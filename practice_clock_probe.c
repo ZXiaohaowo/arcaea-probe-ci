@@ -21,7 +21,7 @@
  *   Header:  # practice_clock_probe v3 (chain probe + guarded position reads)
  *            # build=<id> pid=<n> utc=<ISO8601Z> t0_ms=<n>
  *   Ident:   # ident base=0x.. slide=0x.. img=.. magic=<0|1> words=<0|1> vt=<0|1> ...
- *   Reads:   # reads dispatch=<ok|unavailable>
+ *   Reads:   # reads dispatch=<linked|dlsym|dlopen-null|dlopen-path|unavailable>
  *   Sample:  s seq=<n> t_ms=<n> dt_ms=<n> [gap=1]
  *   Chain:   c seq=<n> t_ms=<n> tid=<n> main=<0|1> state=<ready|not-ready|anomaly|changed>
  *            [slot=0x.. gg=0x.. am=0x.. pv=0x.. count=<n> chan0=0x..] [reason=<..>]
@@ -86,6 +86,13 @@
 
 __attribute__((visibility("default")))
 const char practice_clock_probe_version[] = PRACTICE_CLOCK_PROBE_VERSION;
+
+/* dispatch is used ONLY for the guarded-read main-queue hop (v10).
+ * Primary binding: weak direct import (no runtime lookup). Fallbacks exist because the
+ * first device run showed the path-based dlopen lookup failing on this OS: dlsym(RTLD_DEFAULT)
+ * -> dlopen(NULL) -> explicit paths. The effective layer is logged. */
+extern void *dispatch_get_main_queue(void) __attribute__((weak_import));
+extern void dispatch_async_f(void *queue, void *context, void (*work)(void *)) __attribute__((weak_import));
 
 /* ---------------------------------------------------------------- path */
 
@@ -608,16 +615,58 @@ static void practice_clock_probe_ctor(void)
     }
 
     {
-        void *h = dlopen("/usr/lib/libSystem.B.dylib", RTLD_NOW);
-        if (h != NULL) {
-            p_get_main_queue = (dispatch_get_main_queue_fn)dlsym(h, "dispatch_get_main_queue");
-            p_async_f = (dispatch_async_f_fn)dlsym(h, "dispatch_async_f");
-            if (p_get_main_queue != NULL) {
+        void *f1 = NULL;
+        void *f2 = NULL;
+        const char *src = "unavailable";
+
+        if (dispatch_async_f != NULL && dispatch_get_main_queue != NULL) {
+            p_async_f = dispatch_async_f;
+            g_main_queue = dispatch_get_main_queue();
+            src = "linked";
+        }
+        if (p_async_f == NULL || g_main_queue == NULL) {
+            f1 = dlsym(RTLD_DEFAULT, "dispatch_async_f");
+            f2 = dlsym(RTLD_DEFAULT, "dispatch_get_main_queue");
+            if (f1 != NULL && f2 != NULL) {
+                p_async_f = (dispatch_async_f_fn)f1;
+                p_get_main_queue = (dispatch_get_main_queue_fn)f2;
                 g_main_queue = p_get_main_queue();
+                src = "dlsym";
             }
         }
-        n = snprintf(header, sizeof(header), "# reads dispatch=%s\n",
-                     (p_async_f != NULL && g_main_queue != NULL) ? "ok" : "unavailable");
+        if (p_async_f == NULL || g_main_queue == NULL) {
+            void *h = dlopen(NULL, RTLD_NOW);
+            if (h != NULL) {
+                f1 = dlsym(h, "dispatch_async_f");
+                f2 = dlsym(h, "dispatch_get_main_queue");
+                if (f1 != NULL && f2 != NULL) {
+                    p_async_f = (dispatch_async_f_fn)f1;
+                    p_get_main_queue = (dispatch_get_main_queue_fn)f2;
+                    g_main_queue = p_get_main_queue();
+                    src = "dlopen-null";
+                }
+            }
+        }
+        if (p_async_f == NULL || g_main_queue == NULL) {
+            const char *paths[] = {"/usr/lib/libSystem.B.dylib",
+                                   "/usr/lib/system/libdispatch.dylib", NULL};
+            int pi;
+            for (pi = 0; paths[pi] != NULL && (p_async_f == NULL || g_main_queue == NULL); pi++) {
+                void *h = dlopen(paths[pi], RTLD_NOW);
+                if (h == NULL) {
+                    continue;
+                }
+                f1 = dlsym(h, "dispatch_async_f");
+                f2 = dlsym(h, "dispatch_get_main_queue");
+                if (f1 != NULL && f2 != NULL) {
+                    p_async_f = (dispatch_async_f_fn)f1;
+                    p_get_main_queue = (dispatch_get_main_queue_fn)f2;
+                    g_main_queue = p_get_main_queue();
+                    src = "dlopen-path";
+                }
+            }
+        }
+        n = snprintf(header, sizeof(header), "# reads dispatch=%s\n", src);
         if (n > 0 && (size_t)n < sizeof(header)) {
             append_raw(header, (size_t)n);
         }
