@@ -14,7 +14,7 @@ SDK_VER="$(xcrun --sdk iphoneos --show-sdk-version)"
 echo "iPhoneOS SDK: ${SDK_VER}"
 echo "build id: ${BUILD_ID}"
 
-mkdir -p out/practice_probe_ci.framework out/practice_bootstrap.framework
+mkdir -p out/practice_probe_ci.framework out/practice_bootstrap.framework out/practice_clock_probe.framework
 
 echo "==== build probe ===="
 xcrun --sdk iphoneos clang \
@@ -37,8 +37,19 @@ xcrun --sdk iphoneos clang \
   practice_bootstrap.c
 cp bootstrap-Info.plist out/practice_bootstrap.framework/Info.plist
 
+echo "==== build clock probe (build id: ${BUILD_ID}) ===="
+xcrun --sdk iphoneos clang \
+  -arch arm64 \
+  -mios-version-min=15.0 \
+  -dynamiclib -O2 \
+  "-DPRACTICE_BUILD_ID=\"${BUILD_ID}\"" \
+  -install_name @executable_path/Frameworks/practice_clock_probe.framework/practice_clock_probe \
+  -o out/practice_clock_probe.framework/practice_clock_probe \
+  practice_clock_probe.c
+cp clock_probe-Info.plist out/practice_clock_probe.framework/Info.plist
+
 echo "==== verify ===="
-for f in out/practice_probe_ci.framework/practice_probe_ci out/practice_bootstrap.framework/practice_bootstrap; do
+for f in out/practice_probe_ci.framework/practice_probe_ci out/practice_bootstrap.framework/practice_bootstrap out/practice_clock_probe.framework/practice_clock_probe; do
   lipo -info "$f"
   xcrun vtool -show-build "$f" || true
   shasum -a 256 "$f"
@@ -46,6 +57,7 @@ done
 
 echo "==== package ===="
 ( cd out && zip -qry ../practice_probe_ci.framework.zip practice_probe_ci.framework \
-  && zip -qry ../practice_bootstrap.framework.zip practice_bootstrap.framework )
+  && zip -qry ../practice_bootstrap.framework.zip practice_bootstrap.framework \
+  && zip -qry ../practice_clock_probe.framework.zip practice_clock_probe.framework )
 
 echo "==== done ===="

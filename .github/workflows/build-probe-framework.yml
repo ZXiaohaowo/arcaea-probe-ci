@@ -23,4 +23,5 @@ jobs:
           path: |
             practice_probe_ci.framework.zip
             practice_bootstrap.framework.zip
+            practice_clock_probe.framework.zip
           if-no-files-found: error
