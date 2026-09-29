@@ -14,19 +14,20 @@
  *     NOT prove objects cannot be freed. Conclusions are limited to "chain reading held in
  *     the tested scenarios" (see docs/s2a_audio_position_static_findings.md).
  *   - v10 addition: ONE guarded read per task - AM::getBGMPosition() - executed on the main
- *     queue with fresh pre-checks (ident ok, chain ready, handle non-null). No other game
+ *     THREAD (a CFRunLoopSource added to the main runloop; fully linked, no runtime symbol
+ *     lookup) with fresh pre-checks (ident ok, chain ready, handle non-null). No other game
  *     function is called. The guard is not a lock; see docs/s2a_v10_prereq_thread_analysis.md.
  *
  * Log: <sandbox>/Documents/practice_clock_probe.log (append-only).
  *   Header:  # practice_clock_probe v3 (chain probe + guarded position reads)
  *            # build=<id> pid=<n> utc=<ISO8601Z> t0_ms=<n>
  *   Ident:   # ident base=0x.. slide=0x.. img=.. magic=<0|1> words=<0|1> vt=<0|1> ...
- *   Reads:   # reads dispatch=<dlsym-default|dlopen-null|dlopen-path|unavailable>
+ *   Reads:   # reads mainhop=<cf-runloop|unavailable>
  *   Sample:  s seq=<n> t_ms=<n> dt_ms=<n> [gap=1]
  *   Chain:   c seq=<n> t_ms=<n> tid=<n> main=<0|1> state=<ready|not-ready|anomaly|changed>
  *            [slot=0x.. gg=0x.. am=0x.. pv=0x.. count=<n> chan0=0x..] [reason=<..>]
- *   Position: p seq=<n> t_ms=<n> t_q=<n> lag_ms=<n> am=0x.. handle=0x.. ok=<0|1> pos_ms=<n>
- *            [reason=<..>]   -- main-queue executed, guarded; one call per task.
+ *   Position: p seq=<n> t_ms=<n> t_q=<n> lag_ms=<n> tid=<n> main=<0|1> am=0x.. handle=0x..
+ *            ok=<0|1> pos_ms=<n> [reason=<..>]   -- main-thread executed (main=1 expected).
  *   Chain lines are change-driven (heartbeat every 60 samples). Position reads run at <=2 Hz
  *   only while: chain ready, channel-0 handle non-null, handle stable for >=250 ms, and no
  *   previous read is still in flight.
@@ -37,7 +38,6 @@
  * Safety rules: no game calls, no heap allocation, no UIKit, no networking; every failure
  * path returns silently into the sampler loop; this module must never abort the host app.
  */
-#include <dlfcn.h>
 #include <mach-o/dyld.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
@@ -87,12 +87,32 @@
 __attribute__((visibility("default")))
 const char practice_clock_probe_version[] = PRACTICE_CLOCK_PROBE_VERSION;
 
-/* dispatch is used ONLY for the guarded-read main-queue hop (v10).
- * Resolved at RUNTIME via dlsym: a bare dynamiclib does not link dispatch through
- * libSystem on this SDK (verified by the CI link log), and dlsym on a libSystem handle
- * does not expose it either (first device run: dispatch=unavailable). Layer order:
- * RTLD_DEFAULT -> dlopen(NULL) -> explicit paths (libdispatch first). The effective
- * layer is logged. */
+/* Main-thread hop for the guarded reads (v10c): a CFRunLoopSource added to the main
+ * runloop. Fully LINKED (CoreFoundation) - no runtime symbol lookup, which failed for
+ * dispatch on this OS in two different forms (libSystem handle + RTLD_DEFAULT). The
+ * perform callback runs on the main thread; p-lines carry main= to prove it. */
+typedef struct __CFRunLoop *cf_runloop_ref;
+typedef struct __CFRunLoopSource *cf_runloop_source_ref;
+typedef struct {
+    long version;
+    void *info;
+    const void *retain;
+    const void *release;
+    const void *copy_description;
+    const void *equal;
+    const void *hash;
+    const void *schedule;
+    const void *cancel;
+    void (*perform)(void *info);
+} cf_runloop_source_context_t;
+extern cf_runloop_ref CFRunLoopGetMain(void);
+extern cf_runloop_source_ref CFRunLoopSourceCreate(void *allocator, long order,
+                                                   cf_runloop_source_context_t *context);
+extern void CFRunLoopAddSource(cf_runloop_ref rl, cf_runloop_source_ref source,
+                               const void *mode);
+extern void CFRunLoopSourceSignal(cf_runloop_source_ref source);
+extern void CFRunLoopWakeUp(cf_runloop_ref rl);
+extern const void *kCFRunLoopCommonModes;
 
 /* ---------------------------------------------------------------- path */
 
@@ -330,14 +350,10 @@ static const char *state_name(int s)
     }
 }
 
-/* ------------------------------------- guarded position reads (v10, main queue) */
+/* ------------------------------------- guarded position reads (v10, main thread) */
 
-typedef void *(*dispatch_get_main_queue_fn)(void);
-typedef void (*dispatch_async_f_fn)(void *queue, void *context, void (*work)(void *));
-
-static dispatch_get_main_queue_fn p_get_main_queue;
-static dispatch_async_f_fn p_async_f;
-static void *g_main_queue;
+static cf_runloop_ref g_main_runloop;
+static cf_runloop_source_ref g_read_source;
 
 typedef struct {
     uint64_t q_seq;
@@ -380,11 +396,12 @@ static void padd(const char *s, size_t n)
     }
 }
 
-static void read_trampoline(void *ctx)   /* runs on the main queue */
+static void read_trampoline(void *ctx)   /* runs on the main thread (runloop source) */
 {
     read_task_t *task = (read_task_t *)ctx;
     chain_snap_t cs;
     uint64_t now;
+    uint64_t tid = 0;
     int pos = -1;
     int ok = 0;
     const char *reason = "";
@@ -405,10 +422,12 @@ static void read_trampoline(void *ctx)   /* runs on the main queue */
         ok = 1;
     }
     now = monotonic_ms();
+    pthread_threadid_np(NULL, &tid);
     n = snprintf(line, sizeof(line),
-                 "p seq=%llu t_ms=%llu t_q=%llu lag_ms=%llu am=%llx handle=%llx ok=%d pos_ms=%d",
+                 "p seq=%llu t_ms=%llu t_q=%llu lag_ms=%llu tid=%llu main=%d am=%llx handle=%llx ok=%d pos_ms=%d",
                  (unsigned long long)task->q_seq, (unsigned long long)now,
                  (unsigned long long)task->q_t_ms, (unsigned long long)(now - task->q_t_ms),
+                 (unsigned long long)tid, pthread_main_np() ? 1 : 0,
                  (unsigned long long)cs.am, (unsigned long long)cs.chan0, ok, pos);
     if (!ok && n > 0 && (size_t)n < sizeof(line) - 32) {
         n += snprintf(line + n, sizeof(line) - (size_t)n, " reason=%s", reason);
@@ -550,7 +569,7 @@ static void *sampler_main(void *arg)
                 g_last_handle = cs.chan0;
                 g_last_handle_change_ms = now;
             }
-            if (g_ident_ok && p_async_f != NULL && g_main_queue != NULL && cs.chan0 != 0 &&
+            if (g_ident_ok && g_read_source != NULL && cs.chan0 != 0 &&
                 (now - g_last_handle_change_ms) >= 250 &&
                 (now - g_last_enqueue_ms) >= 500 &&
                 !g_read_inflight) {
@@ -558,7 +577,8 @@ static void *sampler_main(void *arg)
                     g_read_task.q_seq = seq;
                     g_read_task.q_t_ms = now;
                     g_last_enqueue_ms = now;
-                    p_async_f(g_main_queue, &g_read_task, read_trampoline);
+                    CFRunLoopSourceSignal(g_read_source);
+                    CFRunLoopWakeUp(g_main_runloop);
                 }
             }
         }
@@ -615,54 +635,20 @@ static void practice_clock_probe_ctor(void)
     }
 
     {
-        void *f1 = NULL;
-        void *f2 = NULL;
-        const char *src = "unavailable";
+        cf_runloop_source_context_t ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.info = &g_read_task;
+        ctx.perform = read_trampoline;
 
-        /* layer 1: global lookup */
-        f1 = dlsym(RTLD_DEFAULT, "dispatch_async_f");
-        f2 = dlsym(RTLD_DEFAULT, "dispatch_get_main_queue");
-        if (f1 != NULL && f2 != NULL) {
-            src = "dlsym-default";
-        } else {
-            /* layer 2: handle of the main program */
-            void *h = dlopen(NULL, RTLD_NOW);
-            if (h != NULL) {
-                f1 = dlsym(h, "dispatch_async_f");
-                f2 = dlsym(h, "dispatch_get_main_queue");
-                if (f1 != NULL && f2 != NULL) {
-                    src = "dlopen-null";
-                }
+        g_main_runloop = CFRunLoopGetMain();
+        if (g_main_runloop != NULL) {
+            g_read_source = CFRunLoopSourceCreate(NULL, 0, &ctx);
+            if (g_read_source != NULL) {
+                CFRunLoopAddSource(g_main_runloop, g_read_source, kCFRunLoopCommonModes);
             }
         }
-        if (f1 == NULL || f2 == NULL) {
-            /* layer 3: explicit paths (libdispatch first - it owns the symbols) */
-            const char *paths[] = {"/usr/lib/system/libdispatch.dylib",
-                                   "/usr/lib/libdispatch.dylib",
-                                   "/usr/lib/libSystem.B.dylib", NULL};
-            int pi;
-            for (pi = 0; paths[pi] != NULL; pi++) {
-                void *h = dlopen(paths[pi], RTLD_NOW);
-                if (h == NULL) {
-                    continue;
-                }
-                f1 = dlsym(h, "dispatch_async_f");
-                f2 = dlsym(h, "dispatch_get_main_queue");
-                if (f1 != NULL && f2 != NULL) {
-                    src = "dlopen-path";
-                    break;
-                }
-            }
-        }
-        if (f1 != NULL && f2 != NULL) {
-            p_async_f = (dispatch_async_f_fn)f1;
-            p_get_main_queue = (dispatch_get_main_queue_fn)f2;
-            g_main_queue = p_get_main_queue();
-            if (g_main_queue == NULL) {
-                src = "unavailable";
-            }
-        }
-        n = snprintf(header, sizeof(header), "# reads dispatch=%s\n", src);
+        n = snprintf(header, sizeof(header), "# reads mainhop=%s\n",
+                     (g_read_source != NULL) ? "cf-runloop" : "unavailable");
         if (n > 0 && (size_t)n < sizeof(header)) {
             append_raw(header, (size_t)n);
         }

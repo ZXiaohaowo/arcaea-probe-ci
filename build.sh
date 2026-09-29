@@ -43,6 +43,7 @@ xcrun --sdk iphoneos clang \
   -mios-version-min=15.0 \
   -dynamiclib -O2 \
   "-DPRACTICE_BUILD_ID=\"${BUILD_ID}\"" \
+  -framework CoreFoundation \
   -install_name @executable_path/Frameworks/practice_clock_probe.framework/practice_clock_probe \
   -o out/practice_clock_probe.framework/practice_clock_probe \
   practice_clock_probe.c
@@ -52,6 +53,7 @@ echo "==== verify ===="
 for f in out/practice_probe_ci.framework/practice_probe_ci out/practice_bootstrap.framework/practice_bootstrap out/practice_clock_probe.framework/practice_clock_probe; do
   lipo -info "$f"
   xcrun vtool -show-build "$f" || true
+  xcrun otool -L "$f" || true
   shasum -a 256 "$f"
 done
 
