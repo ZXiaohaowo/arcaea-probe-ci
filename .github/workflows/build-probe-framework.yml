@@ -9,7 +9,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build minimal framework with Apple toolchain
+      - name: Build minimal probe framework
         run: |
           set -e
           mkdir -p out/practice_probe_ci.framework
@@ -21,20 +21,36 @@ jobs:
             -o out/practice_probe_ci.framework/practice_probe_ci \
             probe.c
           cp Info.plist out/practice_probe_ci.framework/Info.plist
-          echo '--- built binary info ---'
-          xcrun vtool -show-build out/practice_probe_ci.framework/practice_probe_ci || true
           lipo -info out/practice_probe_ci.framework/practice_probe_ci
           shasum -a 256 out/practice_probe_ci.framework/practice_probe_ci
 
-      - name: Package framework
+      - name: Build bootstrap framework
+        run: |
+          set -e
+          mkdir -p out/practice_bootstrap.framework
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -mios-version-min=15.0 \
+            -dynamiclib -O2 \
+            -install_name @executable_path/Frameworks/practice_bootstrap.framework/practice_bootstrap \
+            -o out/practice_bootstrap.framework/practice_bootstrap \
+            practice_bootstrap.c
+          cp bootstrap-Info.plist out/practice_bootstrap.framework/Info.plist
+          lipo -info out/practice_bootstrap.framework/practice_bootstrap
+          shasum -a 256 out/practice_bootstrap.framework/practice_bootstrap
+
+      - name: Package frameworks
         run: |
           set -e
           cd out
           zip -qry ../practice_probe_ci.framework.zip practice_probe_ci.framework
+          zip -qry ../practice_bootstrap.framework.zip practice_bootstrap.framework
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: practice_probe_ci_framework
-          path: practice_probe_ci.framework.zip
+          name: frameworks
+          path: |
+            practice_probe_ci.framework.zip
+            practice_bootstrap.framework.zip
           if-no-files-found: error
