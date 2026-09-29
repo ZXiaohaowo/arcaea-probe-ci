@@ -21,7 +21,7 @@
  *   Header:  # practice_clock_probe v3 (chain probe + guarded position reads)
  *            # build=<id> pid=<n> utc=<ISO8601Z> t0_ms=<n>
  *   Ident:   # ident base=0x.. slide=0x.. img=.. magic=<0|1> words=<0|1> vt=<0|1> ...
- *   Reads:   # reads dispatch=<linked|dlsym|dlopen-null|dlopen-path|unavailable>
+ *   Reads:   # reads dispatch=<dlsym-default|dlopen-null|dlopen-path|unavailable>
  *   Sample:  s seq=<n> t_ms=<n> dt_ms=<n> [gap=1]
  *   Chain:   c seq=<n> t_ms=<n> tid=<n> main=<0|1> state=<ready|not-ready|anomaly|changed>
  *            [slot=0x.. gg=0x.. am=0x.. pv=0x.. count=<n> chan0=0x..] [reason=<..>]
@@ -88,11 +88,11 @@ __attribute__((visibility("default")))
 const char practice_clock_probe_version[] = PRACTICE_CLOCK_PROBE_VERSION;
 
 /* dispatch is used ONLY for the guarded-read main-queue hop (v10).
- * Primary binding: weak direct import (no runtime lookup). Fallbacks exist because the
- * first device run showed the path-based dlopen lookup failing on this OS: dlsym(RTLD_DEFAULT)
- * -> dlopen(NULL) -> explicit paths. The effective layer is logged. */
-extern void *dispatch_get_main_queue(void) __attribute__((weak_import));
-extern void dispatch_async_f(void *queue, void *context, void (*work)(void *)) __attribute__((weak_import));
+ * Resolved at RUNTIME via dlsym: a bare dynamiclib does not link dispatch through
+ * libSystem on this SDK (verified by the CI link log), and dlsym on a libSystem handle
+ * does not expose it either (first device run: dispatch=unavailable). Layer order:
+ * RTLD_DEFAULT -> dlopen(NULL) -> explicit paths (libdispatch first). The effective
+ * layer is logged. */
 
 /* ---------------------------------------------------------------- path */
 
@@ -619,39 +619,29 @@ static void practice_clock_probe_ctor(void)
         void *f2 = NULL;
         const char *src = "unavailable";
 
-        if (dispatch_async_f != NULL && dispatch_get_main_queue != NULL) {
-            p_async_f = dispatch_async_f;
-            g_main_queue = dispatch_get_main_queue();
-            src = "linked";
-        }
-        if (p_async_f == NULL || g_main_queue == NULL) {
-            f1 = dlsym(RTLD_DEFAULT, "dispatch_async_f");
-            f2 = dlsym(RTLD_DEFAULT, "dispatch_get_main_queue");
-            if (f1 != NULL && f2 != NULL) {
-                p_async_f = (dispatch_async_f_fn)f1;
-                p_get_main_queue = (dispatch_get_main_queue_fn)f2;
-                g_main_queue = p_get_main_queue();
-                src = "dlsym";
-            }
-        }
-        if (p_async_f == NULL || g_main_queue == NULL) {
+        /* layer 1: global lookup */
+        f1 = dlsym(RTLD_DEFAULT, "dispatch_async_f");
+        f2 = dlsym(RTLD_DEFAULT, "dispatch_get_main_queue");
+        if (f1 != NULL && f2 != NULL) {
+            src = "dlsym-default";
+        } else {
+            /* layer 2: handle of the main program */
             void *h = dlopen(NULL, RTLD_NOW);
             if (h != NULL) {
                 f1 = dlsym(h, "dispatch_async_f");
                 f2 = dlsym(h, "dispatch_get_main_queue");
                 if (f1 != NULL && f2 != NULL) {
-                    p_async_f = (dispatch_async_f_fn)f1;
-                    p_get_main_queue = (dispatch_get_main_queue_fn)f2;
-                    g_main_queue = p_get_main_queue();
                     src = "dlopen-null";
                 }
             }
         }
-        if (p_async_f == NULL || g_main_queue == NULL) {
-            const char *paths[] = {"/usr/lib/libSystem.B.dylib",
-                                   "/usr/lib/system/libdispatch.dylib", NULL};
+        if (f1 == NULL || f2 == NULL) {
+            /* layer 3: explicit paths (libdispatch first - it owns the symbols) */
+            const char *paths[] = {"/usr/lib/system/libdispatch.dylib",
+                                   "/usr/lib/libdispatch.dylib",
+                                   "/usr/lib/libSystem.B.dylib", NULL};
             int pi;
-            for (pi = 0; paths[pi] != NULL && (p_async_f == NULL || g_main_queue == NULL); pi++) {
+            for (pi = 0; paths[pi] != NULL; pi++) {
                 void *h = dlopen(paths[pi], RTLD_NOW);
                 if (h == NULL) {
                     continue;
@@ -659,11 +649,17 @@ static void practice_clock_probe_ctor(void)
                 f1 = dlsym(h, "dispatch_async_f");
                 f2 = dlsym(h, "dispatch_get_main_queue");
                 if (f1 != NULL && f2 != NULL) {
-                    p_async_f = (dispatch_async_f_fn)f1;
-                    p_get_main_queue = (dispatch_get_main_queue_fn)f2;
-                    g_main_queue = p_get_main_queue();
                     src = "dlopen-path";
+                    break;
                 }
+            }
+        }
+        if (f1 != NULL && f2 != NULL) {
+            p_async_f = (dispatch_async_f_fn)f1;
+            p_get_main_queue = (dispatch_get_main_queue_fn)f2;
+            g_main_queue = p_get_main_queue();
+            if (g_main_queue == NULL) {
+                src = "unavailable";
             }
         }
         n = snprintf(header, sizeof(header), "# reads dispatch=%s\n", src);
