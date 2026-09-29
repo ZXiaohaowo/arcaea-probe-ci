@@ -1,0 +1,40 @@
+name: build-probe-framework
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build minimal framework with Apple toolchain
+        run: |
+          set -e
+          mkdir -p out/practice_probe_ci.framework
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -mios-version-min=15.0 \
+            -dynamiclib -O2 \
+            -install_name @executable_path/Frameworks/practice_probe_ci.framework/practice_probe_ci \
+            -o out/practice_probe_ci.framework/practice_probe_ci \
+            probe.c
+          cp Info.plist out/practice_probe_ci.framework/Info.plist
+          echo '--- built binary info ---'
+          xcrun vtool -show-build out/practice_probe_ci.framework/practice_probe_ci || true
+          lipo -info out/practice_probe_ci.framework/practice_probe_ci
+          shasum -a 256 out/practice_probe_ci.framework/practice_probe_ci
+
+      - name: Package framework
+        run: |
+          set -e
+          cd out
+          zip -qry ../practice_probe_ci.framework.zip practice_probe_ci.framework
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: practice_probe_ci_framework
+          path: practice_probe_ci.framework.zip
+          if-no-files-found: error
