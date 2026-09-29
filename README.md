@@ -1,35 +1,40 @@
-# Standard-toolchain probe (GitHub Actions)
+# Standard-toolchain build (GitHub Actions)
 
-Purpose: build the same minimal module with the STANDARD Apple toolchain (Xcode/clang
-on a macOS runner) as a control for the iOS 26.6 "code signature invalid" blocker.
-See `docs/s1_signature_blocker_brief.md` for why this control matters: five earlier
-attempts all shared the same zig-built module, so a stock-toolchain reference is the
-highest-value next comparison.
+Purpose: build the practice frameworks with the STANDARD Apple toolchain (Xcode/clang on a
+macOS runner). This pipeline replaced the zig-on-Windows path after the S1 blocker was
+resolved: every zig-built variant was rejected by iOS 26.6, while the standard-toolchain
+probe loaded and executed on device (see `docs/s1_breakthrough_and_next_plan.md`).
 
-## What you need
-	- A GitHub account. A private repository is fine (macOS runner minutes are limited on
-	  free plans but a single build takes ~1-2 minutes; a public repo is unlimited).
+## What it builds
+	- `practice_probe_ci.framework` - minimal probe (probe.c).
+	- `practice_bootstrap.framework` - the real bootstrap module, stamped with the build id
+	  (commit short hash) so every build is identifiable in the device log.
 
-## Steps
-	1. Create a new repository (any name, e.g. `arcaea-probe-ci`).
-	2. Upload the CONTENTS of this `ci/` directory to the repository root, preserving the
-	   folder structure:
-	   - `probe.c`
-	   - `Info.plist`
-	   - `.github/workflows/build-probe-framework.yml`
-	   (GitHub web upload: drag the files; if the web UI refuses to create the
-	   `.github/workflows` path, use `git push` from a local clone instead.)
-	3. Open the repository's "Actions" tab, select "build-probe-framework", click
-	   "Run workflow" (it is a manual-dispatch workflow).
-	4. After ~1-2 minutes the run completes; open it and download the artifact
-	   `practice_probe_ci_framework` (a zip containing `practice_probe_ci.framework.zip`).
-	5. Unzip down to the `practice_probe_ci.framework` folder and tell us its local path
-	   (or place it on the Desktop). We will then build the injection IPA from it and run
-	   the same Sideloadly install test.
+## Repository layout (the contents of this `ci/` folder = repository root)
+	- `probe.c`, `practice_bootstrap.c` - sources. `practice_bootstrap.c` is synced from the
+	  authoritative `src/practice_bootstrap.c` in the project (check with
+	  `python tools/check_ci_sync.py` before pushing).
+	- `Info.plist`, `bootstrap-Info.plist` - the framework Info.plists.
+	- `build.sh` - the build script (toolchain info + build + verify + package). Runs on any
+	  macOS host with Xcode command line tools; the workflow only calls it.
+	- `.github/workflows/build-probe-framework.yml` - CI workflow. Actions are pinned to
+	  full commit SHAs; repository permission is contents: read.
+
+## Operator steps
+	1. Update the repository (only what changed):
+	   - ADD / refresh `build.sh`
+	   - REPLACE `.github/workflows/build-probe-framework.yml`
+	   - If sources changed: refresh `practice_bootstrap.c` and/or `bootstrap-Info.plist`
+	2. Actions -> "build-probe-framework" -> Run workflow.
+	3. When done, open the run: the log shows Xcode / clang / SDK versions and the SHA-256 of
+	   each binary. Download the artifact `frameworks` (contains both
+	   `practice_probe_ci.framework.zip` and `practice_bootstrap.framework.zip`).
+	4. Unpack and hand the framework folder(s) to the Windows side for assembly.
 
 ## Notes
-	- The build proves its own freshness: the workflow prints `lipo -info` and a SHA-256
-	  of the produced binary in the run log.
 	- Nothing secret is uploaded: no IPA, no account credentials, no signing keys.
-	- Expected artifact: `practice_probe_ci.framework` containing a native arm64 iOS
-	  dynamic library named `practice_probe_ci` plus its `Info.plist`.
+	- Keep a local copy of every verified artifact together with its run log; hosted
+	  artifacts have a limited retention period.
+	- The workflow pins `actions/checkout` and `actions/upload-artifact` to verified commit
+	  SHAs (2026-09-29); if these actions are ever updated on purpose, update the SHAs
+	  deliberately and re-verify.

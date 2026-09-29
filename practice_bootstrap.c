@@ -17,7 +17,10 @@
 #include <syslog.h>
 #include <time.h>
 
-#define PRACTICE_BOOTSTRAP_VERSION "s1-minimal-2026-09-28"
+#ifndef PRACTICE_BUILD_ID
+#define PRACTICE_BUILD_ID "dev"
+#endif
+#define PRACTICE_BOOTSTRAP_VERSION "s1-minimal-" PRACTICE_BUILD_ID
 
 __attribute__((visibility("default")))
 const char practice_bootstrap_version[] = PRACTICE_BOOTSTRAP_VERSION;

@@ -3,51 +3,21 @@ name: build-probe-framework
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Build minimal probe framework
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build frameworks
         run: |
-          set -e
-          mkdir -p out/practice_probe_ci.framework
-          xcrun --sdk iphoneos clang \
-            -arch arm64 \
-            -mios-version-min=15.0 \
-            -dynamiclib -O2 \
-            -install_name @executable_path/Frameworks/practice_probe_ci.framework/practice_probe_ci \
-            -o out/practice_probe_ci.framework/practice_probe_ci \
-            probe.c
-          cp Info.plist out/practice_probe_ci.framework/Info.plist
-          lipo -info out/practice_probe_ci.framework/practice_probe_ci
-          shasum -a 256 out/practice_probe_ci.framework/practice_probe_ci
-
-      - name: Build bootstrap framework
-        run: |
-          set -e
-          mkdir -p out/practice_bootstrap.framework
-          xcrun --sdk iphoneos clang \
-            -arch arm64 \
-            -mios-version-min=15.0 \
-            -dynamiclib -O2 \
-            -install_name @executable_path/Frameworks/practice_bootstrap.framework/practice_bootstrap \
-            -o out/practice_bootstrap.framework/practice_bootstrap \
-            practice_bootstrap.c
-          cp bootstrap-Info.plist out/practice_bootstrap.framework/Info.plist
-          lipo -info out/practice_bootstrap.framework/practice_bootstrap
-          shasum -a 256 out/practice_bootstrap.framework/practice_bootstrap
-
-      - name: Package frameworks
-        run: |
-          set -e
-          cd out
-          zip -qry ../practice_probe_ci.framework.zip practice_probe_ci.framework
-          zip -qry ../practice_bootstrap.framework.zip practice_bootstrap.framework
-
+          chmod +x build.sh
+          ./build.sh "$(git rev-parse --short HEAD)"
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: frameworks
           path: |
