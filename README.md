@@ -10,7 +10,9 @@ probe loaded and executed on device (see `docs/s1_breakthrough_and_next_plan.md`
 	- `practice_bootstrap.framework` - the real bootstrap module, stamped with the build id
 	  (commit short hash) so every build is identifiable in the device log.
 	- `practice_clock_probe.framework` - S2a sampling framework (practice_clock_probe.c):
-	  session header + 1 Hz monotonic samples with buffered writes; NO game access (step 1).
+	  session header + 1 Hz monotonic samples with buffered writes; v2 (v9) adds a READ-ONLY
+	  pointer-chain probe of the recorded AudioManager/provider chain - no game function
+	  calls, guarded reads, change-driven chain log (see docs/s2a_audio_position_static_findings.md).
 
 ## Repository layout (the contents of this `ci/` folder = repository root)
 	- `probe.c`, `practice_bootstrap.c`, `practice_clock_probe.c` - sources. `practice_bootstrap.c`

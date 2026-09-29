@@ -1,30 +1,36 @@
-/* practice_clock_probe.c - S2a step 1: minimal sampling framework.
+/* practice_clock_probe.c - S2a: clock sampling framework + read-only pointer-chain probe (v2).
  *
- * Purpose: validate that a long-lived, low-frequency sampling thread can run
- * inside the game process harmlessly, and produce a structured diagnostic log
- * (build id, process session, monotonic time, sample sequence) that later S2
- * steps will extend with the read-only audio-position value.
+ * v9 scope (per the 2026-09-29 review):
+ *   - NO active calls into game functions. Reads only.
+ *   - Guards at every level: pointer plausibility checks before each dereference; both
+ *     AudioManager and provider vtable markers verified; the chain is re-acquired on every
+ *     sample (no long-term caching); if the chain or the channel container changes during a
+ *     snapshot the snapshot is discarded and the event is logged.
+ *   - Channel container: begin/end null combinations, ordering, 16-byte stride and count
+ *     sanity are all checked before the count is used; on any mismatch the frame is marked
+ *     anomalous and no deeper dereference happens.
+ *   - Honest limits: non-null does not mean valid; a vtable match does not guarantee object
+ *     lifetime; these guards reduce misreads but do NOT replace thread synchronization and do
+ *     NOT prove objects cannot be freed. Conclusions are limited to "chain reading held in
+ *     the tested scenarios" (see docs/s2a_audio_position_static_findings.md).
  *
- * Step-1 scope: NO game object is read or called. libSystem only.
+ * Log: <sandbox>/Documents/practice_clock_probe.log (append-only).
+ *   Header:  # practice_clock_probe v2 (chain probe; read-only; no game calls)
+ *            # build=<id> pid=<n> utc=<ISO8601Z> t0_ms=<n>
+ *   Ident:   # ident base=0x.. slide=0x.. img=.. magic=<0|1> words=<0|1> vt=<0|1> ...
+ *   Sample:  s seq=<n> t_ms=<n> dt_ms=<n> [gap=1]
+ *   Chain:   c seq=<n> t_ms=<n> tid=<n> main=<0|1> state=<ready|not-ready|anomaly|changed>
+ *            [slot=0x.. gg=0x.. am=0x.. pv=0x.. count=<n> chan0=0x..] [reason=<..>]
+ *   Chain lines are change-driven; anomalies flush immediately; a heartbeat is logged
+ *   every 60 samples, and one immediately on session start.
  *
- * Log: <sandbox>/Documents/practice_clock_probe.log (append-only; one header
- * line per app launch):
- *   # build=<id> pid=<n> utc=<ISO8601Z> t0_ms=<monotonic ms at module load>
- *   s seq=<n> t_ms=<monotonic ms> dt_ms=<ms since previous wake> [gap=1]
+ * Lifecycle policy (unchanged from v1): game pause is not detectable here; backgrounding
+ * shows up as a sample gap; exit loses at most the unflushed buffer.
  *
- * Lifecycle policy (see docs/s2a_sampling_framework.md):
- *   - Game pause: not detectable without game access; the sampler runs
- *     continuously. Pause effects will be read FROM the audio-position
- *     behaviour in later steps.
- *   - Backgrounding: process suspension shows up as a large dt_ms marked
- *     gap=1; the monotonic clock is the only detector (no UIKit).
- *   - Exit/kill: no reliable termination hook on iOS; the 8-line buffer
- *     bounds possible sample loss to about 8 seconds (best effort).
- *
- * Safety rules honored here:
- *   - No game access; no heap allocation; no UIKit; no networking.
- *   - Any failure path is silent; this module must never abort the host app.
+ * Safety rules: no game calls, no heap allocation, no UIKit, no networking; every failure
+ * path returns silently into the sampler loop; this module must never abort the host app.
  */
+#include <mach-o/dyld.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -38,12 +44,37 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "s2a-clock-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "s2a-chain-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
-#define GAP_FACTOR 3 /* dt >= GAP_FACTOR x interval counts as a gap */
+#define GAP_FACTOR 3
 #define FLUSH_EVERY_LINES 8
-#define LINEBUF 160
+#define LINEBUF 320
+#define HEARTBEAT_EVERY 60
+
+/* Image-relative offsets (vmaddr - 0x100000000 for this client build; EQUAL to file
+ * offsets only for file-backed __TEXT/__DATA ranges - __common/BSS has no file content
+ * and is addressed at runtime as base + offset). Verified in
+ * docs/s2a_audio_position_static_findings.md. */
+#define OFF_SLOT              0x16781d8ULL  /* __common: GameGlobal* slot              */
+#define OFF_AM_GETPOS         0xb6b844ULL   /* AudioManager::getBGMPosition()          */
+#define OFF_AM_INIT           0xb69940ULL   /* AudioManager::init(AudioProvider*)      */
+#define OFF_AM_VT             0x14f90f8ULL  /* AudioManager vtable base                */
+#define OFF_AM_VT_SLOT_INIT   0x508ULL      /* vtable slot: init                       */
+#define OFF_PV_GETPOS         0x8e4274ULL   /* AudioProviderFMODiOS::getBGMPosition(i) */
+#define OFF_PV_VT             0x14bb930ULL  /* provider vtable base                    */
+#define OFF_PV_VT_SLOT_GETPOS 0x38ULL       /* vtable slot: getBGMPosition             */
+#define OFF_GG_AM             0x10ULL       /* GameGlobal -> AudioManager              */
+#define OFF_AM_PROVIDER       0x280ULL      /* AudioManager -> provider                */
+#define OFF_PV_VEC_BEGIN      0x38ULL       /* provider BGM channel vector begin       */
+#define OFF_PV_VEC_END        0x40ULL       /* provider BGM channel vector end         */
+#define CHAN_ELEM_SIZE        16ULL         /* vector element stride                   */
+#define CHAN_COUNT_CAP        64ULL         /* sanity cap (game reserves 10)           */
+
+/* First 8 bytes of each key function (little-endian uint64 of the instruction pair). */
+#define MARK64_GETPOS_AP 0xa9017bfdd10083ffULL  /* sub sp,sp,#0x20; stp x29,x30,[sp,#0x10] */
+#define MARK64_GETPOS_AM 0xf9400008f9414000ULL  /* ldr x0,[x0,#0x280]; ldr x8,[x0]         */
+#define MARK64_AM_INIT   0xa9017bfda9be4ff4ULL  /* stp x20,x19,[sp,#-0x20]!; stp x29,x30   */
 
 __attribute__((visibility("default")))
 const char practice_clock_probe_version[] = PRACTICE_CLOCK_PROBE_VERSION;
@@ -100,6 +131,189 @@ static uint64_t monotonic_ms(void)
     return (ticks * (uint64_t)tb.numer) / ((uint64_t)tb.denom * 1000000ull);
 }
 
+/* -------------------------------------------------------- image identity */
+
+static uint64_t g_base;      /* main image runtime base */
+static uint64_t g_slide;
+static char g_imgname[160];
+static int g_magic_ok, g_words_ok, g_vt_ok;
+
+static void ident_check(void)
+{
+    const void *h = (const void *)_dyld_get_image_header(0);
+    const char *name = _dyld_get_image_name(0);
+
+    g_base = (uint64_t)(uintptr_t)h;
+    g_slide = (uint64_t)(uintptr_t)_dyld_get_image_vmaddr_slide(0);
+    if (name != NULL) {
+        snprintf(g_imgname, sizeof(g_imgname), "%s", name);
+    } else {
+        snprintf(g_imgname, sizeof(g_imgname), "?");
+    }
+    if (g_base == 0) {
+        return;
+    }
+    g_magic_ok = (*(volatile uint32_t *)(uintptr_t)(g_base + 0) == 0xfeedfacfu);
+    g_words_ok =
+        (*(volatile uint64_t *)(uintptr_t)(g_base + OFF_PV_GETPOS) == MARK64_GETPOS_AP) &&
+        (*(volatile uint64_t *)(uintptr_t)(g_base + OFF_AM_GETPOS) == MARK64_GETPOS_AM) &&
+        (*(volatile uint64_t *)(uintptr_t)(g_base + OFF_AM_INIT) == MARK64_AM_INIT);
+    g_vt_ok =
+        (*(volatile uint64_t *)(uintptr_t)(g_base + OFF_PV_VT + OFF_PV_VT_SLOT_GETPOS) ==
+         g_base + OFF_PV_GETPOS) &&
+        (*(volatile uint64_t *)(uintptr_t)(g_base + OFF_AM_VT + OFF_AM_VT_SLOT_INIT) ==
+         g_base + OFF_AM_INIT);
+}
+
+/* ------------------------------------------------------- pointer checks */
+
+static int ptr_plausible(uint64_t p)
+{
+    return p >= 0x100000000ull && p < (1ull << 47) && (p & 7ull) == 0;
+}
+
+/* -------------------------------------------------------- chain snapshot */
+
+enum { CH_NOT_READY = 0, CH_READY = 1, CH_ANOMALY = 2, CH_CHANGED = 3 };
+
+typedef struct {
+    uint64_t slot, gg, am, pv, begin, end, count, chan0;
+    int state;
+    const char *reason;
+} chain_snap_t;
+
+static void snapshot_chain(chain_snap_t *cs)
+{
+    uint64_t slot1, am, pv, begin, end, bytes, count, slot2, begin2, end2;
+    int settled = 0;
+
+    memset(cs, 0, sizeof(*cs));
+    cs->state = CH_NOT_READY;
+    cs->reason = "";
+    if (g_base == 0) {
+        cs->state = CH_ANOMALY;
+        cs->reason = "no-base";
+        return;
+    }
+
+    slot1 = *(volatile uint64_t *)(uintptr_t)(g_base + OFF_SLOT);
+    cs->slot = slot1;
+    cs->gg = slot1;
+    if (slot1 == 0) {
+        cs->reason = "slot-null";          /* boot not finished / not set yet */
+        return;
+    }
+    if (!ptr_plausible(slot1)) {
+        cs->state = CH_ANOMALY;
+        cs->reason = "slot-bad";
+        return;
+    }
+
+    am = *(volatile uint64_t *)(uintptr_t)(slot1 + OFF_GG_AM);
+    cs->am = am;
+    if (am == 0) {
+        cs->reason = "am-null";
+        return;
+    }
+    if (!ptr_plausible(am)) {
+        cs->state = CH_ANOMALY;
+        cs->reason = "am-bad";
+        return;
+    }
+    if (*(volatile uint64_t *)(uintptr_t)am != g_base + OFF_AM_VT) {
+        cs->state = CH_ANOMALY;
+        cs->reason = "am-vt";
+        return;
+    }
+
+    pv = *(volatile uint64_t *)(uintptr_t)(am + OFF_AM_PROVIDER);
+    cs->pv = pv;
+    if (pv == 0) {
+        cs->reason = "pv-null";
+        return;
+    }
+    if (!ptr_plausible(pv)) {
+        cs->state = CH_ANOMALY;
+        cs->reason = "pv-bad";
+        return;
+    }
+    if (*(volatile uint64_t *)(uintptr_t)pv != g_base + OFF_PV_VT) {
+        cs->state = CH_ANOMALY;
+        cs->reason = "pv-vt";
+        return;
+    }
+
+    begin = *(volatile uint64_t *)(uintptr_t)(pv + OFF_PV_VEC_BEGIN);
+    end = *(volatile uint64_t *)(uintptr_t)(pv + OFF_PV_VEC_END);
+    cs->begin = begin;
+    cs->end = end;
+
+    if (begin == 0 && end == 0) {
+        cs->count = 0;
+        settled = 1;
+    } else if (begin == 0 || end == 0) {
+        cs->state = CH_ANOMALY;
+        cs->reason = "vec-nullpair";
+        return;
+    } else if (!ptr_plausible(begin) || !ptr_plausible(end)) {
+        cs->state = CH_ANOMALY;
+        cs->reason = "vec-bad";
+        return;
+    } else if (end < begin) {
+        cs->state = CH_ANOMALY;
+        cs->reason = "vec-reversed";
+        return;
+    } else {
+        bytes = end - begin;
+        if (bytes % CHAN_ELEM_SIZE != 0) {
+            cs->state = CH_ANOMALY;
+            cs->reason = "vec-stride";
+            return;
+        }
+        count = bytes / CHAN_ELEM_SIZE;
+        if (count > CHAN_COUNT_CAP) {
+            cs->state = CH_ANOMALY;
+            cs->reason = "vec-count";
+            return;
+        }
+        cs->count = count;
+        if (count >= 1) {
+            cs->chan0 = *(volatile uint64_t *)(uintptr_t)(begin + 8);
+        }
+        settled = 1;
+    }
+
+    if (settled) {
+        /* mid-read change detection: re-read the root slot and the vector ends */
+        slot2 = *(volatile uint64_t *)(uintptr_t)(g_base + OFF_SLOT);
+        begin2 = *(volatile uint64_t *)(uintptr_t)(pv + OFF_PV_VEC_BEGIN);
+        end2 = *(volatile uint64_t *)(uintptr_t)(pv + OFF_PV_VEC_END);
+        if (slot2 != slot1 || begin2 != begin || end2 != end) {
+            cs->state = CH_CHANGED;
+            cs->reason = "changed-midread";
+            return;
+        }
+        cs->state = CH_READY;
+    }
+}
+
+static int chain_differs(const chain_snap_t *a, const chain_snap_t *b)
+{
+    return a->state != b->state || a->slot != b->slot || a->am != b->am ||
+           a->pv != b->pv || a->count != b->count || a->chan0 != b->chan0 ||
+           strcmp(a->reason, b->reason) != 0;
+}
+
+static const char *state_name(int s)
+{
+    switch (s) {
+    case CH_READY: return "ready";
+    case CH_ANOMALY: return "anomaly";
+    case CH_CHANGED: return "changed";
+    default: return "not-ready";
+    }
+}
+
 /* ------------------------------------------------------------- sampler */
 
 static char g_buf[FLUSH_EVERY_LINES * LINEBUF];
@@ -128,18 +342,62 @@ static void buffer_add(const char *line, size_t len)
     g_buf_lines += 1;
 }
 
+static void log_chain_line(uint64_t seq, uint64_t t_ms, int heartbeat_mode,
+                           const chain_snap_t *cs)
+{
+    char line[LINEBUF];
+    uint64_t tid = 0;
+    int n;
+
+    pthread_threadid_np(NULL, &tid);
+    n = snprintf(line, sizeof(line),
+                 "c seq=%llu t_ms=%llu tid=%llu main=%d hb=%d state=%s",
+                 (unsigned long long)seq, (unsigned long long)t_ms, (unsigned long long)tid,
+                 pthread_main_np() ? 1 : 0, heartbeat_mode, state_name(cs->state));
+    if (n > 0 && (size_t)n < sizeof(line) && cs->slot != 0) {
+        n += snprintf(line + n, sizeof(line) - (size_t)n,
+                      " slot=%llx gg=%llx am=%llx pv=%llx",
+                      (unsigned long long)cs->slot, (unsigned long long)cs->gg,
+                      (unsigned long long)cs->am, (unsigned long long)cs->pv);
+    }
+    if (n > 0 && (size_t)n < sizeof(line) && cs->state == CH_READY && cs->pv != 0) {
+        n += snprintf(line + n, sizeof(line) - (size_t)n,
+                      " count=%llu", (unsigned long long)cs->count);
+        if (cs->count >= 1) {
+            n += snprintf(line + n, sizeof(line) - (size_t)n,
+                          " chan0=%llx", (unsigned long long)cs->chan0);
+        }
+    }
+    if (n > 0 && (size_t)n < sizeof(line) && cs->reason[0] != '\0') {
+        n += snprintf(line + n, sizeof(line) - (size_t)n, " reason=%s", cs->reason);
+    }
+    if (n > 0 && (size_t)n < sizeof(line) - 1) {
+        line[n++] = '\n';
+        line[n] = '\0';
+        buffer_add(line, (size_t)n);
+    }
+}
+
 static void *sampler_main(void *arg)
 {
     uint64_t prev = monotonic_ms();
     uint64_t seq = 0;
     struct timespec ts;
+    chain_snap_t last;
+    int have_last = 0;
+    int hb_countdown = 0;
     (void)arg;
 
     pthread_setname_np("practice.clock");
 
+    /* initial state line: log the first snapshot as soon as possible */
+    memset(&last, 0, sizeof(last));
+    last.state = -1;
+
     for (;;) {
         char line[LINEBUF];
         uint64_t now, dt;
+        chain_snap_t cs;
         int n, gap;
 
         ts.tv_sec = SAMPLE_INTERVAL_MS / 1000;
@@ -159,7 +417,24 @@ static void *sampler_main(void *arg)
             buffer_add(line, (size_t)n);
         }
         if (gap || seq == 1) {
-            buffer_flush(); /* startup evidence + interesting events are durable */
+            buffer_flush();
+        }
+
+        /* read-only chain probe: fresh snapshot every sample, no caching */
+        snapshot_chain(&cs);
+        {
+            int differ = !have_last || chain_differs(&cs, &last);
+            if (differ || hb_countdown <= 0) {
+                log_chain_line(seq, now, differ ? 0 : 1, &cs);
+                last = cs;
+                have_last = 1;
+                hb_countdown = HEARTBEAT_EVERY;
+            } else {
+                hb_countdown -= 1;
+            }
+        }
+        if (cs.state == CH_ANOMALY || cs.state == CH_CHANGED) {
+            buffer_flush();   /* interesting events are durable */
         } else if (g_buf_lines >= FLUSH_EVERY_LINES) {
             buffer_flush();
         }
@@ -180,10 +455,11 @@ static void practice_clock_probe_ctor(void)
     int n;
 
     init_log_path();
+    ident_check();
 
     if (gmtime_r(&now, &tmv) != NULL) {
         n = snprintf(header, sizeof(header),
-                     "# practice_clock_probe v1; framework validation only (no game access)\n"
+                     "# practice_clock_probe v2 (chain probe; read-only; no game calls)\n"
                      "# build=%s pid=%ld utc=%04d-%02d-%02dT%02d:%02d:%02dZ t0_ms=%llu\n",
                      PRACTICE_CLOCK_PROBE_VERSION, (long)getpid(),
                      tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
@@ -191,11 +467,19 @@ static void practice_clock_probe_ctor(void)
                      (unsigned long long)t0);
     } else {
         n = snprintf(header, sizeof(header),
-                     "# practice_clock_probe v1; framework validation only (no game access)\n"
+                     "# practice_clock_probe v2 (chain probe; read-only; no game calls)\n"
                      "# build=%s pid=%ld t0_ms=%llu\n",
                      PRACTICE_CLOCK_PROBE_VERSION, (long)getpid(),
                      (unsigned long long)t0);
     }
+    if (n > 0 && (size_t)n < sizeof(header)) {
+        append_raw(header, (size_t)n);
+    }
+
+    n = snprintf(header, sizeof(header),
+                 "# ident base=0x%llx slide=0x%llx img=%s magic=%d words=%d vt=%d\n",
+                 (unsigned long long)g_base, (unsigned long long)g_slide, g_imgname,
+                 g_magic_ok, g_words_ok, g_vt_ok);
     if (n > 0 && (size_t)n < sizeof(header)) {
         append_raw(header, (size_t)n);
     }
@@ -207,6 +491,6 @@ static void practice_clock_probe_ctor(void)
     }
     pthread_detach(th);
 
-    syslog(LOG_ERR, "[practice-clock-probe] loaded version=%s",
-           PRACTICE_CLOCK_PROBE_VERSION);
+    syslog(LOG_ERR, "[practice-clock-probe] loaded version=%s ident=%d",
+           PRACTICE_CLOCK_PROBE_VERSION, g_magic_ok && g_words_ok && g_vt_ok);
 }
