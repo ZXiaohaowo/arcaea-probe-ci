@@ -1,6 +1,6 @@
-/* practice_clock_probe.c - S2a: clock sampling framework + read-only pointer-chain probe (v2).
+/* practice_clock_probe.c - S2a: clock framework + pointer-chain probe + guarded reads (v3).
  *
- * v9 scope (per the 2026-09-29 review):
+ * v9 scope (per the 2026-09-29 review), kept in v3:
  *   - NO active calls into game functions. Reads only.
  *   - Guards at every level: pointer plausibility checks before each dereference; both
  *     AudioManager and provider vtable markers verified; the chain is re-acquired on every
@@ -13,16 +13,23 @@
  *     lifetime; these guards reduce misreads but do NOT replace thread synchronization and do
  *     NOT prove objects cannot be freed. Conclusions are limited to "chain reading held in
  *     the tested scenarios" (see docs/s2a_audio_position_static_findings.md).
+ *   - v10 addition: ONE guarded read per task - AM::getBGMPosition() - executed on the main
+ *     queue with fresh pre-checks (ident ok, chain ready, handle non-null). No other game
+ *     function is called. The guard is not a lock; see docs/s2a_v10_prereq_thread_analysis.md.
  *
  * Log: <sandbox>/Documents/practice_clock_probe.log (append-only).
- *   Header:  # practice_clock_probe v2 (chain probe; read-only; no game calls)
+ *   Header:  # practice_clock_probe v3 (chain probe + guarded position reads)
  *            # build=<id> pid=<n> utc=<ISO8601Z> t0_ms=<n>
  *   Ident:   # ident base=0x.. slide=0x.. img=.. magic=<0|1> words=<0|1> vt=<0|1> ...
+ *   Reads:   # reads dispatch=<ok|unavailable>
  *   Sample:  s seq=<n> t_ms=<n> dt_ms=<n> [gap=1]
  *   Chain:   c seq=<n> t_ms=<n> tid=<n> main=<0|1> state=<ready|not-ready|anomaly|changed>
  *            [slot=0x.. gg=0x.. am=0x.. pv=0x.. count=<n> chan0=0x..] [reason=<..>]
- *   Chain lines are change-driven; anomalies flush immediately; a heartbeat is logged
- *   every 60 samples, and one immediately on session start.
+ *   Position: p seq=<n> t_ms=<n> t_q=<n> lag_ms=<n> am=0x.. handle=0x.. ok=<0|1> pos_ms=<n>
+ *            [reason=<..>]   -- main-queue executed, guarded; one call per task.
+ *   Chain lines are change-driven (heartbeat every 60 samples). Position reads run at <=2 Hz
+ *   only while: chain ready, channel-0 handle non-null, handle stable for >=250 ms, and no
+ *   previous read is still in flight.
  *
  * Lifecycle policy (unchanged from v1): game pause is not detectable here; backgrounding
  * shows up as a sample gap; exit loses at most the unflushed buffer.
@@ -30,6 +37,7 @@
  * Safety rules: no game calls, no heap allocation, no UIKit, no networking; every failure
  * path returns silently into the sampler loop; this module must never abort the host app.
  */
+#include <dlfcn.h>
 #include <mach-o/dyld.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
@@ -44,7 +52,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "s2a-chain-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "s2a-read-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -136,7 +144,7 @@ static uint64_t monotonic_ms(void)
 static uint64_t g_base;      /* main image runtime base */
 static uint64_t g_slide;
 static char g_imgname[160];
-static int g_magic_ok, g_words_ok, g_vt_ok;
+static int g_magic_ok, g_words_ok, g_vt_ok, g_ident_ok;
 
 static void ident_check(void)
 {
@@ -163,6 +171,7 @@ static void ident_check(void)
          g_base + OFF_PV_GETPOS) &&
         (*(volatile uint64_t *)(uintptr_t)(g_base + OFF_AM_VT + OFF_AM_VT_SLOT_INIT) ==
          g_base + OFF_AM_INIT);
+    g_ident_ok = g_magic_ok && g_words_ok && g_vt_ok;
 }
 
 /* ------------------------------------------------------- pointer checks */
@@ -314,6 +323,100 @@ static const char *state_name(int s)
     }
 }
 
+/* ------------------------------------- guarded position reads (v10, main queue) */
+
+typedef void *(*dispatch_get_main_queue_fn)(void);
+typedef void (*dispatch_async_f_fn)(void *queue, void *context, void (*work)(void *));
+
+static dispatch_get_main_queue_fn p_get_main_queue;
+static dispatch_async_f_fn p_async_f;
+static void *g_main_queue;
+
+typedef struct {
+    uint64_t q_seq;
+    uint64_t q_t_ms;
+} read_task_t;
+
+static read_task_t g_read_task;
+static volatile int g_read_inflight;
+static uint64_t g_last_handle;
+static uint64_t g_last_handle_change_ms;
+static uint64_t g_last_enqueue_ms;
+
+/* main-thread-only buffer for p-lines (never touched by the sampler thread) */
+static char g_pbuf[4 * LINEBUF];
+static size_t g_pbuf_len;
+static int g_pbuf_lines;
+
+static void pflush(void)
+{
+    if (g_pbuf_len > 0) {
+        append_raw(g_pbuf, g_pbuf_len);
+        g_pbuf_len = 0;
+        g_pbuf_lines = 0;
+    }
+}
+
+static void padd(const char *s, size_t n)
+{
+    if (n == 0 || n > LINEBUF) {
+        return;
+    }
+    if (g_pbuf_len + n > sizeof(g_pbuf)) {
+        pflush();
+    }
+    memcpy(g_pbuf + g_pbuf_len, s, n);
+    g_pbuf_len += n;
+    g_pbuf_lines += 1;
+    if (g_pbuf_lines >= 4) {
+        pflush();
+    }
+}
+
+static void read_trampoline(void *ctx)   /* runs on the main queue */
+{
+    read_task_t *task = (read_task_t *)ctx;
+    chain_snap_t cs;
+    uint64_t now;
+    int pos = -1;
+    int ok = 0;
+    const char *reason = "";
+    char line[LINEBUF];
+    int n;
+
+    snapshot_chain(&cs);
+    if (!g_ident_ok) {
+        reason = "ident";
+    } else if (cs.state != CH_READY) {
+        reason = "chain";
+    } else if (cs.chan0 == 0) {
+        reason = "handle-null";
+    } else {
+        typedef int (*getpos_fn)(void *);
+        getpos_fn fn = (getpos_fn)(uintptr_t)(g_base + OFF_AM_GETPOS);
+        pos = fn((void *)(uintptr_t)cs.am);
+        ok = 1;
+    }
+    now = monotonic_ms();
+    n = snprintf(line, sizeof(line),
+                 "p seq=%llu t_ms=%llu t_q=%llu lag_ms=%llu am=%llx handle=%llx ok=%d pos_ms=%d",
+                 (unsigned long long)task->q_seq, (unsigned long long)now,
+                 (unsigned long long)task->q_t_ms, (unsigned long long)(now - task->q_t_ms),
+                 (unsigned long long)cs.am, (unsigned long long)cs.chan0, ok, pos);
+    if (!ok && n > 0 && (size_t)n < sizeof(line) - 32) {
+        n += snprintf(line + n, sizeof(line) - (size_t)n, " reason=%s", reason);
+    }
+    if (n > 0 && (size_t)n < sizeof(line) - 2) {
+        line[n++] = '\n';
+        line[n] = '\0';
+        padd(line, (size_t)n);
+    }
+    if (!ok) {
+        pflush();   /* keep skip events durable */
+    }
+    g_read_inflight = 0;
+}
+
 /* ------------------------------------------------------------- sampler */
 
 static char g_buf[FLUSH_EVERY_LINES * LINEBUF];
@@ -433,6 +536,26 @@ static void *sampler_main(void *arg)
                 hb_countdown -= 1;
             }
         }
+
+        /* guarded position read enqueue (v10): main queue, stability-gated */
+        if (cs.state == CH_READY) {
+            if (cs.chan0 != g_last_handle) {
+                g_last_handle = cs.chan0;
+                g_last_handle_change_ms = now;
+            }
+            if (g_ident_ok && p_async_f != NULL && g_main_queue != NULL && cs.chan0 != 0 &&
+                (now - g_last_handle_change_ms) >= 250 &&
+                (now - g_last_enqueue_ms) >= 500 &&
+                !g_read_inflight) {
+                if (__sync_bool_compare_and_swap(&g_read_inflight, 0, 1)) {
+                    g_read_task.q_seq = seq;
+                    g_read_task.q_t_ms = now;
+                    g_last_enqueue_ms = now;
+                    p_async_f(g_main_queue, &g_read_task, read_trampoline);
+                }
+            }
+        }
+
         if (cs.state == CH_ANOMALY || cs.state == CH_CHANGED) {
             buffer_flush();   /* interesting events are durable */
         } else if (g_buf_lines >= FLUSH_EVERY_LINES) {
@@ -459,7 +582,7 @@ static void practice_clock_probe_ctor(void)
 
     if (gmtime_r(&now, &tmv) != NULL) {
         n = snprintf(header, sizeof(header),
-                     "# practice_clock_probe v2 (chain probe; read-only; no game calls)\n"
+                     "# practice_clock_probe v3 (chain probe + guarded position reads)\n"
                      "# build=%s pid=%ld utc=%04d-%02d-%02dT%02d:%02d:%02dZ t0_ms=%llu\n",
                      PRACTICE_CLOCK_PROBE_VERSION, (long)getpid(),
                      tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
@@ -467,7 +590,7 @@ static void practice_clock_probe_ctor(void)
                      (unsigned long long)t0);
     } else {
         n = snprintf(header, sizeof(header),
-                     "# practice_clock_probe v2 (chain probe; read-only; no game calls)\n"
+                     "# practice_clock_probe v3 (chain probe + guarded position reads)\n"
                      "# build=%s pid=%ld t0_ms=%llu\n",
                      PRACTICE_CLOCK_PROBE_VERSION, (long)getpid(),
                      (unsigned long long)t0);
@@ -482,6 +605,22 @@ static void practice_clock_probe_ctor(void)
                  g_magic_ok, g_words_ok, g_vt_ok);
     if (n > 0 && (size_t)n < sizeof(header)) {
         append_raw(header, (size_t)n);
+    }
+
+    {
+        void *h = dlopen("/usr/lib/libSystem.B.dylib", RTLD_NOW);
+        if (h != NULL) {
+            p_get_main_queue = (dispatch_get_main_queue_fn)dlsym(h, "dispatch_get_main_queue");
+            p_async_f = (dispatch_async_f_fn)dlsym(h, "dispatch_async_f");
+            if (p_get_main_queue != NULL) {
+                g_main_queue = p_get_main_queue();
+            }
+        }
+        n = snprintf(header, sizeof(header), "# reads dispatch=%s\n",
+                     (p_async_f != NULL && g_main_queue != NULL) ? "ok" : "unavailable");
+        if (n > 0 && (size_t)n < sizeof(header)) {
+            append_raw(header, (size_t)n);
+        }
     }
 
     if (pthread_create(&th, NULL, sampler_main, NULL) != 0) {
