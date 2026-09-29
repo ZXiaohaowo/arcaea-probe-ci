@@ -1,4 +1,4 @@
-/* practice_clock_probe.c - S2a: clock framework + pointer-chain probe + guarded reads (v3).
+/* practice_clock_probe.c - S2b: chain probe + guarded reads + chart-time probe (v4).
  *
  * v9 scope (per the 2026-09-29 review), kept in v3:
  *   - NO active calls into game functions. Reads only.
@@ -17,6 +17,10 @@
  *     THREAD (a CFRunLoopSource added to the main runloop; fully linked, no runtime symbol
  *     lookup) with fresh pre-checks (ident ok, chain ready, handle non-null). No other game
  *     function is called. The guard is not a lock; see docs/s2a_v10_prereq_thread_analysis.md.
+ *   - v11 addition (S2b): read-only chart-time probes in the same callback - the BSS mirror
+ *     (0x6539c0) and the GameTimeline chain (GameGlobal+0x78 -> +0x3a0 -> scene+0x30),
+ *     validated by the factory marker *tl == base+0x14d0548. Plain memory reads; zero new
+ *     calls. See docs/s2b_static_findings.md.
  *
  * Log: <sandbox>/Documents/practice_clock_probe.log (append-only).
  *   Header:  # practice_clock_probe v3 (chain probe + guarded position reads)
@@ -27,7 +31,10 @@
  *   Chain:   c seq=<n> t_ms=<n> tid=<n> main=<0|1> state=<ready|not-ready|anomaly|changed>
  *            [slot=0x.. gg=0x.. am=0x.. pv=0x.. count=<n> chan0=0x..] [reason=<..>]
  *   Position: p seq=<n> t_ms=<n> t_q=<n> lag_ms=<n> tid=<n> main=<0|1> am=0x.. handle=0x..
- *            ok=<0|1> pos_ms=<n> [reason=<..>]   -- main-thread executed (main=1 expected).
+ *            ok=<0|1> pos_ms=<n> ctM=<n> ctMok=<0|1> ctA=<0|1> o78=0x.. sc=0x.. tl=0x..
+ *            [t20=<n> t24=<n> t28=<n> f2c=<n> f2d=<n> f2e=<n>] [reason=<..>]
+ *            -- main-thread executed (main=1 expected); ctM = BSS mirror value;
+ *            ctA = 1 when the GameTimeline chain passed the factory-marker check.
  *   Chain lines are change-driven (heartbeat every 60 samples). Position reads run at <=2 Hz
  *   only while: chain ready, channel-0 handle non-null, handle stable for >=250 ms, and no
  *   previous read is still in flight.
@@ -52,12 +59,12 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "s2a-read-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "s2b-clock-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
 #define FLUSH_EVERY_LINES 8
-#define LINEBUF 320
+#define LINEBUF 384
 #define HEARTBEAT_EVERY 60
 
 /* Image-relative offsets (vmaddr - 0x100000000 for this client build; EQUAL to file
@@ -78,6 +85,17 @@
 #define OFF_PV_VEC_END        0x40ULL       /* provider BGM channel vector end         */
 #define CHAN_ELEM_SIZE        16ULL         /* vector element stride                   */
 #define CHAN_COUNT_CAP        64ULL         /* sanity cap (game reserves 10)           */
+
+/* S2b chart-time probe offsets (see docs/s2b_static_findings.md). */
+#define OFF_CT_MIRROR         0x6539c0ULL   /* BSS mirror: last computed chart time    */
+#define OFF_GG_HOLD           0x78ULL       /* GameGlobal -> holder (candidate)        */
+#define OFF_HOLD_SCENE        0x3a0ULL      /* holder -> scene (candidate)             */
+#define OFF_SCENE_TL          0x30ULL       /* scene -> GameTimeline                   */
+#define OFF_TL_TIME           0x20ULL       /* timeline current time (int32 ms)        */
+#define OFF_TL_24             0x24ULL
+#define OFF_TL_28             0x28ULL
+#define OFF_TL_FLAGS          0x2cULL       /* three mode bytes: 2c/2d/2e              */
+#define TL_MARKER_OFF         0x14d0548ULL  /* *(void**)tl == base + this (factory)    */
 
 /* First 8 bytes of each key function (little-endian uint64 of the instruction pair). */
 #define MARK64_GETPOS_AP 0xa9017bfdd10083ffULL  /* sub sp,sp,#0x20; stp x29,x30,[sp,#0x10] */
@@ -402,8 +420,12 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     chain_snap_t cs;
     uint64_t now;
     uint64_t tid = 0;
+    uint64_t o78 = 0, sc = 0, tl = 0;
     int pos = -1;
     int ok = 0;
+    int ctM = 0, ctMok = 0, ctA = 0;
+    int t20 = 0, t24 = 0, t28 = 0;
+    int f2c = -1, f2d = -1, f2e = -1;
     const char *reason = "";
     char line[LINEBUF];
     int n;
@@ -421,14 +443,46 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
         pos = fn((void *)(uintptr_t)cs.am);
         ok = 1;
     }
+    /* chart-time probes (read-only, guarded; no new calls) */
+    ctM = *(volatile int32_t *)(uintptr_t)(g_base + OFF_CT_MIRROR);
+    if (ctM > -(1 << 26) && ctM < (1 << 26)) {
+        ctMok = 1;
+    }
+    if (g_ident_ok && cs.state == CH_READY && ptr_plausible(cs.gg)) {
+        o78 = *(volatile uint64_t *)(uintptr_t)(cs.gg + OFF_GG_HOLD);
+        if (ptr_plausible(o78)) {
+            sc = *(volatile uint64_t *)(uintptr_t)(o78 + OFF_HOLD_SCENE);
+            if (ptr_plausible(sc)) {
+                tl = *(volatile uint64_t *)(uintptr_t)(sc + OFF_SCENE_TL);
+                if (ptr_plausible(tl) &&
+                    *(volatile uint64_t *)(uintptr_t)tl == g_base + TL_MARKER_OFF) {
+                    ctA = 1;
+                    t20 = *(volatile int32_t *)(uintptr_t)(tl + OFF_TL_TIME);
+                    t24 = *(volatile int32_t *)(uintptr_t)(tl + OFF_TL_24);
+                    t28 = *(volatile int32_t *)(uintptr_t)(tl + OFF_TL_28);
+                    f2c = *(volatile uint8_t *)(uintptr_t)(tl + OFF_TL_FLAGS);
+                    f2d = *(volatile uint8_t *)(uintptr_t)(tl + OFF_TL_FLAGS + 1);
+                    f2e = *(volatile uint8_t *)(uintptr_t)(tl + OFF_TL_FLAGS + 2);
+                }
+            }
+        }
+    }
     now = monotonic_ms();
     pthread_threadid_np(NULL, &tid);
     n = snprintf(line, sizeof(line),
-                 "p seq=%llu t_ms=%llu t_q=%llu lag_ms=%llu tid=%llu main=%d am=%llx handle=%llx ok=%d pos_ms=%d",
+                 "p seq=%llu t_ms=%llu t_q=%llu lag_ms=%llu tid=%llu main=%d am=%llx handle=%llx ok=%d pos_ms=%d"
+                 " ctM=%d ctMok=%d ctA=%d o78=%llx sc=%llx tl=%llx",
                  (unsigned long long)task->q_seq, (unsigned long long)now,
                  (unsigned long long)task->q_t_ms, (unsigned long long)(now - task->q_t_ms),
                  (unsigned long long)tid, pthread_main_np() ? 1 : 0,
-                 (unsigned long long)cs.am, (unsigned long long)cs.chan0, ok, pos);
+                 (unsigned long long)cs.am, (unsigned long long)cs.chan0, ok, pos,
+                 ctM, ctMok, ctA,
+                 (unsigned long long)o78, (unsigned long long)sc, (unsigned long long)tl);
+    if (ctA && n > 0 && (size_t)n < sizeof(line) - 80) {
+        n += snprintf(line + n, sizeof(line) - (size_t)n,
+                      " t20=%d t24=%d t28=%d f2c=%d f2d=%d f2e=%d",
+                      t20, t24, t28, f2c, f2d, f2e);
+    }
     if (!ok && n > 0 && (size_t)n < sizeof(line) - 32) {
         n += snprintf(line + n, sizeof(line) - (size_t)n, " reason=%s", reason);
     }
@@ -609,7 +663,7 @@ static void practice_clock_probe_ctor(void)
 
     if (gmtime_r(&now, &tmv) != NULL) {
         n = snprintf(header, sizeof(header),
-                     "# practice_clock_probe v3 (chain probe + guarded position reads)\n"
+                     "# practice_clock_probe v4 (chain + guarded reads + chart-time probe)\n"
                      "# build=%s pid=%ld utc=%04d-%02d-%02dT%02d:%02d:%02dZ t0_ms=%llu\n",
                      PRACTICE_CLOCK_PROBE_VERSION, (long)getpid(),
                      tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
@@ -617,7 +671,7 @@ static void practice_clock_probe_ctor(void)
                      (unsigned long long)t0);
     } else {
         n = snprintf(header, sizeof(header),
-                     "# practice_clock_probe v3 (chain probe + guarded position reads)\n"
+                     "# practice_clock_probe v4 (chain + guarded reads + chart-time probe)\n"
                      "# build=%s pid=%ld t0_ms=%llu\n",
                      PRACTICE_CLOCK_PROBE_VERSION, (long)getpid(),
                      (unsigned long long)t0);
