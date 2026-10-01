@@ -1,4 +1,4 @@
-/* practice_clock_probe.c - S2b: chain probe + guarded reads + safe-read discovery (v5).
+/* practice_clock_probe.c - S2b: chain probe + guarded reads + checked S2b probes (v6).
  *
  * v9 scope (per the 2026-09-29 review), kept in v3:
  *   - NO active calls into game functions. Reads only.
@@ -24,29 +24,42 @@
  *     offset was also wrong by 0x1000000 (0x6539c0; correct: 0x16539c0).
  *   - v12 fix (S2b): mirror offset corrected; the disproven chain is replaced by a guarded
  *     DISCOVERY CRAWL for the scene/timeline (scene factory marker 0x14c0d08, timeline
- *     factory marker 0x14d0548). Every dereference goes through mach_vm_read_overwrite
- *     (weakly imported; if unavailable the crawl is disabled entirely and nothing is
- *     dereferenced), so garbage or unmapped pointers can no longer crash the process.
- *     Once found, the path is cached and the raw timeline fields are logged every read.
- *     See docs/s2b_static_findings.md and docs/s2b_v11_crash_and_v12_plan.md.
+ *     factory marker 0x14d0548). All probing reads go through mach_vm_read_overwrite
+ *     (weakly imported): reads of unmapped or garbage addresses return a failure instead
+ *     of faulting. Identity, liveness and concurrency of objects remain separately
+ *     unverified - a type marker proves WHAT an object is, never that it is the CURRENT
+ *     active one.
+ *   - v13 fix (S2b, after the 2026-10-01 review): ALL new S2b reads (mirror, dump,
+ *     singleton slot, crawl, walk) go through the single checked safe-read interface;
+ *     the whole S2b path is skipped when the identity check fails; read failures are
+ *     logged explicitly (never zeros as valid data). Weak symbols are FUNCTION symbols
+ *     only (task_self_trap + mach_vm_read_overwrite), address-checked before any call.
+ *     The discovered path is re-walked from the root object every cycle (no stale-object
+ *     reads). The crawl has a per-cycle read budget, a growing backoff interval, work
+ *     counters and an off switch (build flag PCP_CRAWL / env PCP_NO_CRAWL). See
+ *     docs/s2b_review_2026-10-01.md.
  *
  * Log: <sandbox>/Documents/practice_clock_probe.log (append-only).
  *   Header:  # practice_clock_probe v5 (chain + guarded reads + safe-read discovery)
  *            # build=<id> pid=<n> utc=<ISO8601Z> t0_ms=<n>
  *   Ident:   # ident base=0x.. slide=0x.. img=.. magic=<0|1> words=<0|1> vt=<0|1> ...
  *   Reads:   # reads mainhop=<cf-runloop|unavailable>
- *   Saferead:# saferead=<mach-vm/1|off/0>
+ *   Saferead:# saferead=<mach-vm/1|off/0> crawl=<on|off>
  *   Sample:  s seq=<n> t_ms=<n> dt_ms=<n> [gap=1]
  *   Chain:   c seq=<n> t_ms=<n> tid=<n> main=<0|1> state=<ready|not-ready|anomaly|changed>
  *            [slot=0x.. gg=0x.. am=0x.. pv=0x.. count=<n> chan0=0x..] [reason=<..>]
  *   Position: p seq=<n> t_ms=<n> t_q=<n> lag_ms=<n> tid=<n> main=<0|1> am=0x.. handle=0x..
- *            ok=<0|1> pos_ms=<n> ctM=<n> ctMok=<0|1> sr=<0|1> ctA=<0|1> cD=<0|1>
+ *            ok=<0|1> pos_ms=<n> safe=<0|1> reads=<n>/<n>/<n>/<n> cw=<0|1> cD=<0|1> ctA=<0|1>
+ *            ctM=<n|na> ctMok=<0|1> xf=<token>
  *            [path=<hub><style>+0x<off> tl=0x.. t20=<n> t24=<n> t28=<n> f2c=<n> f2d=<n> f2e=<n>]
- *            w=<16 x %08x> [reason=<..>]
- *            -- main-thread executed (main=1 expected); ctM = BSS mirror value (offset fixed
- *            in v12); sr = mach safe-read available; ctA = 1 when a timeline was found and
- *            read this cycle; cD = a path is discovered (cached until it breaks); w = 16 u32
- *            words at 0x16539a0 (mirror at index 8).
+ *            w=<16 x %08x|na> [reason=<..>]
+ *            -- main-thread executed (main=1 expected); safe = mach safe reads available;
+ *            reads = safe-read attempts/filtered/failed/budget-hit this cycle; cw = crawl
+ *            switch state; cD = a path is currently cached (re-walked from the root every
+ *            cycle); ctA = timeline fields read this cycle; ctM = BSS mirror - <n> only
+ *            when its checked read succeeded, else na; xf = last failure token
+ *            (none|mirror|dump|walk|scan|budget|fields|ident|nomach); w = 16 u32 words at
+ *            0x16539a0 (mirror at index 8), or na.
  *   Chain lines are change-driven (heartbeat every 60 samples). Position reads run at <=2 Hz
  *   only while: chain ready, channel-0 handle non-null, handle stable for >=250 ms, and no
  *   previous read is still in flight.
@@ -76,7 +89,7 @@
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
 #define FLUSH_EVERY_LINES 8
-#define LINEBUF 512
+#define LINEBUF 576
 #define HEARTBEAT_EVERY 60
 
 /* Image-relative offsets (vmaddr - 0x100000000 for this client build; EQUAL to file
@@ -432,49 +445,111 @@ static void padd(const char *s, size_t n)
 
 /* ------------------------------------------- safe reads + timeline discovery */
 
-/* mach_vm_read_overwrite is imported weakly: the build links even if the SDK stub lacks
- * the symbol; if it is absent at runtime the discovery crawl is disabled and no unverified
- * pointer is ever dereferenced. This is the v12 crash-proofing (the v11 device run crashed
- * once in read_trampoline on a garbage chain value that had passed the old guard). */
+/* ------------------------------------------- safe reads + timeline discovery */
+
+/* Weak FUNCTION imports only, address-checked before any call (no weak data variable is
+ * read unguarded; the mach_task_self_ fallback below checks the variable address first).
+ * mach_vm_read_overwrite turns reads of unmapped/garbage addresses into clean failures;
+ * if the symbols are absent at runtime the whole S2b read path is skipped and nothing is
+ * dereferenced. Identity, liveness and concurrency of objects remain separately
+ * unverified. */
+extern unsigned int task_self_trap(void) __attribute__((weak_import));
 extern unsigned int mach_task_self_ __attribute__((weak_import));
 extern int mach_vm_read_overwrite(unsigned int task, unsigned long long addr,
                                   unsigned long long size, unsigned long long data,
                                   unsigned long long *out_size) __attribute__((weak_import));
 
 static int g_safe_ok;
+static unsigned int g_task_port;
 
 static void saferead_init(void)
 {
-    g_safe_ok = (mach_task_self_ != 0) && (mach_vm_read_overwrite != NULL);
+    g_safe_ok = 0;
+    g_task_port = 0;
+    if (mach_vm_read_overwrite == NULL) {
+        return;
+    }
+    if (task_self_trap != NULL) {
+        g_task_port = task_self_trap();
+    }
+    if (g_task_port == 0 && &mach_task_self_ != NULL) {
+        g_task_port = mach_task_self_;   /* weak-var address checked before reading */
+    }
+    if (g_task_port != 0) {
+        g_safe_ok = 1;
+    }
 }
 
+/* Per-cycle work accounting for the S2b read path. */
+#define SR_BUDGET_PER_CYCLE 1500
+static int g_sr_budget;
+static int g_sr_reads;
+static int g_sr_filtered;
+static int g_sr_failed;
+static int g_sr_budget_hit;
+
+/* Heuristic PRE-FILTER for values treated as object pointers. Out-of-range values are
+ * counted as "filtered" - never as proof that an object does not exist. */
 static int ptr_range_ok(uint64_t p)
 {
     return (p & 7ull) == 0 && (p - 0x100000000ull) < 0x100000000ull;   /* [4 GiB, 8 GiB) */
 }
 
-/* Read 8 bytes without any risk of crashing on unmapped memory. Returns 0 unless the
- * address is in the expected object range, 8-aligned, and the read succeeded. */
-static int try_read64(uint64_t addr, uint64_t *out)
+/* Single checked read interface: the FULL length must be read or the read fails. */
+static int safe_read(uint64_t addr, void *dst, uint64_t len)
 {
     unsigned long long got = 0;
-    if (!g_safe_ok || !ptr_range_ok(addr)) {
+    if (!g_safe_ok) {
         return 0;
     }
-    if (mach_vm_read_overwrite(mach_task_self_, (unsigned long long)addr, 8ull,
-                               (unsigned long long)(uintptr_t)out, &got) != 0 || got != 8ull) {
+    if (g_sr_budget <= 0) {
+        g_sr_budget_hit = 1;
+        return 0;
+    }
+    g_sr_budget -= 1;
+    g_sr_reads += 1;
+    if (mach_vm_read_overwrite(g_task_port, (unsigned long long)addr, len,
+                               (unsigned long long)(uintptr_t)dst, &got) != 0 || got != len) {
+        g_sr_failed += 1;
         return 0;
     }
     return 1;
 }
 
-/* Cached discovered path (process lifetime; re-discovered when it breaks). */
+static int try_read64(uint64_t addr, uint64_t *out)
+{
+    if (!ptr_range_ok(addr)) {
+        g_sr_filtered += 1;
+        return 0;
+    }
+    return safe_read(addr, out, 8);
+}
+
+/* Discovered path description (re-walked from the ROOT object every cycle; a type marker
+ * proves what an object is, not that it is the current active one). */
 static int g_hit_valid;
-static uint64_t g_hit_anchor;    /* styles 1-3: the scene; style 4: the holder object      */
 static char g_hit_hub;           /* 'g' gg, 's' singleton, 'd' *(gg+0x88), 'o' *(gg+0x78) */
 static int g_hit_style;          /* 1 v=scene; 2 *(v+0x3a0)=scene; 3 *(v+0x2c0)=scene;
-                                    4 *(v+0x30)=tl                                     */
-static uint64_t g_hit_off;
+                                    4 *(v+0x30)=tl (v = a holder object)                */
+static uint64_t g_hit_off;       /* hub slot offset; 0 = the hub object itself           */
+
+/* Crawl scheduling: budgeted attempts with growing backoff after failures, and an
+ * independent off switch (build: -DPCP_CRAWL=0, runtime: env PCP_NO_CRAWL). */
+#ifndef PCP_CRAWL
+#define PCP_CRAWL 1
+#endif
+#define SCAN_BASE_INTERVAL 30
+static int g_crawl_enabled;
+static uint32_t g_scan_fail;
+static uint64_t g_scan_next_seq;
+
+static void crawl_init(void)
+{
+    g_crawl_enabled = PCP_CRAWL ? 1 : 0;
+    if (g_crawl_enabled && getenv("PCP_NO_CRAWL") != NULL) {
+        g_crawl_enabled = 0;
+    }
+}
 
 static int is_scene(uint64_t scene)
 {
@@ -512,24 +587,25 @@ static int crawl_slot(char hub, uint64_t off, uint64_t v, uint64_t *tl)
 {
     uint64_t scene = 0, t = 0;
     if (!ptr_range_ok(v)) {
+        g_sr_filtered += 1;      /* filtered, not "absent" */
         return 0;
     }
     if (is_scene(v) && try_read64(v + OFF_SCENE_TL, &t) && is_tl(t, tl)) {
-        g_hit_hub = hub; g_hit_style = 1; g_hit_off = off; g_hit_anchor = v;
+        g_hit_hub = hub; g_hit_style = 1; g_hit_off = off;
         return 1;
     }
     if (try_read64(v + OFF_HUB_SCENE_A, &scene) && is_scene(scene) &&
         try_read64(scene + OFF_SCENE_TL, &t) && is_tl(t, tl)) {
-        g_hit_hub = hub; g_hit_style = 2; g_hit_off = off; g_hit_anchor = scene;
+        g_hit_hub = hub; g_hit_style = 2; g_hit_off = off;
         return 1;
     }
     if (try_read64(v + OFF_HUB_SCENE_B, &scene) && is_scene(scene) &&
         try_read64(scene + OFF_SCENE_TL, &t) && is_tl(t, tl)) {
-        g_hit_hub = hub; g_hit_style = 3; g_hit_off = off; g_hit_anchor = scene;
+        g_hit_hub = hub; g_hit_style = 3; g_hit_off = off;
         return 1;
     }
     if (try_read64(v + OFF_SCENE_TL, &t) && is_tl(t, tl)) {
-        g_hit_hub = hub; g_hit_style = 4; g_hit_off = off; g_hit_anchor = v;
+        g_hit_hub = hub; g_hit_style = 4; g_hit_off = off;
         return 1;
     }
     return 0;
@@ -539,6 +615,7 @@ static int crawl_hub(char hub, uint64_t base, uint64_t max_off, uint64_t *tl)
 {
     uint64_t v = 0, off;
     if (!ptr_range_ok(base)) {
+        g_sr_filtered += 1;
         return 0;
     }
     if (crawl_slot(hub, 0, base, tl)) {          /* the hub object itself */
@@ -554,12 +631,11 @@ static int crawl_hub(char hub, uint64_t base, uint64_t max_off, uint64_t *tl)
 
 static int find_timeline(uint64_t gg, uint64_t *tl)
 {
-    uint64_t hub = 0;
-    uint64_t single = *(volatile uint64_t *)(uintptr_t)(g_base + OFF_SINGLETON);
+    uint64_t hub = 0, single = 0;
     if (crawl_hub('g', gg, 0xf0, tl)) {
         return 1;
     }
-    if (crawl_hub('s', single, 0xf0, tl)) {
+    if (safe_read(g_base + OFF_SINGLETON, &single, 8) && crawl_hub('s', single, 0xf0, tl)) {
         return 1;
     }
     if (try_read64(gg + OFF_GG_D88, &hub) && crawl_hub('d', hub, 0x58, tl)) {
@@ -571,38 +647,114 @@ static int find_timeline(uint64_t gg, uint64_t *tl)
     return 0;
 }
 
-static int walk_hit(uint64_t *tl)
+/* Re-resolve the hub from the CURRENT root objects every cycle (d88/o78 are GameGlobal
+ * fields and must be re-read; the singleton is a static slot re-read via safe_read). */
+static int resolve_hub(char hub, uint64_t gg, uint64_t *base)
 {
-    uint64_t t = 0;
-    if (g_hit_style == 4) {
-        return try_read64(g_hit_anchor + OFF_SCENE_TL, &t) && is_tl(t, tl);
+    uint64_t v = 0;
+    if (hub == 'g') {
+        *base = gg;
+        return 1;
     }
-    return is_scene(g_hit_anchor) &&
-           try_read64(g_hit_anchor + OFF_SCENE_TL, &t) && is_tl(t, tl);
+    if (hub == 's') {
+        if (!safe_read(g_base + OFF_SINGLETON, &v, 8)) {
+            return 0;
+        }
+    } else if (hub == 'd') {
+        if (!try_read64(gg + OFF_GG_D88, &v)) {
+            return 0;
+        }
+    } else if (hub == 'o') {
+        if (!try_read64(gg + OFF_GG_O78, &v)) {
+            return 0;
+        }
+    } else {
+        return 0;
+    }
+    *base = v;
+    return 1;
 }
 
-/* Runs on the main thread; every dereference is a mach safe read. */
+/* Full re-walk from the root: hub -> slot -> scene (marker) -> timeline (marker). */
+static int walk_hit(uint64_t gg, uint64_t *tl)
+{
+    uint64_t hub = 0, v = 0, scene = 0, t = 0;
+    if (g_hit_style < 1 || g_hit_style > 4) {
+        return 0;
+    }
+    if (!resolve_hub(g_hit_hub, gg, &hub) || !ptr_range_ok(hub)) {
+        g_sr_filtered += 1;
+        return 0;
+    }
+    if (g_hit_off == 0) {
+        v = hub;
+    } else if (!try_read64(hub + g_hit_off, &v)) {
+        return 0;
+    }
+    if (!ptr_range_ok(v)) {
+        g_sr_filtered += 1;
+        return 0;
+    }
+    switch (g_hit_style) {
+    case 1:
+        scene = v;
+        break;
+    case 2:
+        if (!try_read64(v + OFF_HUB_SCENE_A, &scene)) {
+            return 0;
+        }
+        break;
+    case 3:
+        if (!try_read64(v + OFF_HUB_SCENE_B, &scene)) {
+            return 0;
+        }
+        break;
+    default:    /* style 4: v is a holder whose +0x30 is the timeline */
+        return try_read64(v + OFF_SCENE_TL, &t) && is_tl(t, tl);
+    }
+    if (!is_scene(scene)) {
+        return 0;
+    }
+    return try_read64(scene + OFF_SCENE_TL, &t) && is_tl(t, tl);
+}
+
+/* Runs on the main thread; every read goes through the checked safe-read interface.
+ * The crawl runs only when scheduled (backoff), never on every time sample. */
 static void ct_probe(uint64_t gg, uint64_t *tl, int *ctA, int *t20, int *t24, int *t28,
-                     int *f2c, int *f2d, int *f2e, char *path, size_t pathlen)
+                     int *f2c, int *f2d, int *f2e, char *path, size_t pathlen,
+                     const char **xf, uint64_t seq)
 {
     *ctA = 0;
     path[0] = '\0';
     if (!g_safe_ok || !ptr_range_ok(gg)) {
         return;
     }
-    if (g_hit_valid && !walk_hit(tl)) {
+    if (g_hit_valid && !walk_hit(gg, tl)) {
         g_hit_valid = 0;                    /* path broke (scene recreated): re-locate */
+        *xf = "walk";
+    }
+    if (!g_hit_valid && g_crawl_enabled && seq >= g_scan_next_seq) {
+        if (find_timeline(gg, tl)) {
+            g_hit_valid = 1;
+            g_scan_fail = 0;
+            g_scan_next_seq = seq + SCAN_BASE_INTERVAL;
+        } else {
+            if (g_scan_fail < 6) {
+                g_scan_fail += 1;
+            }
+            g_scan_next_seq = seq + (uint64_t)(SCAN_BASE_INTERVAL << g_scan_fail);
+            *xf = g_sr_budget_hit ? "budget" : "scan";
+        }
     }
     if (!g_hit_valid) {
-        if (!find_timeline(gg, tl)) {
-            return;
-        }
-        g_hit_valid = 1;
+        return;
     }
     if (!tl_read_fields(*tl, t20, t24, t28, f2c, f2d, f2e)) {
+        *xf = "fields";
         return;
     }
     *ctA = 1;
+    *xf = "none";
     snprintf(path, pathlen, "%c%d+0x%x", g_hit_hub, g_hit_style, (unsigned)g_hit_off);
 }
 
@@ -613,13 +765,16 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     uint64_t now;
     uint64_t tid = 0;
     uint64_t tl = 0;
-    uint32_t words[CT_DUMP_WORDS];
+    uint32_t words[CT_DUMP_WORDS] = {0};
     int pos = -1;
     int ok = 0;
-    int ctM = 0, ctMok = 0, ctA = 0;
+    int ctM = 0, ctMok = 0, ctA = 0, ctMr = 0, dumpr = 0;
     int t20 = 0, t24 = 0, t28 = 0;
     int f2c = -1, f2d = -1, f2e = -1;
+    int sr_reads = 0, sr_filt = 0, sr_fail = 0, sr_bh = 0;
+    const char *xf = "none";
     char path[24];
+    char ctMbuf[16];
     const char *reason = "";
     char line[LINEBUF];
     int n;
@@ -637,43 +792,64 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
         pos = fn((void *)(uintptr_t)cs.am);
         ok = 1;
     }
-    /* chart-time probes + discovery crawl (safe reads only; no new calls) */
-    ctM = *(volatile int32_t *)(uintptr_t)(g_base + OFF_CT_MIRROR);
-    if (ctM > -(1 << 26) && ctM < (1 << 26)) {
-        ctMok = 1;
-    }
-    {
-        const uint32_t *dw = (const uint32_t *)(const void *)(uintptr_t)(g_base + OFF_CT_DUMP_BASE);
-        int i;
-        for (i = 0; i < CT_DUMP_WORDS; i++) {
-            words[i] = dw[i];
+    /* S2b probes: checked safe reads only; the whole path is skipped without ident/mach */
+    if (g_ident_ok && g_safe_ok) {
+        g_sr_budget = SR_BUDGET_PER_CYCLE;
+        g_sr_reads = 0;
+        g_sr_filtered = 0;
+        g_sr_failed = 0;
+        g_sr_budget_hit = 0;
+        ctMr = safe_read(g_base + OFF_CT_MIRROR, &ctM, 4);
+        if (ctMr && ctM > -(1 << 26) && ctM < (1 << 26)) {
+            ctMok = 1;
         }
-    }
-    if (g_ident_ok && cs.state == CH_READY) {
-        ct_probe(cs.gg, &tl, &ctA, &t20, &t24, &t28, &f2c, &f2d, &f2e, path, sizeof(path));
+        dumpr = safe_read(g_base + OFF_CT_DUMP_BASE, words, sizeof(words));
+        if (!ctMr) {
+            xf = "mirror";
+        } else if (!dumpr) {
+            xf = "dump";
+        }
+        if (cs.state == CH_READY) {
+            ct_probe(cs.gg, &tl, &ctA, &t20, &t24, &t28, &f2c, &f2d, &f2e,
+                     path, sizeof(path), &xf, (uint64_t)task->q_seq);
+        }
+        sr_reads = g_sr_reads;
+        sr_filt = g_sr_filtered;
+        sr_fail = g_sr_failed;
+        sr_bh = g_sr_budget_hit;
+    } else {
+        xf = g_safe_ok ? "ident" : "nomach";
     }
     now = monotonic_ms();
     pthread_threadid_np(NULL, &tid);
+    if (ctMr) {
+        snprintf(ctMbuf, sizeof(ctMbuf), "%d", ctM);
+    } else {
+        snprintf(ctMbuf, sizeof(ctMbuf), "na");
+    }
     n = snprintf(line, sizeof(line),
                  "p seq=%llu t_ms=%llu t_q=%llu lag_ms=%llu tid=%llu main=%d am=%llx handle=%llx ok=%d pos_ms=%d"
-                 " ctM=%d ctMok=%d sr=%d ctA=%d cD=%d",
+                 " safe=%d reads=%d/%d/%d/%d cw=%d cD=%d ctA=%d ctM=%s ctMok=%d xf=%s",
                  (unsigned long long)task->q_seq, (unsigned long long)now,
                  (unsigned long long)task->q_t_ms, (unsigned long long)(now - task->q_t_ms),
                  (unsigned long long)tid, pthread_main_np() ? 1 : 0,
                  (unsigned long long)cs.am, (unsigned long long)cs.chan0, ok, pos,
-                 ctM, ctMok, g_safe_ok ? 1 : 0, ctA, g_hit_valid ? 1 : 0);
+                 g_safe_ok ? 1 : 0, sr_reads, sr_filt, sr_fail, sr_bh,
+                 g_crawl_enabled ? 1 : 0, g_hit_valid ? 1 : 0, ctA, ctMbuf, ctMok, xf);
     if (ctA && n > 0 && (size_t)n < sizeof(line) - 128) {
         n += snprintf(line + n, sizeof(line) - (size_t)n,
                       " path=%s tl=%llx t20=%d t24=%d t28=%d f2c=%d f2d=%d f2e=%d",
                       path, (unsigned long long)tl, t20, t24, t28, f2c, f2d, f2e);
     }
-    if (n > 0 && (size_t)n < sizeof(line) - 160) {
+    if (dumpr && n > 0 && (size_t)n < sizeof(line) - 160) {
         int i;
         n += snprintf(line + n, sizeof(line) - (size_t)n, " w=");
         for (i = 0; i < CT_DUMP_WORDS; i++) {
             n += snprintf(line + n, sizeof(line) - (size_t)n, "%s%08x",
                           i ? " " : "", (unsigned)words[i]);
         }
+    } else if (!dumpr && n > 0 && (size_t)n < sizeof(line) - 8) {
+        n += snprintf(line + n, sizeof(line) - (size_t)n, " w=na");
     }
     if (!ok && n > 0 && (size_t)n < sizeof(line) - 32) {
         n += snprintf(line + n, sizeof(line) - (size_t)n, " reason=%s", reason);
@@ -853,10 +1029,11 @@ static void practice_clock_probe_ctor(void)
     init_log_path();
     ident_check();
     saferead_init();
+    crawl_init();
 
     if (gmtime_r(&now, &tmv) != NULL) {
         n = snprintf(header, sizeof(header),
-                     "# practice_clock_probe v5 (chain + guarded reads + safe-read discovery)\n"
+                     "# practice_clock_probe v6 (chain + guarded reads + checked S2b probes)\n"
                      "# build=%s pid=%ld utc=%04d-%02d-%02dT%02d:%02d:%02dZ t0_ms=%llu\n",
                      PRACTICE_CLOCK_PROBE_VERSION, (long)getpid(),
                      tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
@@ -864,7 +1041,7 @@ static void practice_clock_probe_ctor(void)
                      (unsigned long long)t0);
     } else {
         n = snprintf(header, sizeof(header),
-                     "# practice_clock_probe v5 (chain + guarded reads + safe-read discovery)\n"
+                     "# practice_clock_probe v6 (chain + guarded reads + checked S2b probes)\n"
                      "# build=%s pid=%ld t0_ms=%llu\n",
                      PRACTICE_CLOCK_PROBE_VERSION, (long)getpid(),
                      (unsigned long long)t0);
@@ -903,6 +1080,12 @@ static void practice_clock_probe_ctor(void)
 
     n = snprintf(header, sizeof(header), "# saferead=%s\n",
                  g_safe_ok ? "mach-vm/1" : "off/0");
+    if (n > 0 && (size_t)n < sizeof(header)) {
+        append_raw(header, (size_t)n);
+    }
+
+    n = snprintf(header, sizeof(header), "# crawl=%s\n",
+                 g_crawl_enabled ? "on" : "off");
     if (n > 0 && (size_t)n < sizeof(header)) {
         append_raw(header, (size_t)n);
     }
