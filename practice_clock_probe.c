@@ -1,4 +1,4 @@
-/* practice_clock_probe.c - S3a: session-chain probe + rate-entry read (v8).
+/* practice_clock_probe.c - S3a: session-chain resolver + diagnostics (v9).
  *
  * v9 scope (per the 2026-09-29 review), kept in v3:
  *   - NO active calls into game functions. Reads only.
@@ -54,9 +54,18 @@
  *     marker-driven field scan (0x00..0x380) locates the session pointer once (offset
  *     cached). Session/scene/flag reads are logged; NO writes. See
  *     docs/s3a_control_interface_notes.md.
+ *   - v16 (S3a resolver diagnostics): the v15 single-hop probe is generalized into a
+ *     bounded resolver - it logs RAW diagnostic values (singleton, sing+0x148, gg,
+ *     gg+0x88 + its vtable, sing+0x140 + its vtable) and searches (one-shot per round,
+ *     cached per class, marker-driven, with backoff) three windows (singleton
+ *     0x00..0x1f8, GameGlobal 0x00..0xf0, gg+0x88 object 0x00..0x100) for pointers
+ *     carrying the session vtable, the wrapper vtable, the scene marker or the timeline
+ *     marker; a found wrapper additionally gets the bounded field scan (0x00..0x380) for
+ *     the session pointer. Every resolved route is re-validated every cycle. NO writes.
+ *     See docs/s3a_control_interface_notes.md.
  *
  * Log: <sandbox>/Documents/practice_clock_probe.log (append-only).
- *   Header:  # practice_clock_probe v8 (S3a: session chain + rate-entry read)
+ *   Header:  # practice_clock_probe v9 (S3a: resolver diagnostics)
  *            # build=<id> pid=<n> utc=<ISO8601Z> t0_ms=<n>
  *   Ident:   # ident base=0x.. slide=0x.. img=.. magic=<0|1> words=<0|1> vt=<0|1> ...
  *   Reads:   # reads mainhop=<cf-runloop|unavailable>
@@ -66,23 +75,25 @@
  *            [slot=0x.. gg=0x.. am=0x.. pv=0x.. count=<n> chan0=0x..] [reason=<..>]
  *   Position: p seq=<n> t_ms=<n> t_q=<n> lag_ms=<n> tid=<n> main=<0|1> am=0x.. handle=0x..
  *            ok=<0|1> pos_ms=<n> pitch=<f.ffff|na> pchret=<n> pcherr=<token> safe=<0|1>
- *            reads=<n>/<n>/<n>/<n> cD=<0|1> soff=0x<off> sf=<n|-1> s470=<n|-1> s474=<n>
- *            t30=<n> ctA=<0|1> ctM=<n|na> ctMok=<0|1> xf=<token>
+ *            reads=<n>/<n>/<n>/<n> cD=<0|1> via=<token> soff=0x<off> sf=<n|-1> s470=<n|-1>
+ *            s474=<n> t30=<n> ctA=<0|1> ctM=<n|na> ctMok=<0|1> xf=<token>
+ *            s1=0x.. ho=0x.. g0=0x.. g88=0x.. g88v=0x.. h140=0x.. v140=0x..
  *            [sess=0x.. sc=0x.. tl=0x.. t20=<n> t24=<n> t28=<n> f2c=<n> f2d=<n> f2e=<n>]
  *            w=<16 x %08x|na> [reason=<..>]
  *            -- main-thread executed (main=1 expected); pitch = BGM channel pitch (float,
  *            4 decimals; checked finite and in range BEFORE use; na when invalid) with
  *            pchret = FMOD result code and pcherr = failure reason (none|ret|notfinite|
- *            range); safe = mach safe reads available; reads = safe-read
- *            attempts/filtered/failed/budget-hit this cycle; cD = the session chain
- *            resolved this cycle (re-walked from the static singleton root; every hop
- *            marker-validated); soff = cached session field offset inside the registered
- *            object (0 = direct); sf = scene pause/finish flag byte, s470 = session pause
- *            byte, s474 = session resume value, t30 = timeline bound (-1/0 when
- *            unreadable); ctA = timeline fields read this cycle; ctM = BSS mirror - <n>
- *            only when its checked read succeeded, else na; xf = last failure token
- *            (none|mirror|dump|sess|fields|ident|nomach); w = 16 u32 words at 0x16539a0
- *            (mirror at index 8), or na.
+ *            range); safe = mach safe reads available; reads = safe-read attempts/filtered/
+ *            failed/budget-hit this cycle; cD = a validated route to the timeline resolved
+ *            this cycle; via = route tag (s1|gg|g8 + field offset; sc = scene-class only;
+ *            tl = timeline-class only); soff = cached wrapper->session field offset;
+ *            sf = scene pause/finish flag byte, s470 = session pause byte, s474 = session
+ *            resume value, t30 = timeline bound (-1/0 when unreadable); ctA = timeline
+ *            fields read this cycle; ctM = BSS mirror - <n> only when its checked read
+ *            succeeded, else na; xf = last failure token (none|mirror|dump|sess|fields|
+ *            ident|nomach); s1..v140 = raw diagnostic values (singleton; [sing+0x148];
+ *            gg; [gg+0x88]; its vtable; [sing+0x140]; its vtable); w = 16 u32 words at
+ *            0x16539a0 (mirror at index 8), or na.
  *   Chain lines are change-driven (heartbeat every 60 samples). Position reads run at <=2 Hz
  *   only while: chain ready, channel-0 handle non-null, handle stable for >=250 ms, and no
  *   previous read is still in flight.
@@ -108,12 +119,12 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "s3a-session-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "s3a-resolve-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
 #define FLUSH_EVERY_LINES 8
-#define LINEBUF 640
+#define LINEBUF 832
 #define HEARTBEAT_EVERY 60
 
 /* Image-relative offsets (vmaddr - 0x100000000 for this client build; EQUAL to file
@@ -141,7 +152,10 @@
 #define OFF_CT_DUMP_BASE      0x16539a0ULL  /* 16 u32 words around the mirror          */
 #define OFF_SINGLETON         0x1660280ULL  /* app singleton global                    */
 #define OFF_SING_OBJ          0x148ULL      /* singleton -> registered session/wrapper */
+#define OFF_SING_H140         0x140ULL      /* singleton -> transition object (diagnostic)*/
+#define OFF_GG_O88            0x88ULL       /* GameGlobal -> service object (diagnostic)  */
 #define SESS_VT_OFF           0x1521dc0ULL  /* GameSession vtable (ctor 0xca4624)      */
+#define WRAP_VT_OFF           0x14cbcc8ULL  /* wrapper vtable (0x388 object family)    */
 #define OFF_SESS_SCENE        0x3a0ULL      /* session -> scene                        */
 #define OFF_SESS_470          0x470ULL      /* session: pause byte + resume value      */
 #define OFF_SCENE_TL          0x30ULL       /* scene -> GameTimeline                   */
@@ -554,14 +568,42 @@ static int try_read64(uint64_t addr, uint64_t *out)
     return safe_read(addr, out, 8);
 }
 
-/* Session-chain discovery (v15): static singleton -> [singleton+0x148] -> session
- * (GameSession: ctor 0xca4624, vtable 0x1521dc0, size 0x4a0) -> session+0x3a0 -> scene
- * (marker 0x14c0d08) -> scene+0x30 -> timeline (marker 0x14d0548). The object registered
- * at singleton+0x148 may be a wrapper (vtable 0x14cbcc8 family); if its own vtable is not
- * the session vtable, a BOUNDED scan over its fields (0x00..0x380, 8-aligned) searches
- * for a pointer whose target carries the session vtable; the offset is cached once found.
- * Every cycle re-walks from the ROOT; every hop is marker-validated; all reads are safe. */
-static uint64_t g_sess_off;      /* cached session-pointer field offset (0 = direct)     */
+/* v16 resolver: routes to the ACTIVE gameplay session/scene/timeline.
+ * Static map (see docs/s3a_control_interface_notes.md): singleton getter fn 0xe554c0
+ * lazily creates the root object (size 0x208) and caches it at slot 0x1660280;
+ * GameSession (ctor 0xca4624, vtable 0x1521dc0, size 0x4a0) is created, wrapped and
+ * registered into [singleton+0x148]; scene (marker 0x14c0d08) hangs off [session+0x3a0];
+ * timeline (marker 0x14d0548) off [scene+0x30]. The registered slot was EMPTY on the
+ * first device run (v15); v16 therefore logs raw values and searches, one-shot and
+ * marker-driven, bounded windows of the singleton, the GameGlobal and the gg+0x88
+ * object for pointers carrying one of four markers (session vt, wrapper vt, scene,
+ * timeline). Found offsets are cached per class (with a source tag), re-validated
+ * every cycle, and cleared after repeated invalidation so a later rescan can refind.
+ * All reads go through the checked safe-read interface; NO writes anywhere. */
+static uint64_t g_sess_off;      /* wrapper -> session field offset (0 = unknown)       */
+static int g_has_soff;           /* a wrapper->session offset is cached                 */
+static uint64_t g_off_sess;      /* class: session-vt pointer                           */
+static int g_src_sess;           /* 1 sing, 2 gg, 3 gg+0x88                             */
+static int g_has_sess;
+static uint64_t g_off_wrap;      /* class: wrapper-vt pointer                           */
+static int g_src_wrap;
+static int g_has_wrap;
+static uint64_t g_off_scene;     /* class: scene marker pointer                         */
+static int g_src_scene;
+static int g_has_scene;
+static uint64_t g_off_tl;        /* class: timeline marker pointer                      */
+static int g_src_tl;
+static int g_has_tl;
+static int g_inval_sess, g_inval_scene, g_inval_tl;
+
+/* discovery scheduling: bounded one-shot rounds with backoff while unresolved */
+#define DISC_BASE_INTERVAL 30
+static uint32_t g_disc_fail;
+static uint64_t g_disc_next_seq;
+
+typedef struct raw_diag {
+    uint64_t s1, ho, g0, g88, g88v, h140, v140;
+} raw_diag_t;
 
 static int is_scene(uint64_t scene)
 {
@@ -601,53 +643,181 @@ static int is_sess(uint64_t p)
     return p != 0 && try_read64(p, &v) && v == g_base + SESS_VT_OFF;
 }
 
-/* Re-walk the static session chain from the root. Every hop is marker-validated. */
-static int session_chain_walk(uint64_t *sess, uint64_t *scene, uint64_t *tl)
+static int is_wrap(uint64_t p)
 {
-    uint64_t sing = 0, objB = 0, s = 0, sc = 0, t = 0;
-    if (!safe_read(g_base + OFF_SINGLETON, &sing, 8) || !ptr_range_ok(sing)) {
+    uint64_t v = 0;
+    return p != 0 && try_read64(p, &v) && v == g_base + WRAP_VT_OFF;
+}
+
+static const char *src_tag(int src)
+{
+    return src == 1 ? "s1" : (src == 2 ? "gg" : (src == 3 ? "g8" : "??"));
+}
+
+/* Base object for a class source tag (re-read from roots every call). */
+static uint64_t src_base(int src, uint64_t sing)
+{
+    uint64_t gg = 0, o = 0;
+    if (src == 1) {
+        return sing;
+    }
+    if (!safe_read(g_base + OFF_SLOT, &gg, 8) || !ptr_range_ok(gg)) {
         return 0;
     }
-    if (!safe_read(sing + OFF_SING_OBJ, &objB, 8) || !ptr_range_ok(objB)) {
-        return 0;
+    if (src == 2) {
+        return gg;
     }
-    if (is_sess(objB)) {
-        s = objB;                      /* the registered object is the session itself */
-    } else if (g_sess_off != 0) {
-        if (!try_read64(objB + g_sess_off, &s) || !is_sess(s)) {
-            return 0;                  /* cached offset no longer valid */
-        }
-    } else {
-        uint64_t off;
-        for (off = 0; off <= 0x380; off += 8) {   /* bounded marker-driven scan */
-            if (try_read64(objB + off, &s) && is_sess(s)) {
-                g_sess_off = off;
-                break;
-            }
-            s = 0;
-        }
-        if (s == 0) {
+    if (src == 3) {
+        if (!try_read64(gg + OFF_GG_O88, &o) || !ptr_range_ok(o)) {
             return 0;
         }
+        return o;
     }
-    if (!try_read64(s + OFF_SESS_SCENE, &sc) || !is_scene(sc)) {
+    return 0;
+}
+
+/* One bounded window pass: first hit per class wins. Marker-driven only. */
+static void marker_scan(uint64_t obj, int src, uint64_t limit)
+{
+    uint64_t off, v = 0, t = 0;
+    if (!ptr_range_ok(obj)) {
+        return;
+    }
+    for (off = 0; off <= limit; off += 8) {
+        if (!try_read64(obj + off, &v) || v == 0 || !ptr_range_ok(v)) {
+            continue;
+        }
+        if (!try_read64(v, &t)) {
+            continue;
+        }
+        if (!g_has_sess && t == g_base + SESS_VT_OFF) {
+            g_has_sess = 1; g_off_sess = off; g_src_sess = src;
+        } else if (!g_has_wrap && t == g_base + WRAP_VT_OFF) {
+            g_has_wrap = 1; g_off_wrap = off; g_src_wrap = src;
+        } else if (!g_has_scene && t == g_base + SCENE_MARKER_OFF) {
+            g_has_scene = 1; g_off_scene = off; g_src_scene = src;
+        } else if (!g_has_tl && t == g_base + TL_MARKER_OFF) {
+            g_has_tl = 1; g_off_tl = off; g_src_tl = src;
+        }
+    }
+}
+
+/* One bounded discovery round over the three windows (+ wrapper field scan). */
+static void scan_round(uint64_t sing)
+{
+    uint64_t gg = 0, g88 = 0, w = 0, v = 0, t = 0, off;
+    marker_scan(sing, 1, 0x1f8);
+    if (safe_read(g_base + OFF_SLOT, &gg, 8) && ptr_range_ok(gg)) {
+        marker_scan(gg, 2, 0xf0);
+        if (try_read64(gg + OFF_GG_O88, &g88) && ptr_range_ok(g88)) {
+            marker_scan(g88, 3, 0x100);
+        }
+    }
+    if (g_has_wrap && !g_has_soff) {
+        uint64_t b = src_base(g_src_wrap, sing);
+        if (b && try_read64(b + g_off_wrap, &w) && is_wrap(w)) {
+            for (off = 0; off <= 0x380; off += 8) {
+                if (try_read64(w + off, &v) && v != 0 && ptr_range_ok(v) &&
+                    try_read64(v, &t) && t == g_base + SESS_VT_OFF) {
+                    g_has_soff = 1;
+                    g_sess_off = off;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/* Cached-class lookups. A class that keeps failing is dropped for a rescan. */
+static void pick_classes(uint64_t sing, uint64_t *sess, uint64_t *scene, uint64_t *tl)
+{
+    uint64_t b = 0, v = 0, s2 = 0, t = 0;
+    *sess = 0; *scene = 0; *tl = 0;
+    if (g_has_sess) {
+        b = src_base(g_src_sess, sing);
+        if (b && try_read64(b + g_off_sess, &v) && is_sess(v)) {
+            *sess = v; g_inval_sess = 0;
+        } else if (++g_inval_sess >= 8) {
+            g_has_sess = 0; g_inval_sess = 0;
+        }
+    }
+    if (!*sess && g_has_wrap && g_has_soff) {
+        b = src_base(g_src_wrap, sing);
+        if (b && try_read64(b + g_off_wrap, &v) && is_wrap(v) &&
+            try_read64(v + g_sess_off, &s2) && is_sess(s2)) {
+            *sess = s2;
+        }
+    }
+    if (g_has_scene) {
+        b = src_base(g_src_scene, sing);
+        if (b && try_read64(b + g_off_scene, &v) && is_scene(v)) {
+            *scene = v; g_inval_scene = 0;
+        } else if (++g_inval_scene >= 8) {
+            g_has_scene = 0; g_inval_scene = 0;
+        }
+    }
+    if (g_has_tl) {
+        b = src_base(g_src_tl, sing);
+        if (b && try_read64(b + g_off_tl, &v) && is_tl(v, &t)) {
+            *tl = t; g_inval_tl = 0;
+        } else if (++g_inval_tl >= 8) {
+            g_has_tl = 0; g_inval_tl = 0;
+        }
+    }
+    if (!*scene && *sess) {
+        if (try_read64(*sess + OFF_SESS_SCENE, &v) && is_scene(v)) {
+            *scene = v;
+        }
+    }
+    if (!*tl && *scene) {
+        if (try_read64(*scene + OFF_SCENE_TL, &v) && is_tl(v, tl)) {
+            *tl = v;
+        }
+    }
+}
+
+/* Resolve the best route this cycle; returns 1 when a timeline is available. */
+static int resolve_chain(uint64_t sing, uint64_t *sess, uint64_t *scene, uint64_t *tl,
+                         char *via, size_t vialen, uint64_t seq)
+{
+    *via = '\0';
+    pick_classes(sing, sess, scene, tl);
+    if (!*tl && seq >= g_disc_next_seq) {
+        scan_round(sing);
+        pick_classes(sing, sess, scene, tl);
+        if (*tl) {
+            g_disc_fail = 0;
+            g_disc_next_seq = seq + DISC_BASE_INTERVAL;
+        } else {
+            if (g_disc_fail < 6) {
+                g_disc_fail += 1;
+            }
+            g_disc_next_seq = seq + (uint64_t)(DISC_BASE_INTERVAL << g_disc_fail);
+        }
+    }
+    if (!*tl) {
         return 0;
     }
-    if (!try_read64(sc + OFF_SCENE_TL, &t) || !is_tl(t, tl)) {
-        return 0;
+    if (g_has_sess && *sess) {
+        snprintf(via, vialen, "%s+%x", src_tag(g_src_sess), (unsigned)g_off_sess);
+    } else if (g_has_wrap && g_has_soff && *sess) {
+        snprintf(via, vialen, "wr.+%x/%x", (unsigned)g_off_wrap, (unsigned)g_sess_off);
+    } else if (*scene) {
+        snprintf(via, vialen, "sc");
+    } else {
+        snprintf(via, vialen, "tl");
     }
-    *sess = s;
-    *scene = sc;
     return 1;
 }
 
-/* Runs on the main thread; every read goes through the checked safe-read interface.
- * The chain is re-walked from the static root on every cycle (no stale-object use). */
+/* Runs on the main thread; every read goes through the checked safe-read interface. */
 static void ct_probe(uint64_t *tl, int *ctCd, int *ctA, int *t20, int *t24, int *t28,
                      int *f2c, int *f2d, int *f2e, int *sf, int *s470, int *s474, int *t30,
-                     uint64_t *sess_out, uint64_t *scene_out, const char **xf)
+                     uint64_t *sess_out, uint64_t *scene_out, const char **xf,
+                     uint64_t seq, char *via, size_t vialen, raw_diag_t *dg)
 {
-    uint64_t sess = 0, scene = 0, v = 0;
+    uint64_t sing = 0, gg = 0, g88 = 0, v = 0;
+    uint64_t sess = 0, scene = 0;
     *ctCd = 0;
     *ctA = 0;
     *sf = -1;
@@ -656,20 +826,36 @@ static void ct_probe(uint64_t *tl, int *ctCd, int *ctA, int *t20, int *t24, int 
     *t30 = 0;
     *sess_out = 0;
     *scene_out = 0;
+    via[0] = '\0';
+    memset(dg, 0, sizeof(*dg));
     if (!g_safe_ok) {
         return;
     }
-    if (!session_chain_walk(&sess, &scene, tl)) {
+    if (safe_read(g_base + OFF_SINGLETON, &sing, 8) && ptr_range_ok(sing)) {
+        dg->s1 = sing;
+        (void)try_read64(sing + OFF_SING_OBJ, &dg->ho);
+        if (try_read64(sing + OFF_SING_H140, &dg->h140) && ptr_range_ok(dg->h140)) {
+            (void)try_read64(dg->h140, &dg->v140);
+        }
+    }
+    if (safe_read(g_base + OFF_SLOT, &gg, 8) && ptr_range_ok(gg)) {
+        dg->g0 = gg;
+        if (try_read64(gg + OFF_GG_O88, &g88) && ptr_range_ok(g88)) {
+            dg->g88 = g88;
+            (void)try_read64(g88, &dg->g88v);
+        }
+    }
+    if (!resolve_chain(sing, &sess, &scene, tl, via, vialen, seq)) {
         *xf = "sess";
         return;
     }
     *ctCd = 1;
     *sess_out = sess;
     *scene_out = scene;
-    if (try_read64(scene + OFF_SCENE_SF, &v)) {
+    if (scene != 0 && try_read64(scene + OFF_SCENE_SF, &v)) {
         *sf = (int)(v & 0xffull);
     }
-    if (try_read64(sess + OFF_SESS_470, &v)) {
+    if (sess != 0 && try_read64(sess + OFF_SESS_470, &v)) {
         *s470 = (int)(v & 0xffull);
         *s474 = (int)(uint32_t)(v >> 32);
     }
@@ -703,7 +889,9 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     int f2c = -1, f2d = -1, f2e = -1;
     int sr_reads = 0, sr_filt = 0, sr_fail = 0, sr_bh = 0;
     uint64_t sess_addr = 0, scene_addr = 0;
+    raw_diag_t dg;
     const char *xf = "none";
+    char via[24];
     char ctMbuf[16];
     char pitchbuf[16];
     const char *reason = "";
@@ -760,7 +948,8 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
         }
         if (cs.state == CH_READY) {
             ct_probe(&tl, &ctCd, &ctA, &t20, &t24, &t28, &f2c, &f2d, &f2e,
-                     &sf, &s470, &s474, &t30, &sess_addr, &scene_addr, &xf);
+                     &sf, &s470, &s474, &t30, &sess_addr, &scene_addr, &xf,
+                     (uint64_t)task->q_seq, via, sizeof(via), &dg);
         }
         sr_reads = g_sr_reads;
         sr_filt = g_sr_filtered;
@@ -783,7 +972,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     }
     n = snprintf(line, sizeof(line),
                  "p seq=%llu t_ms=%llu t_q=%llu lag_ms=%llu tid=%llu main=%d am=%llx handle=%llx ok=%d pos_ms=%d"
-                 " pitch=%s pchret=%d pcherr=%s safe=%d reads=%d/%d/%d/%d cD=%d soff=0x%x"
+                 " pitch=%s pchret=%d pcherr=%s safe=%d reads=%d/%d/%d/%d cD=%d via=%s soff=0x%x"
                  " sf=%d s470=%d s474=%d t30=%d ctA=%d ctM=%s ctMok=%d xf=%s",
                  (unsigned long long)task->q_seq, (unsigned long long)now,
                  (unsigned long long)task->q_t_ms, (unsigned long long)(now - task->q_t_ms),
@@ -791,7 +980,16 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                  (unsigned long long)cs.am, (unsigned long long)cs.chan0, ok, pos,
                  pitchbuf, pret, pitch_why,
                  g_safe_ok ? 1 : 0, sr_reads, sr_filt, sr_fail, sr_bh,
-                 ctCd, (unsigned)g_sess_off, sf, s470, s474, t30, ctA, ctMbuf, ctMok, xf);
+                 ctCd, via[0] ? via : "-", (unsigned)g_sess_off,
+                 sf, s470, s474, t30, ctA, ctMbuf, ctMok, xf);
+    if (n > 0 && (size_t)n < sizeof(line) - 260) {
+        n += snprintf(line + n, sizeof(line) - (size_t)n,
+                      " s1=%llx ho=%llx g0=%llx g88=%llx g88v=%llx h140=%llx v140=%llx",
+                      (unsigned long long)dg.s1, (unsigned long long)dg.ho,
+                      (unsigned long long)dg.g0, (unsigned long long)dg.g88,
+                      (unsigned long long)dg.g88v, (unsigned long long)dg.h140,
+                      (unsigned long long)dg.v140);
+    }
     if (ctA && n > 0 && (size_t)n < sizeof(line) - 128) {
         n += snprintf(line + n, sizeof(line) - (size_t)n,
                       " sess=%llx sc=%llx tl=%llx t20=%d t24=%d t28=%d f2c=%d f2d=%d f2e=%d",
@@ -989,7 +1187,7 @@ static void practice_clock_probe_ctor(void)
 
     if (gmtime_r(&now, &tmv) != NULL) {
         n = snprintf(header, sizeof(header),
-                     "# practice_clock_probe v8 (S3a: session chain + rate-entry read)\n"
+                     "# practice_clock_probe v9 (S3a: resolver diagnostics)\n"
                      "# build=%s pid=%ld utc=%04d-%02d-%02dT%02d:%02d:%02dZ t0_ms=%llu\n",
                      PRACTICE_CLOCK_PROBE_VERSION, (long)getpid(),
                      tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
@@ -997,7 +1195,7 @@ static void practice_clock_probe_ctor(void)
                      (unsigned long long)t0);
     } else {
         n = snprintf(header, sizeof(header),
-                     "# practice_clock_probe v8 (S3a: session chain + rate-entry read)\n"
+                     "# practice_clock_probe v9 (S3a: resolver diagnostics)\n"
                      "# build=%s pid=%ld t0_ms=%llu\n",
                      PRACTICE_CLOCK_PROBE_VERSION, (long)getpid(),
                      (unsigned long long)t0);
