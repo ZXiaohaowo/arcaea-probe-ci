@@ -44,6 +44,9 @@
  *     values. Same guard class as getBGMPosition; the FMOD result code is logged. The
  *     discovery crawl now defaults OFF (PCP_CRAWL=0; switch and budget kept). No writes
  *     of any kind are performed. See docs/s3a_control_explainer_draft.md.
+ *     v14b (review fix): the returned float is checked (finite, |f| <= 1e5) BEFORE any
+ *     use; the value is logged with 4 decimals; failures log explicit reasons
+ *     (pcherr=ret|notfinite|range). No unchecked float-to-int conversion exists.
  *
  * Log: <sandbox>/Documents/practice_clock_probe.log (append-only).
  *   Header:  # practice_clock_probe v7 (S3a read-only verification: rate-entry probe)
@@ -55,13 +58,14 @@
  *   Chain:   c seq=<n> t_ms=<n> tid=<n> main=<0|1> state=<ready|not-ready|anomaly|changed>
  *            [slot=0x.. gg=0x.. am=0x.. pv=0x.. count=<n> chan0=0x..] [reason=<..>]
  *   Position: p seq=<n> t_ms=<n> t_q=<n> lag_ms=<n> tid=<n> main=<0|1> am=0x.. handle=0x..
- *            ok=<0|1> pos_ms=<n> pitch=<n|na> pchret=<n> safe=<0|1> reads=<n>/<n>/<n>/<n>
- *            cw=<0|1> cD=<0|1> ctA=<0|1> ctM=<n|na> ctMok=<0|1> xf=<token>
+ *            ok=<0|1> pos_ms=<n> pitch=<f.ffff|na> pchret=<n> pcherr=<token> safe=<0|1>
+ *            reads=<n>/<n>/<n>/<n> cw=<0|1> cD=<0|1> ctA=<0|1> ctM=<n|na> ctMok=<0|1> xf=<token>
  *            [path=<hub><style>+0x<off> tl=0x.. t20=<n> t24=<n> t28=<n> f2c=<n> f2d=<n> f2e=<n>]
  *            w=<16 x %08x|na> [reason=<..>]
- *            -- main-thread executed (main=1 expected); pitch = BGM channel pitch in
- *            milli-units (v14 read-only probe; na when the call failed) and pchret its
- *            FMOD result code; safe = mach safe reads available; reads = safe-read
+ *            -- main-thread executed (main=1 expected); pitch = BGM channel pitch (float,
+ *            4 decimals; checked finite and in range BEFORE use; na when invalid) with
+ *            pchret = FMOD result code and pcherr = failure reason (none|ret|notfinite|
+ *            range); safe = mach safe reads available; reads = safe-read
  *            attempts/filtered/failed/budget-hit this cycle; cw = crawl
  *            switch state; cD = a path is currently cached (re-walked from the root every
  *            cycle); ctA = timeline fields read this cycle; ctM = BSS mirror - <n> only
@@ -80,6 +84,7 @@
  */
 #include <mach-o/dyld.h>
 #include <mach/mach_time.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -778,7 +783,9 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     uint64_t tl = 0;
     uint32_t words[CT_DUMP_WORDS] = {0};
     int pos = -1;
-    int pret = 0, pok = 0, pitch_m = 0;
+    float pfv = -1.0f;
+    int pret = 0, pok = 0;
+    const char *pitch_why = "none";
     int ok = 0;
     int ctM = 0, ctMok = 0, ctA = 0, ctMr = 0, dumpr = 0;
     int t20 = 0, t24 = 0, t28 = 0;
@@ -806,13 +813,21 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
         ok = 1;
         {
             /* v14 read-only verification: read the BGM channel's current pitch through the
-             * same wrapper family the future rate entry will use; result code logged. */
+             * same wrapper family the future rate entry will use. The float value is checked
+             * (finite, sane range) before any use; result code and failure reason are logged.
+             * (v14b fix per the 2026-10-01 review: no unchecked float-to-int conversion.) */
             typedef int (*getpitch_fn)(void *, float *);
             getpitch_fn pf = (getpitch_fn)(uintptr_t)(g_base + OFF_GETPITCH);
-            float f = -1.0f;
-            pret = pf((void *)(uintptr_t)cs.chan0, &f);
-            pok = (pret == 0);
-            pitch_m = pok ? (int)(f * 1000.0f + (f >= 0.0f ? 0.5f : -0.5f)) : 0;
+            pret = pf((void *)(uintptr_t)cs.chan0, &pfv);
+            if (pret != 0) {
+                pitch_why = "ret";
+            } else if (!isfinite(pfv)) {
+                pitch_why = "notfinite";
+            } else if (pfv < -1.0e5f || pfv > 1.0e5f) {
+                pitch_why = "range";
+            } else {
+                pok = 1;
+            }
         }
     }
     /* S2b probes: checked safe reads only; the whole path is skipped without ident/mach */
@@ -851,18 +866,18 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
         snprintf(ctMbuf, sizeof(ctMbuf), "na");
     }
     if (pok) {
-        snprintf(pitchbuf, sizeof(pitchbuf), "%d", pitch_m);
+        snprintf(pitchbuf, sizeof(pitchbuf), "%0.4f", (double)pfv);
     } else {
         snprintf(pitchbuf, sizeof(pitchbuf), "na");
     }
     n = snprintf(line, sizeof(line),
                  "p seq=%llu t_ms=%llu t_q=%llu lag_ms=%llu tid=%llu main=%d am=%llx handle=%llx ok=%d pos_ms=%d"
-                 " pitch=%s pchret=%d safe=%d reads=%d/%d/%d/%d cw=%d cD=%d ctA=%d ctM=%s ctMok=%d xf=%s",
+                 " pitch=%s pchret=%d pcherr=%s safe=%d reads=%d/%d/%d/%d cw=%d cD=%d ctA=%d ctM=%s ctMok=%d xf=%s",
                  (unsigned long long)task->q_seq, (unsigned long long)now,
                  (unsigned long long)task->q_t_ms, (unsigned long long)(now - task->q_t_ms),
                  (unsigned long long)tid, pthread_main_np() ? 1 : 0,
                  (unsigned long long)cs.am, (unsigned long long)cs.chan0, ok, pos,
-                 pitchbuf, pret,
+                 pitchbuf, pret, pitch_why,
                  g_safe_ok ? 1 : 0, sr_reads, sr_filt, sr_fail, sr_bh,
                  g_crawl_enabled ? 1 : 0, g_hit_valid ? 1 : 0, ctA, ctMbuf, ctMok, xf);
     if (ctA && n > 0 && (size_t)n < sizeof(line) - 128) {
