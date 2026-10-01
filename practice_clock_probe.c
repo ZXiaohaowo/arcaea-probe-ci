@@ -1,4 +1,4 @@
-/* practice_clock_probe.c - S2b: chain probe + guarded reads + checked S2b probes (v6).
+/* practice_clock_probe.c - S3a: read-only verification - rate-entry probe (v7).
  *
  * v9 scope (per the 2026-09-29 review), kept in v3:
  *   - NO active calls into game functions. Reads only.
@@ -38,9 +38,15 @@
  *     reads). The crawl has a per-cycle read budget, a growing backoff interval, work
  *     counters and an off switch (build flag PCP_CRAWL / env PCP_NO_CRAWL). See
  *     docs/s2b_review_2026-10-01.md.
+ *   - v14 (S3a read-only verification): module v7 adds ONE read call - ChannelControl::
+ *     getPitch (wrapper base+0x10e6540) on the current BGM channel handle - to verify the
+ *     future rate-entry chain is callable in this context and to capture baseline pitch
+ *     values. Same guard class as getBGMPosition; the FMOD result code is logged. The
+ *     discovery crawl now defaults OFF (PCP_CRAWL=0; switch and budget kept). No writes
+ *     of any kind are performed. See docs/s3a_control_explainer_draft.md.
  *
  * Log: <sandbox>/Documents/practice_clock_probe.log (append-only).
- *   Header:  # practice_clock_probe v5 (chain + guarded reads + safe-read discovery)
+ *   Header:  # practice_clock_probe v7 (S3a read-only verification: rate-entry probe)
  *            # build=<id> pid=<n> utc=<ISO8601Z> t0_ms=<n>
  *   Ident:   # ident base=0x.. slide=0x.. img=.. magic=<0|1> words=<0|1> vt=<0|1> ...
  *   Reads:   # reads mainhop=<cf-runloop|unavailable>
@@ -49,12 +55,14 @@
  *   Chain:   c seq=<n> t_ms=<n> tid=<n> main=<0|1> state=<ready|not-ready|anomaly|changed>
  *            [slot=0x.. gg=0x.. am=0x.. pv=0x.. count=<n> chan0=0x..] [reason=<..>]
  *   Position: p seq=<n> t_ms=<n> t_q=<n> lag_ms=<n> tid=<n> main=<0|1> am=0x.. handle=0x..
- *            ok=<0|1> pos_ms=<n> safe=<0|1> reads=<n>/<n>/<n>/<n> cw=<0|1> cD=<0|1> ctA=<0|1>
- *            ctM=<n|na> ctMok=<0|1> xf=<token>
+ *            ok=<0|1> pos_ms=<n> pitch=<n|na> pchret=<n> safe=<0|1> reads=<n>/<n>/<n>/<n>
+ *            cw=<0|1> cD=<0|1> ctA=<0|1> ctM=<n|na> ctMok=<0|1> xf=<token>
  *            [path=<hub><style>+0x<off> tl=0x.. t20=<n> t24=<n> t28=<n> f2c=<n> f2d=<n> f2e=<n>]
  *            w=<16 x %08x|na> [reason=<..>]
- *            -- main-thread executed (main=1 expected); safe = mach safe reads available;
- *            reads = safe-read attempts/filtered/failed/budget-hit this cycle; cw = crawl
+ *            -- main-thread executed (main=1 expected); pitch = BGM channel pitch in
+ *            milli-units (v14 read-only probe; na when the call failed) and pchret its
+ *            FMOD result code; safe = mach safe reads available; reads = safe-read
+ *            attempts/filtered/failed/budget-hit this cycle; cw = crawl
  *            switch state; cD = a path is currently cached (re-walked from the root every
  *            cycle); ctA = timeline fields read this cycle; ctM = BSS mirror - <n> only
  *            when its checked read succeeded, else na; xf = last failure token
@@ -84,7 +92,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "s2b-clock-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "s3a-verify-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -102,6 +110,7 @@
 #define OFF_AM_VT             0x14f90f8ULL  /* AudioManager vtable base                */
 #define OFF_AM_VT_SLOT_INIT   0x508ULL      /* vtable slot: init                       */
 #define OFF_PV_GETPOS         0x8e4274ULL   /* AudioProviderFMODiOS::getBGMPosition(i) */
+#define OFF_GETPITCH          0x10e6540ULL  /* ChannelControl::getPitch(handle,float*)  */
 #define OFF_PV_VT             0x14bb930ULL  /* provider vtable base                    */
 #define OFF_PV_VT_SLOT_GETPOS 0x38ULL       /* vtable slot: getBGMPosition             */
 #define OFF_GG_AM             0x10ULL       /* GameGlobal -> AudioManager              */
@@ -130,6 +139,7 @@
 #define MARK64_GETPOS_AP 0xa9017bfdd10083ffULL  /* sub sp,sp,#0x20; stp x29,x30,[sp,#0x10] */
 #define MARK64_GETPOS_AM 0xf9400008f9414000ULL  /* ldr x0,[x0,#0x280]; ldr x8,[x0]         */
 #define MARK64_AM_INIT   0xa9017bfda9be4ff4ULL  /* stp x20,x19,[sp,#-0x20]!; stp x29,x30   */
+#define MARK64_GETPITCH  0xa91257f6d10543ffULL  /* sub sp,sp,#0x150; stp x22,x21,[sp,#0x120] */
 
 __attribute__((visibility("default")))
 const char practice_clock_probe_version[] = PRACTICE_CLOCK_PROBE_VERSION;
@@ -239,6 +249,7 @@ static void ident_check(void)
     g_words_ok =
         (*(volatile uint64_t *)(uintptr_t)(g_base + OFF_PV_GETPOS) == MARK64_GETPOS_AP) &&
         (*(volatile uint64_t *)(uintptr_t)(g_base + OFF_AM_GETPOS) == MARK64_GETPOS_AM) &&
+        (*(volatile uint64_t *)(uintptr_t)(g_base + OFF_GETPITCH) == MARK64_GETPITCH) &&
         (*(volatile uint64_t *)(uintptr_t)(g_base + OFF_AM_INIT) == MARK64_AM_INIT);
     g_vt_ok =
         (*(volatile uint64_t *)(uintptr_t)(g_base + OFF_PV_VT + OFF_PV_VT_SLOT_GETPOS) ==
@@ -536,7 +547,7 @@ static uint64_t g_hit_off;       /* hub slot offset; 0 = the hub object itself  
 /* Crawl scheduling: budgeted attempts with growing backoff after failures, and an
  * independent off switch (build: -DPCP_CRAWL=0, runtime: env PCP_NO_CRAWL). */
 #ifndef PCP_CRAWL
-#define PCP_CRAWL 1
+#define PCP_CRAWL 0        /* review 2026-10-01: discovery scans default OFF */
 #endif
 #define SCAN_BASE_INTERVAL 30
 static int g_crawl_enabled;
@@ -767,6 +778,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     uint64_t tl = 0;
     uint32_t words[CT_DUMP_WORDS] = {0};
     int pos = -1;
+    int pret = 0, pok = 0, pitch_m = 0;
     int ok = 0;
     int ctM = 0, ctMok = 0, ctA = 0, ctMr = 0, dumpr = 0;
     int t20 = 0, t24 = 0, t28 = 0;
@@ -775,6 +787,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     const char *xf = "none";
     char path[24];
     char ctMbuf[16];
+    char pitchbuf[16];
     const char *reason = "";
     char line[LINEBUF];
     int n;
@@ -791,6 +804,16 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
         getpos_fn fn = (getpos_fn)(uintptr_t)(g_base + OFF_AM_GETPOS);
         pos = fn((void *)(uintptr_t)cs.am);
         ok = 1;
+        {
+            /* v14 read-only verification: read the BGM channel's current pitch through the
+             * same wrapper family the future rate entry will use; result code logged. */
+            typedef int (*getpitch_fn)(void *, float *);
+            getpitch_fn pf = (getpitch_fn)(uintptr_t)(g_base + OFF_GETPITCH);
+            float f = -1.0f;
+            pret = pf((void *)(uintptr_t)cs.chan0, &f);
+            pok = (pret == 0);
+            pitch_m = pok ? (int)(f * 1000.0f + (f >= 0.0f ? 0.5f : -0.5f)) : 0;
+        }
     }
     /* S2b probes: checked safe reads only; the whole path is skipped without ident/mach */
     if (g_ident_ok && g_safe_ok) {
@@ -827,13 +850,19 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     } else {
         snprintf(ctMbuf, sizeof(ctMbuf), "na");
     }
+    if (pok) {
+        snprintf(pitchbuf, sizeof(pitchbuf), "%d", pitch_m);
+    } else {
+        snprintf(pitchbuf, sizeof(pitchbuf), "na");
+    }
     n = snprintf(line, sizeof(line),
                  "p seq=%llu t_ms=%llu t_q=%llu lag_ms=%llu tid=%llu main=%d am=%llx handle=%llx ok=%d pos_ms=%d"
-                 " safe=%d reads=%d/%d/%d/%d cw=%d cD=%d ctA=%d ctM=%s ctMok=%d xf=%s",
+                 " pitch=%s pchret=%d safe=%d reads=%d/%d/%d/%d cw=%d cD=%d ctA=%d ctM=%s ctMok=%d xf=%s",
                  (unsigned long long)task->q_seq, (unsigned long long)now,
                  (unsigned long long)task->q_t_ms, (unsigned long long)(now - task->q_t_ms),
                  (unsigned long long)tid, pthread_main_np() ? 1 : 0,
                  (unsigned long long)cs.am, (unsigned long long)cs.chan0, ok, pos,
+                 pitchbuf, pret,
                  g_safe_ok ? 1 : 0, sr_reads, sr_filt, sr_fail, sr_bh,
                  g_crawl_enabled ? 1 : 0, g_hit_valid ? 1 : 0, ctA, ctMbuf, ctMok, xf);
     if (ctA && n > 0 && (size_t)n < sizeof(line) - 128) {
@@ -1033,7 +1062,7 @@ static void practice_clock_probe_ctor(void)
 
     if (gmtime_r(&now, &tmv) != NULL) {
         n = snprintf(header, sizeof(header),
-                     "# practice_clock_probe v6 (chain + guarded reads + checked S2b probes)\n"
+                     "# practice_clock_probe v7 (S3a read-only verification: rate-entry probe)\n"
                      "# build=%s pid=%ld utc=%04d-%02d-%02dT%02d:%02d:%02dZ t0_ms=%llu\n",
                      PRACTICE_CLOCK_PROBE_VERSION, (long)getpid(),
                      tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
@@ -1041,7 +1070,7 @@ static void practice_clock_probe_ctor(void)
                      (unsigned long long)t0);
     } else {
         n = snprintf(header, sizeof(header),
-                     "# practice_clock_probe v6 (chain + guarded reads + checked S2b probes)\n"
+                     "# practice_clock_probe v7 (S3a read-only verification: rate-entry probe)\n"
                      "# build=%s pid=%ld t0_ms=%llu\n",
                      PRACTICE_CLOCK_PROBE_VERSION, (long)getpid(),
                      (unsigned long long)t0);
