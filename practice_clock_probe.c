@@ -1,4 +1,4 @@
-/* practice_clock_probe.c - S3a: read-only verification - rate-entry probe (v7).
+/* practice_clock_probe.c - S3a: session-chain probe + rate-entry read (v8).
  *
  * v9 scope (per the 2026-09-29 review), kept in v3:
  *   - NO active calls into game functions. Reads only.
@@ -47,31 +47,42 @@
  *     v14b (review fix): the returned float is checked (finite, |f| <= 1e5) BEFORE any
  *     use; the value is logged with 4 decimals; failures log explicit reasons
  *     (pcherr=ret|notfinite|range). No unchecked float-to-int conversion exists.
+ *   - v15 (S3a session chain): the static route to the ACTIVE game session is found and
+ *     probed read-only: singleton(0x1660280) -> +0x148 (registered session/wrapper) ->
+ *     session (vtable marker 0x1521dc0) -> +0x3a0 -> scene (marker 0x14c0d08) -> +0x30 ->
+ *     timeline (marker 0x14d0548). If the registered object is a wrapper, a bounded
+ *     marker-driven field scan (0x00..0x380) locates the session pointer once (offset
+ *     cached). Session/scene/flag reads are logged; NO writes. See
+ *     docs/s3a_control_interface_notes.md.
  *
  * Log: <sandbox>/Documents/practice_clock_probe.log (append-only).
- *   Header:  # practice_clock_probe v7 (S3a read-only verification: rate-entry probe)
+ *   Header:  # practice_clock_probe v8 (S3a: session chain + rate-entry read)
  *            # build=<id> pid=<n> utc=<ISO8601Z> t0_ms=<n>
  *   Ident:   # ident base=0x.. slide=0x.. img=.. magic=<0|1> words=<0|1> vt=<0|1> ...
  *   Reads:   # reads mainhop=<cf-runloop|unavailable>
- *   Saferead:# saferead=<mach-vm/1|off/0> crawl=<on|off>
+ *   Saferead:# saferead=<mach-vm/1|off/0>
  *   Sample:  s seq=<n> t_ms=<n> dt_ms=<n> [gap=1]
  *   Chain:   c seq=<n> t_ms=<n> tid=<n> main=<0|1> state=<ready|not-ready|anomaly|changed>
  *            [slot=0x.. gg=0x.. am=0x.. pv=0x.. count=<n> chan0=0x..] [reason=<..>]
  *   Position: p seq=<n> t_ms=<n> t_q=<n> lag_ms=<n> tid=<n> main=<0|1> am=0x.. handle=0x..
  *            ok=<0|1> pos_ms=<n> pitch=<f.ffff|na> pchret=<n> pcherr=<token> safe=<0|1>
- *            reads=<n>/<n>/<n>/<n> cw=<0|1> cD=<0|1> ctA=<0|1> ctM=<n|na> ctMok=<0|1> xf=<token>
- *            [path=<hub><style>+0x<off> tl=0x.. t20=<n> t24=<n> t28=<n> f2c=<n> f2d=<n> f2e=<n>]
+ *            reads=<n>/<n>/<n>/<n> cD=<0|1> soff=0x<off> sf=<n|-1> s470=<n|-1> s474=<n>
+ *            t30=<n> ctA=<0|1> ctM=<n|na> ctMok=<0|1> xf=<token>
+ *            [sess=0x.. sc=0x.. tl=0x.. t20=<n> t24=<n> t28=<n> f2c=<n> f2d=<n> f2e=<n>]
  *            w=<16 x %08x|na> [reason=<..>]
  *            -- main-thread executed (main=1 expected); pitch = BGM channel pitch (float,
  *            4 decimals; checked finite and in range BEFORE use; na when invalid) with
  *            pchret = FMOD result code and pcherr = failure reason (none|ret|notfinite|
  *            range); safe = mach safe reads available; reads = safe-read
- *            attempts/filtered/failed/budget-hit this cycle; cw = crawl
- *            switch state; cD = a path is currently cached (re-walked from the root every
- *            cycle); ctA = timeline fields read this cycle; ctM = BSS mirror - <n> only
- *            when its checked read succeeded, else na; xf = last failure token
- *            (none|mirror|dump|walk|scan|budget|fields|ident|nomach); w = 16 u32 words at
- *            0x16539a0 (mirror at index 8), or na.
+ *            attempts/filtered/failed/budget-hit this cycle; cD = the session chain
+ *            resolved this cycle (re-walked from the static singleton root; every hop
+ *            marker-validated); soff = cached session field offset inside the registered
+ *            object (0 = direct); sf = scene pause/finish flag byte, s470 = session pause
+ *            byte, s474 = session resume value, t30 = timeline bound (-1/0 when
+ *            unreadable); ctA = timeline fields read this cycle; ctM = BSS mirror - <n>
+ *            only when its checked read succeeded, else na; xf = last failure token
+ *            (none|mirror|dump|sess|fields|ident|nomach); w = 16 u32 words at 0x16539a0
+ *            (mirror at index 8), or na.
  *   Chain lines are change-driven (heartbeat every 60 samples). Position reads run at <=2 Hz
  *   only while: chain ready, channel-0 handle non-null, handle stable for >=250 ms, and no
  *   previous read is still in flight.
@@ -97,12 +108,12 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "s3a-verify-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "s3a-session-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
 #define FLUSH_EVERY_LINES 8
-#define LINEBUF 576
+#define LINEBUF 640
 #define HEARTBEAT_EVERY 60
 
 /* Image-relative offsets (vmaddr - 0x100000000 for this client build; EQUAL to file
@@ -125,19 +136,21 @@
 #define CHAN_ELEM_SIZE        16ULL         /* vector element stride                   */
 #define CHAN_COUNT_CAP        64ULL         /* sanity cap (game reserves 10)           */
 
-/* S2b chart-time probes (v12; see docs/s2b_static_findings.md). */
+/* v15 session chain + chart-time probes (see docs/s3a_control_interface_notes.md). */
 #define OFF_CT_MIRROR         0x16539c0ULL  /* BSS mirror: last computed chart time    */
 #define OFF_CT_DUMP_BASE      0x16539a0ULL  /* 16 u32 words around the mirror          */
 #define OFF_SINGLETON         0x1660280ULL  /* app singleton global                    */
-#define OFF_GG_D88            0x88ULL       /* GameGlobal -> manager (scene registered)*/
-#define OFF_GG_O78            0x78ULL       /* GameGlobal -> object (early candidate)  */
-#define OFF_HUB_SCENE_A       0x3a0ULL      /* controller -> scene                     */
-#define OFF_HUB_SCENE_B       0x2c0ULL      /* alt holder -> scene                     */
+#define OFF_SING_OBJ          0x148ULL      /* singleton -> registered session/wrapper */
+#define SESS_VT_OFF           0x1521dc0ULL  /* GameSession vtable (ctor 0xca4624)      */
+#define OFF_SESS_SCENE        0x3a0ULL      /* session -> scene                        */
+#define OFF_SESS_470          0x470ULL      /* session: pause byte + resume value      */
 #define OFF_SCENE_TL          0x30ULL       /* scene -> GameTimeline                   */
+#define OFF_SCENE_SF          0x138ULL      /* scene: pause/finished flag byte         */
 #define SCENE_MARKER_OFF      0x14c0d08ULL  /* *(void**)scene == base + this (factory) */
 #define TL_MARKER_OFF         0x14d0548ULL  /* *(void**)tl == base + this (factory)    */
 #define OFF_TL_TIME           0x20ULL       /* timeline: (t20,t24) word                */
 #define OFF_TL_W28            0x28ULL       /* timeline: (t28,f2c,f2d,f2e) word        */
+#define OFF_TL_BOUND          0x30ULL       /* timeline: bound value                   */
 #define CT_DUMP_WORDS         16
 
 /* First 8 bytes of each key function (little-endian uint64 of the instruction pair). */
@@ -541,31 +554,14 @@ static int try_read64(uint64_t addr, uint64_t *out)
     return safe_read(addr, out, 8);
 }
 
-/* Discovered path description (re-walked from the ROOT object every cycle; a type marker
- * proves what an object is, not that it is the current active one). */
-static int g_hit_valid;
-static char g_hit_hub;           /* 'g' gg, 's' singleton, 'd' *(gg+0x88), 'o' *(gg+0x78) */
-static int g_hit_style;          /* 1 v=scene; 2 *(v+0x3a0)=scene; 3 *(v+0x2c0)=scene;
-                                    4 *(v+0x30)=tl (v = a holder object)                */
-static uint64_t g_hit_off;       /* hub slot offset; 0 = the hub object itself           */
-
-/* Crawl scheduling: budgeted attempts with growing backoff after failures, and an
- * independent off switch (build: -DPCP_CRAWL=0, runtime: env PCP_NO_CRAWL). */
-#ifndef PCP_CRAWL
-#define PCP_CRAWL 0        /* review 2026-10-01: discovery scans default OFF */
-#endif
-#define SCAN_BASE_INTERVAL 30
-static int g_crawl_enabled;
-static uint32_t g_scan_fail;
-static uint64_t g_scan_next_seq;
-
-static void crawl_init(void)
-{
-    g_crawl_enabled = PCP_CRAWL ? 1 : 0;
-    if (g_crawl_enabled && getenv("PCP_NO_CRAWL") != NULL) {
-        g_crawl_enabled = 0;
-    }
-}
+/* Session-chain discovery (v15): static singleton -> [singleton+0x148] -> session
+ * (GameSession: ctor 0xca4624, vtable 0x1521dc0, size 0x4a0) -> session+0x3a0 -> scene
+ * (marker 0x14c0d08) -> scene+0x30 -> timeline (marker 0x14d0548). The object registered
+ * at singleton+0x148 may be a wrapper (vtable 0x14cbcc8 family); if its own vtable is not
+ * the session vtable, a BOUNDED scan over its fields (0x00..0x380, 8-aligned) searches
+ * for a pointer whose target carries the session vtable; the offset is cached once found.
+ * Every cycle re-walks from the ROOT; every hop is marker-validated; all reads are safe. */
+static uint64_t g_sess_off;      /* cached session-pointer field offset (0 = direct)     */
 
 static int is_scene(uint64_t scene)
 {
@@ -599,171 +595,86 @@ static int tl_read_fields(uint64_t tl, int *t20, int *t24, int *t28,
     return 1;
 }
 
-static int crawl_slot(char hub, uint64_t off, uint64_t v, uint64_t *tl)
-{
-    uint64_t scene = 0, t = 0;
-    if (!ptr_range_ok(v)) {
-        g_sr_filtered += 1;      /* filtered, not "absent" */
-        return 0;
-    }
-    if (is_scene(v) && try_read64(v + OFF_SCENE_TL, &t) && is_tl(t, tl)) {
-        g_hit_hub = hub; g_hit_style = 1; g_hit_off = off;
-        return 1;
-    }
-    if (try_read64(v + OFF_HUB_SCENE_A, &scene) && is_scene(scene) &&
-        try_read64(scene + OFF_SCENE_TL, &t) && is_tl(t, tl)) {
-        g_hit_hub = hub; g_hit_style = 2; g_hit_off = off;
-        return 1;
-    }
-    if (try_read64(v + OFF_HUB_SCENE_B, &scene) && is_scene(scene) &&
-        try_read64(scene + OFF_SCENE_TL, &t) && is_tl(t, tl)) {
-        g_hit_hub = hub; g_hit_style = 3; g_hit_off = off;
-        return 1;
-    }
-    if (try_read64(v + OFF_SCENE_TL, &t) && is_tl(t, tl)) {
-        g_hit_hub = hub; g_hit_style = 4; g_hit_off = off;
-        return 1;
-    }
-    return 0;
-}
-
-static int crawl_hub(char hub, uint64_t base, uint64_t max_off, uint64_t *tl)
-{
-    uint64_t v = 0, off;
-    if (!ptr_range_ok(base)) {
-        g_sr_filtered += 1;
-        return 0;
-    }
-    if (crawl_slot(hub, 0, base, tl)) {          /* the hub object itself */
-        return 1;
-    }
-    for (off = 8; off <= max_off; off += 8) {
-        if (try_read64(base + off, &v) && crawl_slot(hub, off, v, tl)) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static int find_timeline(uint64_t gg, uint64_t *tl)
-{
-    uint64_t hub = 0, single = 0;
-    if (crawl_hub('g', gg, 0xf0, tl)) {
-        return 1;
-    }
-    if (safe_read(g_base + OFF_SINGLETON, &single, 8) && crawl_hub('s', single, 0xf0, tl)) {
-        return 1;
-    }
-    if (try_read64(gg + OFF_GG_D88, &hub) && crawl_hub('d', hub, 0x58, tl)) {
-        return 1;
-    }
-    if (try_read64(gg + OFF_GG_O78, &hub) && crawl_hub('o', hub, 0x58, tl)) {
-        return 1;
-    }
-    return 0;
-}
-
-/* Re-resolve the hub from the CURRENT root objects every cycle (d88/o78 are GameGlobal
- * fields and must be re-read; the singleton is a static slot re-read via safe_read). */
-static int resolve_hub(char hub, uint64_t gg, uint64_t *base)
+static int is_sess(uint64_t p)
 {
     uint64_t v = 0;
-    if (hub == 'g') {
-        *base = gg;
-        return 1;
-    }
-    if (hub == 's') {
-        if (!safe_read(g_base + OFF_SINGLETON, &v, 8)) {
-            return 0;
-        }
-    } else if (hub == 'd') {
-        if (!try_read64(gg + OFF_GG_D88, &v)) {
-            return 0;
-        }
-    } else if (hub == 'o') {
-        if (!try_read64(gg + OFF_GG_O78, &v)) {
-            return 0;
-        }
-    } else {
+    return p != 0 && try_read64(p, &v) && v == g_base + SESS_VT_OFF;
+}
+
+/* Re-walk the static session chain from the root. Every hop is marker-validated. */
+static int session_chain_walk(uint64_t *sess, uint64_t *scene, uint64_t *tl)
+{
+    uint64_t sing = 0, objB = 0, s = 0, sc = 0, t = 0;
+    if (!safe_read(g_base + OFF_SINGLETON, &sing, 8) || !ptr_range_ok(sing)) {
         return 0;
     }
-    *base = v;
+    if (!safe_read(sing + OFF_SING_OBJ, &objB, 8) || !ptr_range_ok(objB)) {
+        return 0;
+    }
+    if (is_sess(objB)) {
+        s = objB;                      /* the registered object is the session itself */
+    } else if (g_sess_off != 0) {
+        if (!try_read64(objB + g_sess_off, &s) || !is_sess(s)) {
+            return 0;                  /* cached offset no longer valid */
+        }
+    } else {
+        uint64_t off;
+        for (off = 0; off <= 0x380; off += 8) {   /* bounded marker-driven scan */
+            if (try_read64(objB + off, &s) && is_sess(s)) {
+                g_sess_off = off;
+                break;
+            }
+            s = 0;
+        }
+        if (s == 0) {
+            return 0;
+        }
+    }
+    if (!try_read64(s + OFF_SESS_SCENE, &sc) || !is_scene(sc)) {
+        return 0;
+    }
+    if (!try_read64(sc + OFF_SCENE_TL, &t) || !is_tl(t, tl)) {
+        return 0;
+    }
+    *sess = s;
+    *scene = sc;
     return 1;
 }
 
-/* Full re-walk from the root: hub -> slot -> scene (marker) -> timeline (marker). */
-static int walk_hit(uint64_t gg, uint64_t *tl)
-{
-    uint64_t hub = 0, v = 0, scene = 0, t = 0;
-    if (g_hit_style < 1 || g_hit_style > 4) {
-        return 0;
-    }
-    if (!resolve_hub(g_hit_hub, gg, &hub) || !ptr_range_ok(hub)) {
-        g_sr_filtered += 1;
-        return 0;
-    }
-    if (g_hit_off == 0) {
-        v = hub;
-    } else if (!try_read64(hub + g_hit_off, &v)) {
-        return 0;
-    }
-    if (!ptr_range_ok(v)) {
-        g_sr_filtered += 1;
-        return 0;
-    }
-    switch (g_hit_style) {
-    case 1:
-        scene = v;
-        break;
-    case 2:
-        if (!try_read64(v + OFF_HUB_SCENE_A, &scene)) {
-            return 0;
-        }
-        break;
-    case 3:
-        if (!try_read64(v + OFF_HUB_SCENE_B, &scene)) {
-            return 0;
-        }
-        break;
-    default:    /* style 4: v is a holder whose +0x30 is the timeline */
-        return try_read64(v + OFF_SCENE_TL, &t) && is_tl(t, tl);
-    }
-    if (!is_scene(scene)) {
-        return 0;
-    }
-    return try_read64(scene + OFF_SCENE_TL, &t) && is_tl(t, tl);
-}
-
 /* Runs on the main thread; every read goes through the checked safe-read interface.
- * The crawl runs only when scheduled (backoff), never on every time sample. */
-static void ct_probe(uint64_t gg, uint64_t *tl, int *ctA, int *t20, int *t24, int *t28,
-                     int *f2c, int *f2d, int *f2e, char *path, size_t pathlen,
-                     const char **xf, uint64_t seq)
+ * The chain is re-walked from the static root on every cycle (no stale-object use). */
+static void ct_probe(uint64_t *tl, int *ctCd, int *ctA, int *t20, int *t24, int *t28,
+                     int *f2c, int *f2d, int *f2e, int *sf, int *s470, int *s474, int *t30,
+                     uint64_t *sess_out, uint64_t *scene_out, const char **xf)
 {
+    uint64_t sess = 0, scene = 0, v = 0;
+    *ctCd = 0;
     *ctA = 0;
-    path[0] = '\0';
-    if (!g_safe_ok || !ptr_range_ok(gg)) {
+    *sf = -1;
+    *s470 = -1;
+    *s474 = 0;
+    *t30 = 0;
+    *sess_out = 0;
+    *scene_out = 0;
+    if (!g_safe_ok) {
         return;
     }
-    if (g_hit_valid && !walk_hit(gg, tl)) {
-        g_hit_valid = 0;                    /* path broke (scene recreated): re-locate */
-        *xf = "walk";
-    }
-    if (!g_hit_valid && g_crawl_enabled && seq >= g_scan_next_seq) {
-        if (find_timeline(gg, tl)) {
-            g_hit_valid = 1;
-            g_scan_fail = 0;
-            g_scan_next_seq = seq + SCAN_BASE_INTERVAL;
-        } else {
-            if (g_scan_fail < 6) {
-                g_scan_fail += 1;
-            }
-            g_scan_next_seq = seq + (uint64_t)(SCAN_BASE_INTERVAL << g_scan_fail);
-            *xf = g_sr_budget_hit ? "budget" : "scan";
-        }
-    }
-    if (!g_hit_valid) {
+    if (!session_chain_walk(&sess, &scene, tl)) {
+        *xf = "sess";
         return;
+    }
+    *ctCd = 1;
+    *sess_out = sess;
+    *scene_out = scene;
+    if (try_read64(scene + OFF_SCENE_SF, &v)) {
+        *sf = (int)(v & 0xffull);
+    }
+    if (try_read64(sess + OFF_SESS_470, &v)) {
+        *s470 = (int)(v & 0xffull);
+        *s474 = (int)(uint32_t)(v >> 32);
+    }
+    if (try_read64(*tl + OFF_TL_BOUND, &v)) {
+        *t30 = (int)(uint32_t)v;
     }
     if (!tl_read_fields(*tl, t20, t24, t28, f2c, f2d, f2e)) {
         *xf = "fields";
@@ -771,7 +682,6 @@ static void ct_probe(uint64_t gg, uint64_t *tl, int *ctA, int *t20, int *t24, in
     }
     *ctA = 1;
     *xf = "none";
-    snprintf(path, pathlen, "%c%d+0x%x", g_hit_hub, g_hit_style, (unsigned)g_hit_off);
 }
 
 static void read_trampoline(void *ctx)   /* runs on the main thread (runloop source) */
@@ -787,12 +697,13 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     int pret = 0, pok = 0;
     const char *pitch_why = "none";
     int ok = 0;
-    int ctM = 0, ctMok = 0, ctA = 0, ctMr = 0, dumpr = 0;
+    int ctM = 0, ctMok = 0, ctA = 0, ctMr = 0, dumpr = 0, ctCd = 0;
+    int sf = -1, s470 = -1, s474 = 0, t30 = 0;
     int t20 = 0, t24 = 0, t28 = 0;
     int f2c = -1, f2d = -1, f2e = -1;
     int sr_reads = 0, sr_filt = 0, sr_fail = 0, sr_bh = 0;
+    uint64_t sess_addr = 0, scene_addr = 0;
     const char *xf = "none";
-    char path[24];
     char ctMbuf[16];
     char pitchbuf[16];
     const char *reason = "";
@@ -848,8 +759,8 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
             xf = "dump";
         }
         if (cs.state == CH_READY) {
-            ct_probe(cs.gg, &tl, &ctA, &t20, &t24, &t28, &f2c, &f2d, &f2e,
-                     path, sizeof(path), &xf, (uint64_t)task->q_seq);
+            ct_probe(&tl, &ctCd, &ctA, &t20, &t24, &t28, &f2c, &f2d, &f2e,
+                     &sf, &s470, &s474, &t30, &sess_addr, &scene_addr, &xf);
         }
         sr_reads = g_sr_reads;
         sr_filt = g_sr_filtered;
@@ -872,18 +783,20 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     }
     n = snprintf(line, sizeof(line),
                  "p seq=%llu t_ms=%llu t_q=%llu lag_ms=%llu tid=%llu main=%d am=%llx handle=%llx ok=%d pos_ms=%d"
-                 " pitch=%s pchret=%d pcherr=%s safe=%d reads=%d/%d/%d/%d cw=%d cD=%d ctA=%d ctM=%s ctMok=%d xf=%s",
+                 " pitch=%s pchret=%d pcherr=%s safe=%d reads=%d/%d/%d/%d cD=%d soff=0x%x"
+                 " sf=%d s470=%d s474=%d t30=%d ctA=%d ctM=%s ctMok=%d xf=%s",
                  (unsigned long long)task->q_seq, (unsigned long long)now,
                  (unsigned long long)task->q_t_ms, (unsigned long long)(now - task->q_t_ms),
                  (unsigned long long)tid, pthread_main_np() ? 1 : 0,
                  (unsigned long long)cs.am, (unsigned long long)cs.chan0, ok, pos,
                  pitchbuf, pret, pitch_why,
                  g_safe_ok ? 1 : 0, sr_reads, sr_filt, sr_fail, sr_bh,
-                 g_crawl_enabled ? 1 : 0, g_hit_valid ? 1 : 0, ctA, ctMbuf, ctMok, xf);
+                 ctCd, (unsigned)g_sess_off, sf, s470, s474, t30, ctA, ctMbuf, ctMok, xf);
     if (ctA && n > 0 && (size_t)n < sizeof(line) - 128) {
         n += snprintf(line + n, sizeof(line) - (size_t)n,
-                      " path=%s tl=%llx t20=%d t24=%d t28=%d f2c=%d f2d=%d f2e=%d",
-                      path, (unsigned long long)tl, t20, t24, t28, f2c, f2d, f2e);
+                      " sess=%llx sc=%llx tl=%llx t20=%d t24=%d t28=%d f2c=%d f2d=%d f2e=%d",
+                      (unsigned long long)sess_addr, (unsigned long long)scene_addr,
+                      (unsigned long long)tl, t20, t24, t28, f2c, f2d, f2e);
     }
     if (dumpr && n > 0 && (size_t)n < sizeof(line) - 160) {
         int i;
@@ -1073,11 +986,10 @@ static void practice_clock_probe_ctor(void)
     init_log_path();
     ident_check();
     saferead_init();
-    crawl_init();
 
     if (gmtime_r(&now, &tmv) != NULL) {
         n = snprintf(header, sizeof(header),
-                     "# practice_clock_probe v7 (S3a read-only verification: rate-entry probe)\n"
+                     "# practice_clock_probe v8 (S3a: session chain + rate-entry read)\n"
                      "# build=%s pid=%ld utc=%04d-%02d-%02dT%02d:%02d:%02dZ t0_ms=%llu\n",
                      PRACTICE_CLOCK_PROBE_VERSION, (long)getpid(),
                      tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
@@ -1085,7 +997,7 @@ static void practice_clock_probe_ctor(void)
                      (unsigned long long)t0);
     } else {
         n = snprintf(header, sizeof(header),
-                     "# practice_clock_probe v7 (S3a read-only verification: rate-entry probe)\n"
+                     "# practice_clock_probe v8 (S3a: session chain + rate-entry read)\n"
                      "# build=%s pid=%ld t0_ms=%llu\n",
                      PRACTICE_CLOCK_PROBE_VERSION, (long)getpid(),
                      (unsigned long long)t0);
@@ -1124,12 +1036,6 @@ static void practice_clock_probe_ctor(void)
 
     n = snprintf(header, sizeof(header), "# saferead=%s\n",
                  g_safe_ok ? "mach-vm/1" : "off/0");
-    if (n > 0 && (size_t)n < sizeof(header)) {
-        append_raw(header, (size_t)n);
-    }
-
-    n = snprintf(header, sizeof(header), "# crawl=%s\n",
-                 g_crawl_enabled ? "on" : "off");
     if (n > 0 && (size_t)n < sizeof(header)) {
         append_raw(header, (size_t)n);
     }
