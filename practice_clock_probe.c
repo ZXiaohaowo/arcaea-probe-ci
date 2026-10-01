@@ -1,4 +1,4 @@
-/* practice_clock_probe.c - S2b: chain probe + guarded reads + chart-time probe (v4).
+/* practice_clock_probe.c - S2b: chain probe + guarded reads + safe-read discovery (v5).
  *
  * v9 scope (per the 2026-09-29 review), kept in v3:
  *   - NO active calls into game functions. Reads only.
@@ -18,23 +18,35 @@
  *     lookup) with fresh pre-checks (ident ok, chain ready, handle non-null). No other game
  *     function is called. The guard is not a lock; see docs/s2a_v10_prereq_thread_analysis.md.
  *   - v11 addition (S2b): read-only chart-time probes in the same callback - the BSS mirror
- *     (0x6539c0) and the GameTimeline chain (GameGlobal+0x78 -> +0x3a0 -> scene+0x30),
- *     validated by the factory marker *tl == base+0x14d0548. Plain memory reads; zero new
- *     calls. See docs/s2b_static_findings.md.
+ *     and a GameTimeline chain candidate, marker-validated. Device run 2026-10-01: the chain
+ *     candidate proved wrong (read text/data bytes at its middle hop) and its loose guard let
+ *     a garbage value through to a dereference that crashed the main thread; the mirror
+ *     offset was also wrong by 0x1000000 (0x6539c0; correct: 0x16539c0).
+ *   - v12 fix (S2b): mirror offset corrected; the disproven chain is replaced by a guarded
+ *     DISCOVERY CRAWL for the scene/timeline (scene factory marker 0x14c0d08, timeline
+ *     factory marker 0x14d0548). Every dereference goes through mach_vm_read_overwrite
+ *     (weakly imported; if unavailable the crawl is disabled entirely and nothing is
+ *     dereferenced), so garbage or unmapped pointers can no longer crash the process.
+ *     Once found, the path is cached and the raw timeline fields are logged every read.
+ *     See docs/s2b_static_findings.md and docs/s2b_v11_crash_and_v12_plan.md.
  *
  * Log: <sandbox>/Documents/practice_clock_probe.log (append-only).
- *   Header:  # practice_clock_probe v3 (chain probe + guarded position reads)
+ *   Header:  # practice_clock_probe v5 (chain + guarded reads + safe-read discovery)
  *            # build=<id> pid=<n> utc=<ISO8601Z> t0_ms=<n>
  *   Ident:   # ident base=0x.. slide=0x.. img=.. magic=<0|1> words=<0|1> vt=<0|1> ...
  *   Reads:   # reads mainhop=<cf-runloop|unavailable>
+ *   Saferead:# saferead=<mach-vm/1|off/0>
  *   Sample:  s seq=<n> t_ms=<n> dt_ms=<n> [gap=1]
  *   Chain:   c seq=<n> t_ms=<n> tid=<n> main=<0|1> state=<ready|not-ready|anomaly|changed>
  *            [slot=0x.. gg=0x.. am=0x.. pv=0x.. count=<n> chan0=0x..] [reason=<..>]
  *   Position: p seq=<n> t_ms=<n> t_q=<n> lag_ms=<n> tid=<n> main=<0|1> am=0x.. handle=0x..
- *            ok=<0|1> pos_ms=<n> ctM=<n> ctMok=<0|1> ctA=<0|1> o78=0x.. sc=0x.. tl=0x..
- *            [t20=<n> t24=<n> t28=<n> f2c=<n> f2d=<n> f2e=<n>] [reason=<..>]
- *            -- main-thread executed (main=1 expected); ctM = BSS mirror value;
- *            ctA = 1 when the GameTimeline chain passed the factory-marker check.
+ *            ok=<0|1> pos_ms=<n> ctM=<n> ctMok=<0|1> sr=<0|1> ctA=<0|1> cD=<0|1>
+ *            [path=<hub><style>+0x<off> tl=0x.. t20=<n> t24=<n> t28=<n> f2c=<n> f2d=<n> f2e=<n>]
+ *            w=<16 x %08x> [reason=<..>]
+ *            -- main-thread executed (main=1 expected); ctM = BSS mirror value (offset fixed
+ *            in v12); sr = mach safe-read available; ctA = 1 when a timeline was found and
+ *            read this cycle; cD = a path is discovered (cached until it breaks); w = 16 u32
+ *            words at 0x16539a0 (mirror at index 8).
  *   Chain lines are change-driven (heartbeat every 60 samples). Position reads run at <=2 Hz
  *   only while: chain ready, channel-0 handle non-null, handle stable for >=250 ms, and no
  *   previous read is still in flight.
@@ -64,7 +76,7 @@
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
 #define FLUSH_EVERY_LINES 8
-#define LINEBUF 384
+#define LINEBUF 512
 #define HEARTBEAT_EVERY 60
 
 /* Image-relative offsets (vmaddr - 0x100000000 for this client build; EQUAL to file
@@ -86,16 +98,20 @@
 #define CHAN_ELEM_SIZE        16ULL         /* vector element stride                   */
 #define CHAN_COUNT_CAP        64ULL         /* sanity cap (game reserves 10)           */
 
-/* S2b chart-time probe offsets (see docs/s2b_static_findings.md). */
-#define OFF_CT_MIRROR         0x6539c0ULL   /* BSS mirror: last computed chart time    */
-#define OFF_GG_HOLD           0x78ULL       /* GameGlobal -> holder (candidate)        */
-#define OFF_HOLD_SCENE        0x3a0ULL      /* holder -> scene (candidate)             */
+/* S2b chart-time probes (v12; see docs/s2b_static_findings.md). */
+#define OFF_CT_MIRROR         0x16539c0ULL  /* BSS mirror: last computed chart time    */
+#define OFF_CT_DUMP_BASE      0x16539a0ULL  /* 16 u32 words around the mirror          */
+#define OFF_SINGLETON         0x1660280ULL  /* app singleton global                    */
+#define OFF_GG_D88            0x88ULL       /* GameGlobal -> manager (scene registered)*/
+#define OFF_GG_O78            0x78ULL       /* GameGlobal -> object (early candidate)  */
+#define OFF_HUB_SCENE_A       0x3a0ULL      /* controller -> scene                     */
+#define OFF_HUB_SCENE_B       0x2c0ULL      /* alt holder -> scene                     */
 #define OFF_SCENE_TL          0x30ULL       /* scene -> GameTimeline                   */
-#define OFF_TL_TIME           0x20ULL       /* timeline current time (int32 ms)        */
-#define OFF_TL_24             0x24ULL
-#define OFF_TL_28             0x28ULL
-#define OFF_TL_FLAGS          0x2cULL       /* three mode bytes: 2c/2d/2e              */
+#define SCENE_MARKER_OFF      0x14c0d08ULL  /* *(void**)scene == base + this (factory) */
 #define TL_MARKER_OFF         0x14d0548ULL  /* *(void**)tl == base + this (factory)    */
+#define OFF_TL_TIME           0x20ULL       /* timeline: (t20,t24) word                */
+#define OFF_TL_W28            0x28ULL       /* timeline: (t28,f2c,f2d,f2e) word        */
+#define CT_DUMP_WORDS         16
 
 /* First 8 bytes of each key function (little-endian uint64 of the instruction pair). */
 #define MARK64_GETPOS_AP 0xa9017bfdd10083ffULL  /* sub sp,sp,#0x20; stp x29,x30,[sp,#0x10] */
@@ -414,18 +430,196 @@ static void padd(const char *s, size_t n)
     }
 }
 
+/* ------------------------------------------- safe reads + timeline discovery */
+
+/* mach_vm_read_overwrite is imported weakly: the build links even if the SDK stub lacks
+ * the symbol; if it is absent at runtime the discovery crawl is disabled and no unverified
+ * pointer is ever dereferenced. This is the v12 crash-proofing (the v11 device run crashed
+ * once in read_trampoline on a garbage chain value that had passed the old guard). */
+extern unsigned int mach_task_self_ __attribute__((weak_import));
+extern int mach_vm_read_overwrite(unsigned int task, unsigned long long addr,
+                                  unsigned long long size, unsigned long long data,
+                                  unsigned long long *out_size) __attribute__((weak_import));
+
+static int g_safe_ok;
+
+static void saferead_init(void)
+{
+    g_safe_ok = (mach_task_self_ != 0) && (mach_vm_read_overwrite != NULL);
+}
+
+static int ptr_range_ok(uint64_t p)
+{
+    return (p & 7ull) == 0 && (p - 0x100000000ull) < 0x100000000ull;   /* [4 GiB, 8 GiB) */
+}
+
+/* Read 8 bytes without any risk of crashing on unmapped memory. Returns 0 unless the
+ * address is in the expected object range, 8-aligned, and the read succeeded. */
+static int try_read64(uint64_t addr, uint64_t *out)
+{
+    unsigned long long got = 0;
+    if (!g_safe_ok || !ptr_range_ok(addr)) {
+        return 0;
+    }
+    if (mach_vm_read_overwrite(mach_task_self_, (unsigned long long)addr, 8ull,
+                               (unsigned long long)(uintptr_t)out, &got) != 0 || got != 8ull) {
+        return 0;
+    }
+    return 1;
+}
+
+/* Cached discovered path (process lifetime; re-discovered when it breaks). */
+static int g_hit_valid;
+static uint64_t g_hit_anchor;    /* styles 1-3: the scene; style 4: the holder object      */
+static char g_hit_hub;           /* 'g' gg, 's' singleton, 'd' *(gg+0x88), 'o' *(gg+0x78) */
+static int g_hit_style;          /* 1 v=scene; 2 *(v+0x3a0)=scene; 3 *(v+0x2c0)=scene;
+                                    4 *(v+0x30)=tl                                     */
+static uint64_t g_hit_off;
+
+static int is_scene(uint64_t scene)
+{
+    uint64_t v = 0;
+    return scene != 0 && try_read64(scene, &v) && v == g_base + SCENE_MARKER_OFF;
+}
+
+static int is_tl(uint64_t cand, uint64_t *tl)
+{
+    uint64_t v = 0;
+    if (cand == 0 || !try_read64(cand, &v) || v != g_base + TL_MARKER_OFF) {
+        return 0;
+    }
+    *tl = cand;
+    return 1;
+}
+
+static int tl_read_fields(uint64_t tl, int *t20, int *t24, int *t28,
+                          int *f2c, int *f2d, int *f2e)
+{
+    uint64_t w20 = 0, w28 = 0;
+    if (!try_read64(tl + OFF_TL_TIME, &w20) || !try_read64(tl + OFF_TL_W28, &w28)) {
+        return 0;
+    }
+    *t20 = (int)(uint32_t)w20;
+    *t24 = (int)(uint32_t)(w20 >> 32);
+    *t28 = (int)(uint32_t)w28;
+    *f2c = (int)((w28 >> 32) & 0xffull);
+    *f2d = (int)((w28 >> 40) & 0xffull);
+    *f2e = (int)((w28 >> 48) & 0xffull);
+    return 1;
+}
+
+static int crawl_slot(char hub, uint64_t off, uint64_t v, uint64_t *tl)
+{
+    uint64_t scene = 0, t = 0;
+    if (!ptr_range_ok(v)) {
+        return 0;
+    }
+    if (is_scene(v) && try_read64(v + OFF_SCENE_TL, &t) && is_tl(t, tl)) {
+        g_hit_hub = hub; g_hit_style = 1; g_hit_off = off; g_hit_anchor = v;
+        return 1;
+    }
+    if (try_read64(v + OFF_HUB_SCENE_A, &scene) && is_scene(scene) &&
+        try_read64(scene + OFF_SCENE_TL, &t) && is_tl(t, tl)) {
+        g_hit_hub = hub; g_hit_style = 2; g_hit_off = off; g_hit_anchor = scene;
+        return 1;
+    }
+    if (try_read64(v + OFF_HUB_SCENE_B, &scene) && is_scene(scene) &&
+        try_read64(scene + OFF_SCENE_TL, &t) && is_tl(t, tl)) {
+        g_hit_hub = hub; g_hit_style = 3; g_hit_off = off; g_hit_anchor = scene;
+        return 1;
+    }
+    if (try_read64(v + OFF_SCENE_TL, &t) && is_tl(t, tl)) {
+        g_hit_hub = hub; g_hit_style = 4; g_hit_off = off; g_hit_anchor = v;
+        return 1;
+    }
+    return 0;
+}
+
+static int crawl_hub(char hub, uint64_t base, uint64_t max_off, uint64_t *tl)
+{
+    uint64_t v = 0, off;
+    if (!ptr_range_ok(base)) {
+        return 0;
+    }
+    if (crawl_slot(hub, 0, base, tl)) {          /* the hub object itself */
+        return 1;
+    }
+    for (off = 8; off <= max_off; off += 8) {
+        if (try_read64(base + off, &v) && crawl_slot(hub, off, v, tl)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int find_timeline(uint64_t gg, uint64_t *tl)
+{
+    uint64_t hub = 0;
+    uint64_t single = *(volatile uint64_t *)(uintptr_t)(g_base + OFF_SINGLETON);
+    if (crawl_hub('g', gg, 0xf0, tl)) {
+        return 1;
+    }
+    if (crawl_hub('s', single, 0xf0, tl)) {
+        return 1;
+    }
+    if (try_read64(gg + OFF_GG_D88, &hub) && crawl_hub('d', hub, 0x58, tl)) {
+        return 1;
+    }
+    if (try_read64(gg + OFF_GG_O78, &hub) && crawl_hub('o', hub, 0x58, tl)) {
+        return 1;
+    }
+    return 0;
+}
+
+static int walk_hit(uint64_t *tl)
+{
+    uint64_t t = 0;
+    if (g_hit_style == 4) {
+        return try_read64(g_hit_anchor + OFF_SCENE_TL, &t) && is_tl(t, tl);
+    }
+    return is_scene(g_hit_anchor) &&
+           try_read64(g_hit_anchor + OFF_SCENE_TL, &t) && is_tl(t, tl);
+}
+
+/* Runs on the main thread; every dereference is a mach safe read. */
+static void ct_probe(uint64_t gg, uint64_t *tl, int *ctA, int *t20, int *t24, int *t28,
+                     int *f2c, int *f2d, int *f2e, char *path, size_t pathlen)
+{
+    *ctA = 0;
+    path[0] = '\0';
+    if (!g_safe_ok || !ptr_range_ok(gg)) {
+        return;
+    }
+    if (g_hit_valid && !walk_hit(tl)) {
+        g_hit_valid = 0;                    /* path broke (scene recreated): re-locate */
+    }
+    if (!g_hit_valid) {
+        if (!find_timeline(gg, tl)) {
+            return;
+        }
+        g_hit_valid = 1;
+    }
+    if (!tl_read_fields(*tl, t20, t24, t28, f2c, f2d, f2e)) {
+        return;
+    }
+    *ctA = 1;
+    snprintf(path, pathlen, "%c%d+0x%x", g_hit_hub, g_hit_style, (unsigned)g_hit_off);
+}
+
 static void read_trampoline(void *ctx)   /* runs on the main thread (runloop source) */
 {
     read_task_t *task = (read_task_t *)ctx;
     chain_snap_t cs;
     uint64_t now;
     uint64_t tid = 0;
-    uint64_t o78 = 0, sc = 0, tl = 0;
+    uint64_t tl = 0;
+    uint32_t words[CT_DUMP_WORDS];
     int pos = -1;
     int ok = 0;
     int ctM = 0, ctMok = 0, ctA = 0;
     int t20 = 0, t24 = 0, t28 = 0;
     int f2c = -1, f2d = -1, f2e = -1;
+    char path[24];
     const char *reason = "";
     char line[LINEBUF];
     int n;
@@ -443,45 +637,43 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
         pos = fn((void *)(uintptr_t)cs.am);
         ok = 1;
     }
-    /* chart-time probes (read-only, guarded; no new calls) */
+    /* chart-time probes + discovery crawl (safe reads only; no new calls) */
     ctM = *(volatile int32_t *)(uintptr_t)(g_base + OFF_CT_MIRROR);
     if (ctM > -(1 << 26) && ctM < (1 << 26)) {
         ctMok = 1;
     }
-    if (g_ident_ok && cs.state == CH_READY && ptr_plausible(cs.gg)) {
-        o78 = *(volatile uint64_t *)(uintptr_t)(cs.gg + OFF_GG_HOLD);
-        if (ptr_plausible(o78)) {
-            sc = *(volatile uint64_t *)(uintptr_t)(o78 + OFF_HOLD_SCENE);
-            if (ptr_plausible(sc)) {
-                tl = *(volatile uint64_t *)(uintptr_t)(sc + OFF_SCENE_TL);
-                if (ptr_plausible(tl) &&
-                    *(volatile uint64_t *)(uintptr_t)tl == g_base + TL_MARKER_OFF) {
-                    ctA = 1;
-                    t20 = *(volatile int32_t *)(uintptr_t)(tl + OFF_TL_TIME);
-                    t24 = *(volatile int32_t *)(uintptr_t)(tl + OFF_TL_24);
-                    t28 = *(volatile int32_t *)(uintptr_t)(tl + OFF_TL_28);
-                    f2c = *(volatile uint8_t *)(uintptr_t)(tl + OFF_TL_FLAGS);
-                    f2d = *(volatile uint8_t *)(uintptr_t)(tl + OFF_TL_FLAGS + 1);
-                    f2e = *(volatile uint8_t *)(uintptr_t)(tl + OFF_TL_FLAGS + 2);
-                }
-            }
+    {
+        const uint32_t *dw = (const uint32_t *)(const void *)(uintptr_t)(g_base + OFF_CT_DUMP_BASE);
+        int i;
+        for (i = 0; i < CT_DUMP_WORDS; i++) {
+            words[i] = dw[i];
         }
+    }
+    if (g_ident_ok && cs.state == CH_READY) {
+        ct_probe(cs.gg, &tl, &ctA, &t20, &t24, &t28, &f2c, &f2d, &f2e, path, sizeof(path));
     }
     now = monotonic_ms();
     pthread_threadid_np(NULL, &tid);
     n = snprintf(line, sizeof(line),
                  "p seq=%llu t_ms=%llu t_q=%llu lag_ms=%llu tid=%llu main=%d am=%llx handle=%llx ok=%d pos_ms=%d"
-                 " ctM=%d ctMok=%d ctA=%d o78=%llx sc=%llx tl=%llx",
+                 " ctM=%d ctMok=%d sr=%d ctA=%d cD=%d",
                  (unsigned long long)task->q_seq, (unsigned long long)now,
                  (unsigned long long)task->q_t_ms, (unsigned long long)(now - task->q_t_ms),
                  (unsigned long long)tid, pthread_main_np() ? 1 : 0,
                  (unsigned long long)cs.am, (unsigned long long)cs.chan0, ok, pos,
-                 ctM, ctMok, ctA,
-                 (unsigned long long)o78, (unsigned long long)sc, (unsigned long long)tl);
-    if (ctA && n > 0 && (size_t)n < sizeof(line) - 80) {
+                 ctM, ctMok, g_safe_ok ? 1 : 0, ctA, g_hit_valid ? 1 : 0);
+    if (ctA && n > 0 && (size_t)n < sizeof(line) - 128) {
         n += snprintf(line + n, sizeof(line) - (size_t)n,
-                      " t20=%d t24=%d t28=%d f2c=%d f2d=%d f2e=%d",
-                      t20, t24, t28, f2c, f2d, f2e);
+                      " path=%s tl=%llx t20=%d t24=%d t28=%d f2c=%d f2d=%d f2e=%d",
+                      path, (unsigned long long)tl, t20, t24, t28, f2c, f2d, f2e);
+    }
+    if (n > 0 && (size_t)n < sizeof(line) - 160) {
+        int i;
+        n += snprintf(line + n, sizeof(line) - (size_t)n, " w=");
+        for (i = 0; i < CT_DUMP_WORDS; i++) {
+            n += snprintf(line + n, sizeof(line) - (size_t)n, "%s%08x",
+                          i ? " " : "", (unsigned)words[i]);
+        }
     }
     if (!ok && n > 0 && (size_t)n < sizeof(line) - 32) {
         n += snprintf(line + n, sizeof(line) - (size_t)n, " reason=%s", reason);
@@ -660,10 +852,11 @@ static void practice_clock_probe_ctor(void)
 
     init_log_path();
     ident_check();
+    saferead_init();
 
     if (gmtime_r(&now, &tmv) != NULL) {
         n = snprintf(header, sizeof(header),
-                     "# practice_clock_probe v4 (chain + guarded reads + chart-time probe)\n"
+                     "# practice_clock_probe v5 (chain + guarded reads + safe-read discovery)\n"
                      "# build=%s pid=%ld utc=%04d-%02d-%02dT%02d:%02d:%02dZ t0_ms=%llu\n",
                      PRACTICE_CLOCK_PROBE_VERSION, (long)getpid(),
                      tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
@@ -671,7 +864,7 @@ static void practice_clock_probe_ctor(void)
                      (unsigned long long)t0);
     } else {
         n = snprintf(header, sizeof(header),
-                     "# practice_clock_probe v4 (chain + guarded reads + chart-time probe)\n"
+                     "# practice_clock_probe v5 (chain + guarded reads + safe-read discovery)\n"
                      "# build=%s pid=%ld t0_ms=%llu\n",
                      PRACTICE_CLOCK_PROBE_VERSION, (long)getpid(),
                      (unsigned long long)t0);
@@ -706,6 +899,12 @@ static void practice_clock_probe_ctor(void)
         if (n > 0 && (size_t)n < sizeof(header)) {
             append_raw(header, (size_t)n);
         }
+    }
+
+    n = snprintf(header, sizeof(header), "# saferead=%s\n",
+                 g_safe_ok ? "mach-vm/1" : "off/0");
+    if (n > 0 && (size_t)n < sizeof(header)) {
+        append_raw(header, (size_t)n);
     }
 
     if (pthread_create(&th, NULL, sampler_main, NULL) != 0) {
