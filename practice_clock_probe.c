@@ -134,11 +134,12 @@
 #include <time.h>
 #include <unistd.h>
 #include "practice_obs_queue.h"
+#include "practice_shadow.h"
 
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "s3a-anchor-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "s3b-shadow-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -541,8 +542,9 @@ extern int mach_vm_read_overwrite(unsigned int task, unsigned long long addr,
 #define OBS_VALID_READS  0x1u   /* on-site timeline reads succeeded      */
 #define OBS_VALID_MAIN   0x4u   /* pthread_main_np() true at the site    */
 static PracticeObsQueue g_obs_q = POQ_INITIALIZER;
+static PracticeShadow g_shadow;
 static uint64_t g_main_base;
-static uint32_t g_tb_numer = 125, g_tb_denom = 3;   /* replaced by ctor probe */
+static uint32_t g_tb_numer, g_tb_denom; /* zero means unavailable, never guessed */
 
 __attribute__((used, noinline))
 void pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
@@ -1141,6 +1143,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                     break;
                 }
                 uc++;
+                ps_observe(&g_shadow, &rec, g_tb_numer, g_tb_denom);
                 if (rec.tag == 1) ub1++; else if (rec.tag == 2) ub2++;
                 if (rec.valid & OBS_VALID_MAIN) upm++; else unm++;
                 if (rec.valid & OBS_VALID_READS) uv++;
@@ -1156,8 +1159,8 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                     }
                 }
                 if (uc > 1 && rec.mach > prev_mach) {
-                    uint64_t gap_us = (rec.mach - prev_mach) * (uint64_t)g_tb_numer /
-                                      ((uint64_t)g_tb_denom * 1000ull);
+                    uint64_t gap_us = 0;
+                    (void)ps_mach_us(rec.mach - prev_mach, g_tb_numer, g_tb_denom, &gap_us);
                     if (umin == 0 || gap_us < umin) umin = (unsigned int)gap_us;
                     if (gap_us > umax) umax = (unsigned int)gap_us;
                     if (gap_us < 100) uh[0]++;
@@ -1250,6 +1253,16 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
         line[n] = '\0';
         padd(line, (size_t)n);
     }
+    n = snprintf(line, sizeof(line),
+                 "sh seq=%llu segments=%llu compared=%llu skipped=%llu faults=%llu transitions=%llu"
+                 " over5=%llu over50=%llu max_us=%llu last_us=%lld bound=%d paused=%d\n",
+                 (unsigned long long)task->q_seq,
+                 (unsigned long long)g_shadow.segments, (unsigned long long)g_shadow.compared,
+                 (unsigned long long)g_shadow.skipped, (unsigned long long)g_shadow.faults,
+                 (unsigned long long)g_shadow.transitions, (unsigned long long)g_shadow.over5ms,
+                 (unsigned long long)g_shadow.over50ms, (unsigned long long)g_shadow.max_abs_us,
+                 (long long)g_shadow.last_error_us, g_shadow.bound, g_shadow.paused);
+    if (n > 0 && (size_t)n < sizeof(line)) padd(line, (size_t)n);
     if (!ok) {
         pflush();   /* keep skip events durable */
     }
@@ -1491,7 +1504,8 @@ static void practice_clock_probe_ctor(void)
     {
         uintptr_t main_base = (uintptr_t)_dyld_get_image_header(0);
         int qok = poq_init(&g_obs_q);
-        if (main_base != 0 && qok) {
+        int shadow_ok = ps_init(&g_shadow);
+        if (main_base != 0 && qok && shadow_ok && g_tb_numer && g_tb_denom) {
             volatile uint64_t *magic = (volatile uint64_t *)(main_base + 0x165BE00ull);
             volatile uint64_t *ptr = (volatile uint64_t *)(main_base + 0x165BE08ull);
             uint64_t pre_magic = *magic;

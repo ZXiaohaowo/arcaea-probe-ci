@@ -47,7 +47,7 @@ xcrun --sdk iphoneos clang \
   -framework CoreFoundation \
   -install_name @executable_path/Frameworks/practice_clock_probe.framework/practice_clock_probe \
   -o out/practice_clock_probe.framework/practice_clock_probe \
-  practice_clock_probe.c practice_obs_queue.c
+  practice_clock_probe.c practice_obs_queue.c practice_time.c practice_shadow.c
 cp clock_probe-Info.plist out/practice_clock_probe.framework/Info.plist
 
 echo "==== verify ===="
