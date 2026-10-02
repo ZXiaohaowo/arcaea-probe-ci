@@ -1,4 +1,4 @@
-/* practice_clock_probe.c - S3a: state-route probe (v10).
+/* practice_clock_probe.c - S3a: anchor/units probe (v11).
  *
  * v9 scope (per the 2026-09-29 review), kept in v3:
  *   - NO active calls into game functions. Reads only.
@@ -69,22 +69,29 @@
  *     pause/resume work: timeline anchor pair (tl+0x10/+0x18), tl+0x34 (field34),
  *     tl+0x38 (resume-seek bias), scene+0x144 and session+0x2d0 state words. The bounded
  *     marker scans stay as fallback. NO writes.
+ *   - v18 (S3a anchor/units probe): the v17 run decoded the pause/resume mechanics and
+ *     showed t18 = wall ms (scene anchor). v18 logs the mach timebase (numer/denom) and
+ *     mach_absolute_time per line to close the remaining unit questions, and re-reads the
+ *     scene windows (+0x138 bytes: sf/s13b/s13e; +0x140 u64: s140/sc144), plus f2f.
+ *     NO writes.
  *
  * Log: <sandbox>/Documents/practice_clock_probe.log (append-only).
- *   Header:  # practice_clock_probe v10 (S3a: state-route probe)
+ *   Header:  # practice_clock_probe v11 (S3a: anchor/units probe)
  *            # build=<id> pid=<n> utc=<ISO8601Z> t0_ms=<n>
  *   Ident:   # ident base=0x.. slide=0x.. img=.. magic=<0|1> words=<0|1> vt=<0|1> ...
  *   Reads:   # reads mainhop=<cf-runloop|unavailable>
  *   Saferead:# saferead=<mach-vm/1|off/0>
+ *   Timebase:# timebase numer=<n> denom=<d>
  *   Sample:  s seq=<n> t_ms=<n> dt_ms=<n> [gap=1]
  *   Chain:   c seq=<n> t_ms=<n> tid=<n> main=<0|1> state=<ready|not-ready|anomaly|changed>
  *            [slot=0x.. gg=0x.. am=0x.. pv=0x.. count=<n> chan0=0x..] [reason=<..>]
  *   Position: p seq=<n> t_ms=<n> t_q=<n> lag_ms=<n> tid=<n> main=<0|1> am=0x.. handle=0x..
  *            ok=<0|1> pos_ms=<n> pitch=<f.ffff|na> pchret=<n> pcherr=<token> safe=<0|1>
  *            reads=<n>/<n>/<n>/<n> cD=<0|1> via=<token> soff=0x<off> sf=<n|-1> s470=<n|-1>
- *            s474=<n> t30=<n> ctA=<0|1> ctM=<n|na> ctMok=<0|1> xf=<token>
+ *            s474=<n> t30=<n> mb=0x.. ctA=<0|1> ctM=<n|na> ctMok=<0|1> xf=<token>
  *            s1=0x.. ho=0x.. g0=0x.. g88=0x.. g88v=0x.. h140=0x.. v140=0x..
- *            t34=<n> t10=0x.. t18=0x.. t38=0x.. sc144=<n> s2d0=<n>
+ *            t34=<n> f2f=<n> t10=0x.. t18=0x.. t38=0x.. sc144=<n> s140=<n> s13b=<n>
+ *            s13e=<n> s2d0=<n>
  *            [sess=0x.. sc=0x.. tl=0x.. t20=<n> t24=<n> t28=<n> f2c=<n> f2d=<n> f2e=<n>]
  *            w=<16 x %08x|na> [reason=<..>]
  *            -- main-thread executed (main=1 expected); pitch = BGM channel pitch (float,
@@ -101,8 +108,9 @@
  *            ident|nomach); s1..v140 = raw diagnostic values (singleton; [sing+0x148];
  *            gg; [gg+0x88]; its vtable; [sing+0x140]; its vtable); t10/t18 = the timeline
  *            anchor pair, t34 = field34 (the >0?0:-3000 switch), t38 = the resume-seek
- *            bias, sc144 = scene state word, s2d0 = session state word (pause-gate);
- *            w = 16 u32 words at 0x16539a0 (mirror at index 8), or na.
+ *            bias, f2f = timeline flag byte 7, sc144/s140 = scene state words, s13b/s13e =
+ *            scene flag bytes, s2d0 = session state word (pause-gate), mb = mach_absolute_time
+ *            at line build; w = 16 u32 words at 0x16539a0 (mirror at index 8), or na.
  *   Chain lines are change-driven (heartbeat every 60 samples). Position reads run at <=2 Hz
  *   only while: chain ready, channel-0 handle non-null, handle stable for >=250 ms, and no
  *   previous read is still in flight.
@@ -128,12 +136,12 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "s3a-states-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "s3a-anchor-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
 #define FLUSH_EVERY_LINES 8
-#define LINEBUF 896
+#define LINEBUF 960
 #define HEARTBEAT_EVERY 60
 
 /* Image-relative offsets (vmaddr - 0x100000000 for this client build; EQUAL to file
@@ -177,7 +185,7 @@
 #define OFF_TL_A10            0x10ULL       /* timeline anchor pair low                */
 #define OFF_TL_A18            0x18ULL       /* timeline anchor pair high               */
 #define OFF_TL_W38            0x38ULL       /* timeline resume-seek bias               */
-#define OFF_SCENE_ST144       0x144ULL      /* scene state word                        */
+#define OFF_SCENE_W140        0x140ULL      /* scene: state-word window (+0x140/+0x144)*/
 #define OFF_SESS_2D0          0x2d0ULL      /* session state word (pause-gate)         */
 #define OFF_WRAP_SESS         0x2b0ULL      /* wrapper -> session field (run 10-02)    */
 #define CT_DUMP_WORDS         16
@@ -632,7 +640,10 @@ typedef struct raw_diag {
 typedef struct tl_extra {
     uint64_t t10, t18, t38;   /* timeline anchor pair + resume-seek bias            */
     int t34;                  /* timeline field34 (the >0 ? 0 : -3000 switch)       */
-    int sc144;                /* scene state word                                   */
+    int f2f;                  /* timeline flag byte 7                               */
+    int sc144;                /* scene state word (+0x144)                          */
+    int s140;                 /* scene state word (+0x140)                          */
+    int s13b, s13e;           /* scene flag bytes (+0x13b / +0x13e)                 */
     int s2d0;                 /* session state word (pause-gate)                    */
 } tl_extra_t;
 
@@ -653,7 +664,7 @@ static int is_tl(uint64_t cand, uint64_t *tl)
 }
 
 static int tl_read_fields(uint64_t tl, int *t20, int *t24, int *t28,
-                          int *f2c, int *f2d, int *f2e)
+                          int *f2c, int *f2d, int *f2e, int *f2f)
 {
     uint64_t w20 = 0, w28 = 0;
     if (!try_read64(tl + OFF_TL_TIME, &w20) || !try_read64(tl + OFF_TL_W28, &w28)) {
@@ -665,6 +676,7 @@ static int tl_read_fields(uint64_t tl, int *t20, int *t24, int *t28,
     *f2c = (int)((w28 >> 32) & 0xffull);
     *f2d = (int)((w28 >> 40) & 0xffull);
     *f2e = (int)((w28 >> 48) & 0xffull);
+    *f2f = (int)((w28 >> 56) & 0xffull);
     return 1;
 }
 
@@ -923,6 +935,8 @@ static void ct_probe(uint64_t *tl, int *ctCd, int *ctA, int *t20, int *t24, int 
     *scene_out = scene;
     if (scene != 0 && try_read64(scene + OFF_SCENE_SF, &v)) {
         *sf = (int)(v & 0xffull);
+        ex->s13b = (int)((v >> 24) & 0xffull);
+        ex->s13e = (int)((v >> 48) & 0xffull);
     }
     if (sess != 0 && try_read64(sess + OFF_SESS_470, &v)) {
         *s470 = (int)(v & 0xffull);
@@ -941,18 +955,20 @@ static void ct_probe(uint64_t *tl, int *ctCd, int *ctA, int *t20, int *t24, int 
     if (try_read64(*tl + OFF_TL_W38, &v)) {
         ex->t38 = v;
     }
-    if (scene != 0) {
-        uint32_t u32 = 0;
-        if (try_read32(scene + OFF_SCENE_ST144, &u32)) {
-            ex->sc144 = (int)u32;
-        }
+    if (scene != 0 && try_read64(scene + OFF_SCENE_W140, &v)) {
+        ex->s140 = (int)(uint32_t)v;
+        ex->sc144 = (int)(uint32_t)(v >> 32);
     }
     if (sess != 0 && try_read64(sess + OFF_SESS_2D0, &v)) {
         ex->s2d0 = (int)(uint32_t)v;
     }
-    if (!tl_read_fields(*tl, t20, t24, t28, f2c, f2d, f2e)) {
-        *xf = "fields";
-        return;
+    {
+        int f2f = -1;
+        if (!tl_read_fields(*tl, t20, t24, t28, f2c, f2d, f2e, &f2f)) {
+            *xf = "fields";
+            return;
+        }
+        ex->f2f = f2f;
     }
     *ctA = 1;
     *xf = "none";
@@ -977,6 +993,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     int f2c = -1, f2d = -1, f2e = -1;
     int sr_reads = 0, sr_filt = 0, sr_fail = 0, sr_bh = 0;
     uint64_t sess_addr = 0, scene_addr = 0;
+    uint64_t mach_now = 0;
     raw_diag_t dg;
     tl_extra_t te;
     const char *xf = "none";
@@ -1048,6 +1065,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
         xf = g_safe_ok ? "ident" : "nomach";
     }
     now = monotonic_ms();
+    mach_now = mach_absolute_time();
     pthread_threadid_np(NULL, &tid);
     if (ctMr) {
         snprintf(ctMbuf, sizeof(ctMbuf), "%d", ctM);
@@ -1062,7 +1080,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     n = snprintf(line, sizeof(line),
                  "p seq=%llu t_ms=%llu t_q=%llu lag_ms=%llu tid=%llu main=%d am=%llx handle=%llx ok=%d pos_ms=%d"
                  " pitch=%s pchret=%d pcherr=%s safe=%d reads=%d/%d/%d/%d cD=%d via=%s soff=0x%x"
-                 " sf=%d s470=%d s474=%d t30=%d ctA=%d ctM=%s ctMok=%d xf=%s",
+                 " sf=%d s470=%d s474=%d t30=%d ctA=%d ctM=%s ctMok=%d xf=%s mb=%llx",
                  (unsigned long long)task->q_seq, (unsigned long long)now,
                  (unsigned long long)task->q_t_ms, (unsigned long long)(now - task->q_t_ms),
                  (unsigned long long)tid, pthread_main_np() ? 1 : 0,
@@ -1070,7 +1088,8 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                  pitchbuf, pret, pitch_why,
                  g_safe_ok ? 1 : 0, sr_reads, sr_filt, sr_fail, sr_bh,
                  ctCd, via[0] ? via : "-", (unsigned)g_sess_off,
-                 sf, s470, s474, t30, ctA, ctMbuf, ctMok, xf);
+                 sf, s470, s474, t30, ctA, ctMbuf, ctMok, xf,
+                 (unsigned long long)mach_now);
     if (n > 0 && (size_t)n < sizeof(line) - 260) {
         n += snprintf(line + n, sizeof(line) - (size_t)n,
                       " s1=%llx ho=%llx g0=%llx g88=%llx g88v=%llx h140=%llx v140=%llx",
@@ -1081,9 +1100,9 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     }
     if (n > 0 && (size_t)n < sizeof(line) - 190) {
         n += snprintf(line + n, sizeof(line) - (size_t)n,
-                      " t34=%d t10=%llx t18=%llx t38=%llx sc144=%d s2d0=%d",
-                      te.t34, (unsigned long long)te.t10, (unsigned long long)te.t18,
-                      (unsigned long long)te.t38, te.sc144, te.s2d0);
+                      " t34=%d f2f=%d t10=%llx t18=%llx t38=%llx sc144=%d s140=%d s13b=%d s13e=%d s2d0=%d",
+                      te.t34, te.f2f, (unsigned long long)te.t10, (unsigned long long)te.t18,
+                      (unsigned long long)te.t38, te.sc144, te.s140, te.s13b, te.s13e, te.s2d0);
     }
     if (ctA && n > 0 && (size_t)n < sizeof(line) - 128) {
         n += snprintf(line + n, sizeof(line) - (size_t)n,
@@ -1282,7 +1301,7 @@ static void practice_clock_probe_ctor(void)
 
     if (gmtime_r(&now, &tmv) != NULL) {
         n = snprintf(header, sizeof(header),
-                     "# practice_clock_probe v10 (S3a: state-route probe)\n"
+                     "# practice_clock_probe v11 (S3a: anchor/units probe)\n"
                      "# build=%s pid=%ld utc=%04d-%02d-%02dT%02d:%02d:%02dZ t0_ms=%llu\n",
                      PRACTICE_CLOCK_PROBE_VERSION, (long)getpid(),
                      tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
@@ -1290,7 +1309,7 @@ static void practice_clock_probe_ctor(void)
                      (unsigned long long)t0);
     } else {
         n = snprintf(header, sizeof(header),
-                     "# practice_clock_probe v10 (S3a: state-route probe)\n"
+                     "# practice_clock_probe v11 (S3a: anchor/units probe)\n"
                      "# build=%s pid=%ld t0_ms=%llu\n",
                      PRACTICE_CLOCK_PROBE_VERSION, (long)getpid(),
                      (unsigned long long)t0);
