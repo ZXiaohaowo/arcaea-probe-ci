@@ -135,11 +135,12 @@
 #include <unistd.h>
 #include "practice_obs_queue.h"
 #include "practice_shadow.h"
+#include "practice_pitch_trial.h"
 
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "s3b-w1e1-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "s3b-pitchtrial-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -158,6 +159,7 @@
 #define OFF_AM_VT_SLOT_INIT   0x508ULL      /* vtable slot: init                       */
 #define OFF_PV_GETPOS         0x8e4274ULL   /* AudioProviderFMODiOS::getBGMPosition(i) */
 #define OFF_GETPITCH          0x10e6540ULL  /* ChannelControl::getPitch(handle,float*)  */
+#define OFF_SETPITCH          0x10e6458ULL
 #define OFF_PV_VT             0x14bb930ULL  /* provider vtable base                    */
 #define OFF_PV_VT_SLOT_GETPOS 0x38ULL       /* vtable slot: getBGMPosition             */
 #define OFF_GG_AM             0x10ULL       /* GameGlobal -> AudioManager              */
@@ -543,6 +545,20 @@ extern int mach_vm_read_overwrite(unsigned int task, unsigned long long addr,
 #define OBS_VALID_MAIN   0x4u   /* pthread_main_np() true at the site    */
 static PracticeObsQueue g_obs_q = POQ_INITIALIZER;
 static PracticeShadow g_shadow;
+static PracticePitchTrial g_pitch_trial;
+static int g_pitch_done, g_pitch_success;
+static uint64_t g_pitch_candidate_tl, g_pitch_candidate_handle;
+static unsigned g_pitch_stable;
+static int trial_get(void *handle, float *value)
+{
+    typedef int (*fn)(void *, float *);
+    return ((fn)(uintptr_t)(g_base + OFF_GETPITCH))(handle, value);
+}
+static int trial_set(void *handle, float value)
+{
+    typedef int (*fn)(void *, float);
+    return ((fn)(uintptr_t)(g_base + OFF_SETPITCH))(handle, value);
+}
 /* Main-thread drainer counters, not modified by hook callbacks. */
 static uint64_t g_e1_count, g_e1_mismatch, g_e1_nonmain, g_e1_invalid;
 static uint64_t g_main_base;
@@ -1130,6 +1146,34 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                      &sf, &s470, &s474, &t30, &sess_addr, &scene_addr, &xf,
                      (uint64_t)task->q_seq, via, sizeof(via), &dg, &te);
         }
+        /* One synchronous transaction while natively paused. No pitch remains
+         * intentionally changed on return. Never scheduled onto a later frame. */
+        if (!g_pitch_done) {
+            uint64_t marker = 0;
+            int eligible = pthread_main_np() && ctCd && ctA &&
+                f2c == 1 && f2d == 1 && sf == 1 && s470 == 1 &&
+                t30 == 0 && te.t34 == 0 && te.t38 == 0 &&
+                (int64_t)t20 - t28 > 1000 && cs.chan0 && pok &&
+                safe_read(g_base + OFF_SETPITCH, &marker, 8) &&
+                marker == 0x6d1223e9d10583ffULL;
+            if (!eligible) g_pitch_stable = 0;
+            else {
+                chain_snap_t fresh;
+                if (g_pitch_candidate_tl != tl || g_pitch_candidate_handle != cs.chan0)
+                    g_pitch_stable = 0;
+                g_pitch_candidate_tl = tl;
+                g_pitch_candidate_handle = cs.chan0;
+                if (++g_pitch_stable >= 2) {
+                    snapshot_chain(&fresh);
+                    if (fresh.state == CH_READY && fresh.am == cs.am &&
+                        fresh.pv == cs.pv && fresh.chan0 == cs.chan0) {
+                        PracticePitchOps ops = {(void *)(uintptr_t)fresh.chan0, trial_get, trial_set};
+                        g_pitch_done = 1;
+                        g_pitch_success = ppt_run(ops, 75, &g_pitch_trial);
+                    }
+                }
+            }
+        }
         sr_reads = g_sr_reads;
         sr_filt = g_sr_filtered;
         sr_fail = g_sr_failed;
@@ -1283,6 +1327,17 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     if (!ok) {
         pflush();   /* keep skip events durable */
     }
+    n = snprintf(line, sizeof(line),
+                 "pt seq=%llu done=%d success=%d attempted=%d target_ok=%d restore_ok=%d"
+                 " baseline=%.4f target=%.4f observed=%.4f restored=%.4f rc=%d/%d/%d/%d/%d\n",
+                 (unsigned long long)task->q_seq, g_pitch_done, g_pitch_success,
+                 g_pitch_trial.attempted, g_pitch_trial.target_ok, g_pitch_trial.restore_ok,
+                 (double)g_pitch_trial.baseline, (double)g_pitch_trial.target,
+                 (double)g_pitch_trial.observed, (double)g_pitch_trial.restored,
+                 g_pitch_trial.baseline_rc, g_pitch_trial.set_rc, g_pitch_trial.read_rc,
+                 g_pitch_trial.restore_rc, g_pitch_trial.final_rc);
+    if (n > 0 && (size_t)n < sizeof(line)) padd(line, (size_t)n);
+    if (g_pitch_done) pflush();
     g_read_inflight = 0;
 }
 
