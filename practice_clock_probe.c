@@ -1352,6 +1352,17 @@ static void practice_clock_probe_ctor(void)
         append_raw(header, (size_t)n);
     }
 
+    {
+        mach_timebase_info_data_t tbi;   /* distinct name: monotonic_ms has its own tb */
+        if (mach_timebase_info(&tbi) == KERN_SUCCESS) {
+            n = snprintf(header, sizeof(header), "# timebase numer=%u denom=%u\n",
+                         (unsigned)tbi.numer, (unsigned)tbi.denom);
+            if (n > 0 && (size_t)n < sizeof(header)) {
+                append_raw(header, (size_t)n);
+            }
+        }
+    }
+
     if (pthread_create(&th, NULL, sampler_main, NULL) != 0) {
         static const char fail_msg[] = "# sampler thread start failed\n";
         append_raw(fail_msg, sizeof(fail_msg) - 1);
