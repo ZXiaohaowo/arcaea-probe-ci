@@ -133,6 +133,7 @@
 #include <syslog.h>
 #include <time.h>
 #include <unistd.h>
+#include "practice_obs_queue.h"
 
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
@@ -142,7 +143,7 @@
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
 #define FLUSH_EVERY_LINES 8
-#define LINEBUF 1024
+#define LINEBUF 1280
 #define HEARTBEAT_EVERY 60
 
 /* Image-relative offsets (vmaddr - 0x100000000 for this client build; EQUAL to file
@@ -532,28 +533,55 @@ extern int mach_vm_read_overwrite(unsigned int task, unsigned long long addr,
  * holds this function's address (written by the ctor). All runtime writes are confined
  * to the slot. The ring is written by the observed thread(s) and drained on the main
  * thread (same thread that owns the p-line output). */
-#define OBS_RING_RECORDS 8192
+/* ---- v20-obs: trampoline observation via the lead's observation queue ----------------
+ * Callback fills a local PoqRecord and pushes it (try-once; drops are counted, never
+ * spun or overwritten). On-site fields (t20/t28/state bytes) are read at the hook site
+ * with validity bits; nothing is re-read later to "reconstruct" the event. */
 #define OBS_SLOT_MAGIC   0x5043504F4253316bull   /* "PCPOBS1k" */
-typedef struct obs_rec {
-    uint64_t mach;      /* mach_absolute_time at entry       */
-    uint64_t tl;        /* x0 of the update call             */
-    uint64_t lr;        /* x30 of the update call (caller)   */
-    uint64_t self;      /* pthread_self() of the caller      */
-} obs_rec_t;
-static obs_rec_t g_obs_ring[OBS_RING_RECORDS];
-static _Atomic uint32_t g_obs_wr;
-static uint32_t g_obs_rd;
+#define OBS_VALID_READS  0x1u   /* on-site timeline reads succeeded      */
+#define OBS_VALID_MAIN   0x4u   /* pthread_main_np() true at the site    */
+static PracticeObsQueue g_obs_q = POQ_INITIALIZER;
 static uint64_t g_main_base;
+static uint32_t g_tb_numer = 125, g_tb_denom = 3;   /* replaced by ctor probe */
 
 __attribute__((used, noinline))
-void pcp_obs_entry(uint64_t tl, uint64_t caller_lr)
+void pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
 {
-    uint32_t i = atomic_fetch_add_explicit(&g_obs_wr, 1u, memory_order_relaxed);
-    obs_rec_t *r = &g_obs_ring[i & (OBS_RING_RECORDS - 1)];
-    r->mach = mach_absolute_time();
-    r->tl = tl;
-    r->lr = caller_lr;
-    r->self = (uint64_t)(uintptr_t)pthread_self();
+    PoqRecord r;
+    uint32_t validbits = 0;
+    r.mach = mach_absolute_time();
+    r.tag = tag;
+    r.object = a;
+    r.lr = lr;
+    r.thread = (uint64_t)(uintptr_t)pthread_self();
+    r.invocation = 0;                 /* pairing not established yet      */
+    r.t20 = 0;
+    r.t28 = 0;
+    r.state = 0;
+    {
+        uint64_t tl = 0;
+        if (tag == 1) {
+            tl = a;                   /* entry hook: x0 = timeline        */
+        } else if (tag == 2) {
+            if ((a & 7ull) == 0 && (a - 0x100000000ull) < 0x100000000ull) {
+                tl = *(volatile uint64_t *)(uintptr_t)(a + 0x30ull);   /* scene+0x30 */
+            }
+        }
+        if (tl != 0 && (tl & 7ull) == 0 && (tl - 0x100000000ull) < 0x100000000ull) {
+            uint64_t w20 = *(volatile uint64_t *)(uintptr_t)(tl + 0x20ull);
+            uint64_t w28 = *(volatile uint64_t *)(uintptr_t)(tl + 0x28ull);
+            uint32_t f2x = *(volatile uint32_t *)(uintptr_t)(tl + 0x2cull);
+            r.t20 = (int32_t)(uint32_t)w20;
+            r.t28 = (int32_t)(uint32_t)w28;
+            r.state = (uint32_t)(f2x & 0xffffu);   /* +0x2c / +0x2d bytes */
+            validbits |= OBS_VALID_READS;
+        }
+    }
+    if (pthread_main_np()) {
+        validbits |= OBS_VALID_MAIN;
+    }
+    r.valid = validbits;
+    (void)poq_push(&g_obs_q, &r);
 }
 
 static int g_safe_ok;
@@ -1023,9 +1051,12 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     int t20 = 0, t24 = 0, t28 = 0;
     int f2c = -1, f2d = -1, f2e = -1;
     int sr_reads = 0, sr_filt = 0, sr_fail = 0, sr_bh = 0;
-    int uc = 0, uth = 0, utl = 0, us = 0;
+    int uc = 0, uv = 0, upm = 0, unm = 0, ub1 = 0, ub2 = 0, urvd = 0, us = 0;
     unsigned int umin = 0, umax = 0;
-    uint64_t ulr = 0;
+    unsigned int uq[5] = {0, 0, 0, 0, 0};
+    uint64_t urv = 0;
+    int ut20 = 0, ut28 = 0;
+    unsigned int ust = 0;
     int uh[6] = {0, 0, 0, 0, 0, 0};
     uint64_t sess_addr = 0, scene_addr = 0;
     uint64_t mach_now = 0;
@@ -1096,47 +1127,54 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
         sr_filt = g_sr_filtered;
         sr_fail = g_sr_failed;
         sr_bh = g_sr_budget_hit;
-        /* v19-obs: drain the trampoline ring (written and drained on this thread). */
+        /* v20-obs: bounded drain of the observation queue (try-once pops). */
         {
-            uint32_t wr = atomic_load_explicit(&g_obs_wr, memory_order_relaxed);
-            uint32_t avail = wr - g_obs_rd;
-            uint64_t prev_mach = 0, self0 = 0, prev_tl = 0;
-            if (avail > OBS_RING_RECORDS) {
-                g_obs_rd = wr - OBS_RING_RECORDS;
-                avail = OBS_RING_RECORDS;
-            }
-            uc = (int)avail;
-            if (avail > 0) {
-                uint32_t k;
-                for (k = 0; k < avail; k++) {
-                    const obs_rec_t *r = &g_obs_ring[(g_obs_rd + k) & (OBS_RING_RECORDS - 1)];
-                    if (k > 0) {
-                        uint64_t gap_us = 0;
-                        if (r->mach > prev_mach) {
-                            gap_us = (r->mach - prev_mach) / 24u;   /* 24 MHz -> us */
-                        }
-                        if (umin == 0 || gap_us < umin) umin = (unsigned int)gap_us;
-                        if (gap_us > umax) umax = (unsigned int)gap_us;
-                        if (gap_us < 100) uh[0]++;
-                        else if (gap_us < 500) uh[1]++;
-                        else if (gap_us < 1000) uh[2]++;
-                        else if (gap_us < 2000) uh[3]++;
-                        else if (gap_us < 5000) uh[4]++;
-                        else uh[5]++;
-                        if (r->self != self0) uth++;
-                        if (r->tl != prev_tl) utl++;
-                    } else {
-                        self0 = r->self;
-                    }
-                    prev_mach = r->mach;
-                    prev_tl = r->tl;
+            uint64_t prev_mach = 0;
+            uint64_t rva_slot[6];
+            int slot_fill = 0;
+            int j, k;
+            PoqRecord rec;
+            PoqStats st;
+            for (j = 0; j < 6; j++) rva_slot[j] = 0;
+            for (j = 0; j < 256; j++) {
+                if (poq_pop(&g_obs_q, &rec) != POQ_OK) {
+                    break;
                 }
-                ulr = g_obs_ring[(g_obs_rd + avail - 1) & (OBS_RING_RECORDS - 1)].lr;
-                g_obs_rd = wr;
+                uc++;
+                if (rec.tag == 1) ub1++; else if (rec.tag == 2) ub2++;
+                if (rec.valid & OBS_VALID_MAIN) upm++; else unm++;
+                if (rec.valid & OBS_VALID_READS) uv++;
+                ut20 = rec.t20; ut28 = rec.t28; ust = rec.state;
+                if (rec.lr > g_main_base) {
+                    uint64_t norm = rec.lr - g_main_base;
+                    urv = norm;
+                    for (k = 0; k < slot_fill; k++) {
+                        if (rva_slot[k] == norm) break;
+                    }
+                    if (k == slot_fill && slot_fill < 6) {
+                        rva_slot[slot_fill++] = norm;
+                    }
+                }
+                if (uc > 1 && rec.mach > prev_mach) {
+                    uint64_t gap_us = (rec.mach - prev_mach) * (uint64_t)g_tb_numer /
+                                      ((uint64_t)g_tb_denom * 1000ull);
+                    if (umin == 0 || gap_us < umin) umin = (unsigned int)gap_us;
+                    if (gap_us > umax) umax = (unsigned int)gap_us;
+                    if (gap_us < 100) uh[0]++;
+                    else if (gap_us < 500) uh[1]++;
+                    else if (gap_us < 1000) uh[2]++;
+                    else if (gap_us < 2000) uh[3]++;
+                    else if (gap_us < 5000) uh[4]++;
+                    else uh[5]++;
+                }
+                prev_mach = rec.mach;
             }
+            urvd = slot_fill;
+            st = poq_stats(&g_obs_q);
+            uq[0] = st.attempted; uq[1] = st.accepted; uq[2] = st.dropped_busy;
+            uq[3] = st.dropped_full; uq[4] = st.drained;
             if (g_main_base != 0 &&
-                *(volatile uint64_t *)(uintptr_t)(g_main_base + 0x165BE00ull) ==
-                    OBS_SLOT_MAGIC) {
+                *(volatile uint64_t *)(uintptr_t)(g_main_base + 0x165BE00ull) == OBS_SLOT_MAGIC) {
                 us = 1;
             }
         }
@@ -1160,7 +1198,8 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                  "p seq=%llu t_ms=%llu t_q=%llu lag_ms=%llu tid=%llu main=%d am=%llx handle=%llx ok=%d pos_ms=%d"
                  " pitch=%s pchret=%d pcherr=%s safe=%d reads=%d/%d/%d/%d cD=%d via=%s soff=0x%x"
                  " sf=%d s470=%d s474=%d t30=%d ctA=%d ctM=%s ctMok=%d xf=%s mb=%llx"
-                 " uc=%d uh=%d/%d/%d/%d/%d/%d umin=%u umax=%u ulr=%llx uth=%d utl=%d us=%d",
+                 " uc=%d uv=%d upm=%d unm=%d ub=%d/%d uh=%d/%d/%d/%d/%d/%d umin=%u umax=%u"
+                 " urv=%llx urvd=%d ut=%d/%d/%x uq=%u/%u/%u/%u/%u us=%d",
                  (unsigned long long)task->q_seq, (unsigned long long)now,
                  (unsigned long long)task->q_t_ms, (unsigned long long)(now - task->q_t_ms),
                  (unsigned long long)tid, pthread_main_np() ? 1 : 0,
@@ -1170,8 +1209,9 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                  ctCd, via[0] ? via : "-", (unsigned)g_sess_off,
                  sf, s470, s474, t30, ctA, ctMbuf, ctMok, xf,
                  (unsigned long long)mach_now,
-                 uc, uh[0], uh[1], uh[2], uh[3], uh[4], uh[5],
-                 umin, umax, (unsigned long long)ulr, uth, utl, us);
+                 uc, uv, upm, unm, ub1, ub2, uh[0], uh[1], uh[2], uh[3], uh[4], uh[5],
+                 umin, umax, (unsigned long long)urv, urvd,
+                 ut20, ut28, ust, uq[0], uq[1], uq[2], uq[3], uq[4], us);
     if (n > 0 && (size_t)n < sizeof(line) - 260) {
         n += snprintf(line + n, sizeof(line) - (size_t)n,
                       " s1=%llx ho=%llx g0=%llx g88=%llx g88v=%llx h140=%llx v140=%llx",
@@ -1436,7 +1476,9 @@ static void practice_clock_probe_ctor(void)
 
     {
         mach_timebase_info_data_t tbi;   /* distinct name: monotonic_ms has its own tb */
-        if (mach_timebase_info(&tbi) == KERN_SUCCESS) {
+        if (mach_timebase_info(&tbi) == KERN_SUCCESS && tbi.denom != 0) {
+            g_tb_numer = tbi.numer;
+            g_tb_denom = tbi.denom;
             n = snprintf(header, sizeof(header), "# timebase numer=%u denom=%u\n",
                          (unsigned)tbi.numer, (unsigned)tbi.denom);
             if (n > 0 && (size_t)n < sizeof(header)) {
@@ -1445,10 +1487,11 @@ static void practice_clock_probe_ctor(void)
         }
     }
 
-    /* v19-obs: wire the static trampoline slot in the main image (+0x165BE00). */
+    /* v20-obs: init the observation queue, then wire the trampoline slot. */
     {
         uintptr_t main_base = (uintptr_t)_dyld_get_image_header(0);
-        if (main_base != 0) {
+        int qok = poq_init(&g_obs_q);
+        if (main_base != 0 && qok) {
             volatile uint64_t *magic = (volatile uint64_t *)(main_base + 0x165BE00ull);
             volatile uint64_t *ptr = (volatile uint64_t *)(main_base + 0x165BE08ull);
             uint64_t pre_magic = *magic;
@@ -1467,9 +1510,12 @@ static void practice_clock_probe_ctor(void)
                              "# obs slot OCCUPIED pre=%016llx/%016llx - NOT wired\n",
                              (unsigned long long)pre_magic, (unsigned long long)pre_ptr);
             }
-            if (n > 0 && (size_t)n < sizeof(header)) {
-                append_raw(header, (size_t)n);
-            }
+        } else {
+            n = snprintf(header, sizeof(header),
+                         "# obs NOT wired (main_base=%d qok=%d)\n", main_base != 0, qok);
+        }
+        if (n > 0 && (size_t)n < sizeof(header)) {
+            append_raw(header, (size_t)n);
         }
     }
 
