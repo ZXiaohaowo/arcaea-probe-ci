@@ -1,4 +1,4 @@
-/* practice_clock_probe.c - S3a: session-chain resolver + diagnostics (v9).
+/* practice_clock_probe.c - S3a: state-route probe (v10).
  *
  * v9 scope (per the 2026-09-29 review), kept in v3:
  *   - NO active calls into game functions. Reads only.
@@ -63,9 +63,15 @@
  *     marker; a found wrapper additionally gets the bounded field scan (0x00..0x380) for
  *     the session pointer. Every resolved route is re-validated every cycle. NO writes.
  *     See docs/s3a_control_interface_notes.md.
+ *   - v17 (S3a state-route probe): the v16 run resolved the live route ([singleton+0x140]
+ *     -> session; wrapper+0x2b0 -> session). v17 adds a per-cycle quick candidate on that
+ *     slot (immediate first discovery, no scan latency), plus state detail for the
+ *     pause/resume work: timeline anchor pair (tl+0x10/+0x18), tl+0x34 (field34),
+ *     tl+0x38 (resume-seek bias), scene+0x144 and session+0x2d0 state words. The bounded
+ *     marker scans stay as fallback. NO writes.
  *
  * Log: <sandbox>/Documents/practice_clock_probe.log (append-only).
- *   Header:  # practice_clock_probe v9 (S3a: resolver diagnostics)
+ *   Header:  # practice_clock_probe v10 (S3a: state-route probe)
  *            # build=<id> pid=<n> utc=<ISO8601Z> t0_ms=<n>
  *   Ident:   # ident base=0x.. slide=0x.. img=.. magic=<0|1> words=<0|1> vt=<0|1> ...
  *   Reads:   # reads mainhop=<cf-runloop|unavailable>
@@ -78,6 +84,7 @@
  *            reads=<n>/<n>/<n>/<n> cD=<0|1> via=<token> soff=0x<off> sf=<n|-1> s470=<n|-1>
  *            s474=<n> t30=<n> ctA=<0|1> ctM=<n|na> ctMok=<0|1> xf=<token>
  *            s1=0x.. ho=0x.. g0=0x.. g88=0x.. g88v=0x.. h140=0x.. v140=0x..
+ *            t34=<n> t10=0x.. t18=0x.. t38=0x.. sc144=<n> s2d0=<n>
  *            [sess=0x.. sc=0x.. tl=0x.. t20=<n> t24=<n> t28=<n> f2c=<n> f2d=<n> f2e=<n>]
  *            w=<16 x %08x|na> [reason=<..>]
  *            -- main-thread executed (main=1 expected); pitch = BGM channel pitch (float,
@@ -92,8 +99,10 @@
  *            fields read this cycle; ctM = BSS mirror - <n> only when its checked read
  *            succeeded, else na; xf = last failure token (none|mirror|dump|sess|fields|
  *            ident|nomach); s1..v140 = raw diagnostic values (singleton; [sing+0x148];
- *            gg; [gg+0x88]; its vtable; [sing+0x140]; its vtable); w = 16 u32 words at
- *            0x16539a0 (mirror at index 8), or na.
+ *            gg; [gg+0x88]; its vtable; [sing+0x140]; its vtable); t10/t18 = the timeline
+ *            anchor pair, t34 = field34 (the >0?0:-3000 switch), t38 = the resume-seek
+ *            bias, sc144 = scene state word, s2d0 = session state word (pause-gate);
+ *            w = 16 u32 words at 0x16539a0 (mirror at index 8), or na.
  *   Chain lines are change-driven (heartbeat every 60 samples). Position reads run at <=2 Hz
  *   only while: chain ready, channel-0 handle non-null, handle stable for >=250 ms, and no
  *   previous read is still in flight.
@@ -119,12 +128,12 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "s3a-resolve-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "s3a-states-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
 #define FLUSH_EVERY_LINES 8
-#define LINEBUF 832
+#define LINEBUF 896
 #define HEARTBEAT_EVERY 60
 
 /* Image-relative offsets (vmaddr - 0x100000000 for this client build; EQUAL to file
@@ -165,6 +174,12 @@
 #define OFF_TL_TIME           0x20ULL       /* timeline: (t20,t24) word                */
 #define OFF_TL_W28            0x28ULL       /* timeline: (t28,f2c,f2d,f2e) word        */
 #define OFF_TL_BOUND          0x30ULL       /* timeline: bound value                   */
+#define OFF_TL_A10            0x10ULL       /* timeline anchor pair low                */
+#define OFF_TL_A18            0x18ULL       /* timeline anchor pair high               */
+#define OFF_TL_W38            0x38ULL       /* timeline resume-seek bias               */
+#define OFF_SCENE_ST144       0x144ULL      /* scene state word                        */
+#define OFF_SESS_2D0          0x2d0ULL      /* session state word (pause-gate)         */
+#define OFF_WRAP_SESS         0x2b0ULL      /* wrapper -> session field (run 10-02)    */
 #define CT_DUMP_WORDS         16
 
 /* First 8 bytes of each key function (little-endian uint64 of the instruction pair). */
@@ -568,6 +583,15 @@ static int try_read64(uint64_t addr, uint64_t *out)
     return safe_read(addr, out, 8);
 }
 
+static int try_read32(uint64_t addr, uint32_t *out)
+{
+    if ((addr & 3ull) != 0 || (addr - 0x100000000ull) >= 0x100000000ull) {
+        g_sr_filtered += 1;
+        return 0;
+    }
+    return safe_read(addr, out, 4);
+}
+
 /* v16 resolver: routes to the ACTIVE gameplay session/scene/timeline.
  * Static map (see docs/s3a_control_interface_notes.md): singleton getter fn 0xe554c0
  * lazily creates the root object (size 0x208) and caches it at slot 0x1660280;
@@ -604,6 +628,13 @@ static uint64_t g_disc_next_seq;
 typedef struct raw_diag {
     uint64_t s1, ho, g0, g88, g88v, h140, v140;
 } raw_diag_t;
+
+typedef struct tl_extra {
+    uint64_t t10, t18, t38;   /* timeline anchor pair + resume-seek bias            */
+    int t34;                  /* timeline field34 (the >0 ? 0 : -3000 switch)       */
+    int sc144;                /* scene state word                                   */
+    int s2d0;                 /* session state word (pause-gate)                    */
+} tl_extra_t;
 
 static int is_scene(uint64_t scene)
 {
@@ -776,11 +807,48 @@ static void pick_classes(uint64_t sing, uint64_t *sess, uint64_t *scene, uint64_
     }
 }
 
+/* Quick candidate: the [singleton+0x140] slot re-checked EVERY cycle (v16 run showed it
+ * holds the live session in gameplay; the wrapper at transitions - wrapper+0x2b0 -> session).
+ * Found objects are folded into the class caches so the normal validation path uses them. */
+static void quick_candidates(uint64_t sing)
+{
+    uint64_t v = 0, w = 0;
+    if (!ptr_range_ok(sing)) {
+        return;
+    }
+    if (!try_read64(sing + OFF_SING_H140, &v) || v == 0 || !ptr_range_ok(v)) {
+        return;
+    }
+    if (is_sess(v)) {
+        if (!g_has_sess || g_off_sess != OFF_SING_H140) {
+            g_has_sess = 1;
+            g_off_sess = OFF_SING_H140;
+            g_src_sess = 1;
+        }
+        g_inval_sess = 0;
+        return;
+    }
+    if (is_wrap(v)) {
+        if (!g_has_wrap || g_off_wrap != OFF_SING_H140) {
+            g_has_wrap = 1;
+            g_off_wrap = OFF_SING_H140;
+            g_src_wrap = 1;
+        }
+        if (try_read64(v + OFF_WRAP_SESS, &w) && is_sess(w)) {
+            if (!g_has_soff) {
+                g_has_soff = 1;
+                g_sess_off = OFF_WRAP_SESS;
+            }
+        }
+    }
+}
+
 /* Resolve the best route this cycle; returns 1 when a timeline is available. */
 static int resolve_chain(uint64_t sing, uint64_t *sess, uint64_t *scene, uint64_t *tl,
                          char *via, size_t vialen, uint64_t seq)
 {
     *via = '\0';
+    quick_candidates(sing);
     pick_classes(sing, sess, scene, tl);
     if (!*tl && seq >= g_disc_next_seq) {
         scan_round(sing);
@@ -814,7 +882,7 @@ static int resolve_chain(uint64_t sing, uint64_t *sess, uint64_t *scene, uint64_
 static void ct_probe(uint64_t *tl, int *ctCd, int *ctA, int *t20, int *t24, int *t28,
                      int *f2c, int *f2d, int *f2e, int *sf, int *s470, int *s474, int *t30,
                      uint64_t *sess_out, uint64_t *scene_out, const char **xf,
-                     uint64_t seq, char *via, size_t vialen, raw_diag_t *dg)
+                     uint64_t seq, char *via, size_t vialen, raw_diag_t *dg, tl_extra_t *ex)
 {
     uint64_t sing = 0, gg = 0, g88 = 0, v = 0;
     uint64_t sess = 0, scene = 0;
@@ -828,6 +896,7 @@ static void ct_probe(uint64_t *tl, int *ctCd, int *ctA, int *t20, int *t24, int 
     *scene_out = 0;
     via[0] = '\0';
     memset(dg, 0, sizeof(*dg));
+    memset(ex, 0, sizeof(*ex));
     if (!g_safe_ok) {
         return;
     }
@@ -861,6 +930,25 @@ static void ct_probe(uint64_t *tl, int *ctCd, int *ctA, int *t20, int *t24, int 
     }
     if (try_read64(*tl + OFF_TL_BOUND, &v)) {
         *t30 = (int)(uint32_t)v;
+        ex->t34 = (int)(uint32_t)(v >> 32);
+    }
+    if (try_read64(*tl + OFF_TL_A10, &v)) {
+        ex->t10 = v;
+    }
+    if (try_read64(*tl + OFF_TL_A18, &v)) {
+        ex->t18 = v;
+    }
+    if (try_read64(*tl + OFF_TL_W38, &v)) {
+        ex->t38 = v;
+    }
+    if (scene != 0) {
+        uint32_t u32 = 0;
+        if (try_read32(scene + OFF_SCENE_ST144, &u32)) {
+            ex->sc144 = (int)u32;
+        }
+    }
+    if (sess != 0 && try_read64(sess + OFF_SESS_2D0, &v)) {
+        ex->s2d0 = (int)(uint32_t)v;
     }
     if (!tl_read_fields(*tl, t20, t24, t28, f2c, f2d, f2e)) {
         *xf = "fields";
@@ -890,6 +978,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     int sr_reads = 0, sr_filt = 0, sr_fail = 0, sr_bh = 0;
     uint64_t sess_addr = 0, scene_addr = 0;
     raw_diag_t dg;
+    tl_extra_t te;
     const char *xf = "none";
     char via[24];
     char ctMbuf[16];
@@ -949,7 +1038,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
         if (cs.state == CH_READY) {
             ct_probe(&tl, &ctCd, &ctA, &t20, &t24, &t28, &f2c, &f2d, &f2e,
                      &sf, &s470, &s474, &t30, &sess_addr, &scene_addr, &xf,
-                     (uint64_t)task->q_seq, via, sizeof(via), &dg);
+                     (uint64_t)task->q_seq, via, sizeof(via), &dg, &te);
         }
         sr_reads = g_sr_reads;
         sr_filt = g_sr_filtered;
@@ -989,6 +1078,12 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                       (unsigned long long)dg.g0, (unsigned long long)dg.g88,
                       (unsigned long long)dg.g88v, (unsigned long long)dg.h140,
                       (unsigned long long)dg.v140);
+    }
+    if (n > 0 && (size_t)n < sizeof(line) - 190) {
+        n += snprintf(line + n, sizeof(line) - (size_t)n,
+                      " t34=%d t10=%llx t18=%llx t38=%llx sc144=%d s2d0=%d",
+                      te.t34, (unsigned long long)te.t10, (unsigned long long)te.t18,
+                      (unsigned long long)te.t38, te.sc144, te.s2d0);
     }
     if (ctA && n > 0 && (size_t)n < sizeof(line) - 128) {
         n += snprintf(line + n, sizeof(line) - (size_t)n,
@@ -1187,7 +1282,7 @@ static void practice_clock_probe_ctor(void)
 
     if (gmtime_r(&now, &tmv) != NULL) {
         n = snprintf(header, sizeof(header),
-                     "# practice_clock_probe v9 (S3a: resolver diagnostics)\n"
+                     "# practice_clock_probe v10 (S3a: state-route probe)\n"
                      "# build=%s pid=%ld utc=%04d-%02d-%02dT%02d:%02d:%02dZ t0_ms=%llu\n",
                      PRACTICE_CLOCK_PROBE_VERSION, (long)getpid(),
                      tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
@@ -1195,7 +1290,7 @@ static void practice_clock_probe_ctor(void)
                      (unsigned long long)t0);
     } else {
         n = snprintf(header, sizeof(header),
-                     "# practice_clock_probe v9 (S3a: resolver diagnostics)\n"
+                     "# practice_clock_probe v10 (S3a: state-route probe)\n"
                      "# build=%s pid=%ld t0_ms=%llu\n",
                      PRACTICE_CLOCK_PROBE_VERSION, (long)getpid(),
                      (unsigned long long)t0);
