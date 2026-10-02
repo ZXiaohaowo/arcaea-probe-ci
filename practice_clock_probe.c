@@ -139,7 +139,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "s3b-shadow-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "s3b-w1e1-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -543,26 +543,28 @@ extern int mach_vm_read_overwrite(unsigned int task, unsigned long long addr,
 #define OBS_VALID_MAIN   0x4u   /* pthread_main_np() true at the site    */
 static PracticeObsQueue g_obs_q = POQ_INITIALIZER;
 static PracticeShadow g_shadow;
+/* Main-thread drainer counters, not modified by hook callbacks. */
+static uint64_t g_e1_count, g_e1_mismatch, g_e1_nonmain, g_e1_invalid;
 static uint64_t g_main_base;
 static uint32_t g_tb_numer, g_tb_denom; /* zero means unavailable, never guessed */
 
 __attribute__((used, noinline))
-void pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
+uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
 {
     PoqRecord r;
     uint32_t validbits = 0;
     r.mach = mach_absolute_time();
     r.tag = tag;
     r.object = a;
-    r.lr = lr;
+    r.lr = tag == 3 ? 0 : lr; /* tag3 argument is native w9, NOT a caller LR */
     r.thread = (uint64_t)(uintptr_t)pthread_self();
-    r.invocation = 0;                 /* pairing not established yet      */
+    r.invocation = tag == 3 ? (uint32_t)lr : 0; /* tag3: native input bits */
     r.t20 = 0;
     r.t28 = 0;
     r.state = 0;
     {
         uint64_t tl = 0;
-        if (tag == 1) {
+        if (tag == 1 || tag == 3) {
             tl = a;                   /* entry hook: x0 = timeline        */
         } else if (tag == 2) {
             if ((a & 7ull) == 0 && (a - 0x100000000ull) < 0x100000000ull) {
@@ -584,6 +586,9 @@ void pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
     }
     r.valid = validbits;
     (void)poq_push(&g_obs_q, &r);
+    /* E1 is unconditional identity. No model value, pitch, anchor or t28 write.
+     * The W1 bridge places this uint32 result in w9 AND t20 on the same call. */
+    return tag == 3 ? (uint32_t)lr : 0;
 }
 
 static int g_safe_ok;
@@ -1138,11 +1143,17 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
             PoqRecord rec;
             PoqStats st;
             for (j = 0; j < 6; j++) rva_slot[j] = 0;
-            for (j = 0; j < 256; j++) {
+            for (j = 0; j < 1024; j++) {
                 if (poq_pop(&g_obs_q, &rec) != POQ_OK) {
                     break;
                 }
                 uc++;
+                if (rec.tag == 3) {
+                    g_e1_count++;
+                    if (!(rec.valid & OBS_VALID_MAIN)) g_e1_nonmain++;
+                    if (!(rec.valid & OBS_VALID_READS)) g_e1_invalid++;
+                    else if ((uint32_t)rec.t20 != (uint32_t)rec.invocation) g_e1_mismatch++;
+                }
                 ps_observe(&g_shadow, &rec, g_tb_numer, g_tb_denom);
                 if (rec.tag == 1) ub1++; else if (rec.tag == 2) ub2++;
                 if (rec.valid & OBS_VALID_MAIN) upm++; else unm++;
@@ -1262,6 +1273,12 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                  (unsigned long long)g_shadow.transitions, (unsigned long long)g_shadow.over5ms,
                  (unsigned long long)g_shadow.over50ms, (unsigned long long)g_shadow.max_abs_us,
                  (long long)g_shadow.last_error_us, g_shadow.bound, g_shadow.paused);
+    if (n > 0 && (size_t)n < sizeof(line)) padd(line, (size_t)n);
+    n = snprintf(line, sizeof(line),
+                 "e1 seq=%llu calls=%llu input_mismatch=%llu nonmain=%llu invalid=%llu rate=100\n",
+                 (unsigned long long)task->q_seq, (unsigned long long)g_e1_count,
+                 (unsigned long long)g_e1_mismatch, (unsigned long long)g_e1_nonmain,
+                 (unsigned long long)g_e1_invalid);
     if (n > 0 && (size_t)n < sizeof(line)) padd(line, (size_t)n);
     if (!ok) {
         pflush();   /* keep skip events durable */
