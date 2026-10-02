@@ -41,12 +41,13 @@ echo "==== build clock probe (build id: ${BUILD_ID}) ===="
 xcrun --sdk iphoneos clang \
   -arch arm64 \
   -mios-version-min=15.0 \
+  -std=gnu11 \
   -dynamiclib -O2 \
   "-DPRACTICE_BUILD_ID=\"${BUILD_ID}\"" \
   -framework CoreFoundation \
   -install_name @executable_path/Frameworks/practice_clock_probe.framework/practice_clock_probe \
   -o out/practice_clock_probe.framework/practice_clock_probe \
-  practice_clock_probe.c
+  practice_clock_probe.c practice_obs_queue.c
 cp clock_probe-Info.plist out/practice_clock_probe.framework/Info.plist
 
 echo "==== verify ===="
