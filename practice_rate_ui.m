@@ -16,6 +16,7 @@
 @property(nonatomic,strong) PCPRateOverlay *overlay;
 @property(nonatomic,strong) UIView *panel;
 @property(nonatomic,strong) UIButton *entry,*apply,*reset;
+@property(nonatomic,strong) UIButton *noteMode;
 @property(nonatomic,strong) UILabel *value,*status;
 @property(nonatomic,strong) UISlider *slider;
 @property(nonatomic,strong) NSTimer *timer;
@@ -67,15 +68,17 @@
         CGFloat h=(i==0||i==3)?52:44;
         b.frame=CGRectMake(16+i*84,160+(52-h)/2,76,h);[self.panel addSubview:b];
     }
+    self.noteMode=[self button:@"Note 同步变速" action:@selector(toggleNoteMode)];
+    self.noteMode.frame=CGRectMake(16,216,328,36);[self.panel addSubview:self.noteMode];
     self.status=[self label:13];self.status.numberOfLines=2;
-    self.status.frame=CGRectMake(16,218,328,40);[self.panel addSubview:self.status];
+    self.status.frame=CGRectMake(16,256,328,34);[self.panel addSubview:self.status];
     self.reset=[self button:@"恢复 1.00x" action:@selector(resetRate)];
-    self.reset.frame=CGRectMake(16,267,158,48);[self.panel addSubview:self.reset];
+    self.reset.frame=CGRectMake(16,294,158,44);[self.panel addSubview:self.reset];
     self.apply=[self button:@"应用" action:@selector(applyRate)];
     self.apply.backgroundColor=[UIColor colorWithRed:0.48 green:0.36 blue:0.82 alpha:1];
-    self.apply.frame=CGRectMake(186,267,158,48);[self.panel addSubview:self.apply];
+    self.apply.frame=CGRectMake(186,294,158,44);[self.panel addSubview:self.apply];
     UIButton *close=[self button:@"收起" action:@selector(toggle)];
-    close.frame=CGRectMake(130,326,100,38);[self.panel addSubview:close];
+    close.frame=CGRectMake(130,344,100,34);[self.panel addSubview:close];
     self.draft=(NSInteger)pcp_rate_ui_stored_percent();[self updateDraft];
 }
 - (void)updateDraft {
@@ -97,6 +100,16 @@
     } else {self.status.text=@"状态已变化，请保持暂停后重试";}
 }
 - (void)resetRate {self.draft=100;[self updateDraft];[self applyRate];}
+- (void)refreshNoteMode {
+    unsigned mode=pcp_note_mode_get();
+    [self.noteMode setTitle:(mode==PCP_NOTE_MODE_FIXED?@"Note 流速不变":@"Note 同步变速")
+                   forState:UIControlStateNormal];
+}
+- (void)toggleNoteMode {
+    unsigned next=pcp_note_mode_get()==PCP_NOTE_MODE_FIXED?PCP_NOTE_MODE_SYNC:PCP_NOTE_MODE_FIXED;
+    pcp_note_mode_set(next);
+    [self refreshNoteMode];
+}
 - (UIWindow *)gameWindow {
     UIApplication *app=UIApplication.sharedApplication;
     for(UIScene *scene in app.connectedScenes) {
@@ -122,14 +135,15 @@
     UIEdgeInsets safe=window.safeAreaInsets;CGSize size=window.bounds.size;
     self.entry.frame=CGRectMake(size.width-safe.right-150,safe.top+16,134,46);
     self.panel.transform=CGAffineTransformIdentity;
-    self.panel.bounds=CGRectMake(0,0,360,378);
-    CGFloat scale=MIN(1,MIN((size.width-safe.left-safe.right-24)/360,(size.height-safe.top-safe.bottom-24)/378));
+    self.panel.bounds=CGRectMake(0,0,360,384);
+    CGFloat scale=MIN(1,MIN((size.width-safe.left-safe.right-24)/360,(size.height-safe.top-safe.bottom-24)/384));
     self.panel.transform=CGAffineTransformMakeScale(MAX(0.5,scale),MAX(0.5,scale));
     self.panel.center=CGPointMake(size.width/2,size.height/2);
     [self.entry setTitle:[NSString stringWithFormat:@"倍率 %.2fx",state.applied/100.0] forState:UIControlStateNormal];
     self.apply.enabled=self.reset.enabled=state.ready&&!state.pending;
     self.apply.alpha=self.reset.alpha=self.apply.enabled?1:0.45;
     self.slider.enabled=!state.pending;
+    [self refreshNoteMode];
     self.status.text=state.pending?@"正在应用…":state.result==-3?@"控制已停止，请退出并重新启动":state.result==-2?@"未能应用，请重新暂停后重试":
         state.prep&&state.ready?[NSString stringWithFormat:@"已设定 %.2fx\n开始播放后生效",state.applied/100.0]:
         !state.ready?@"等待暂停状态就绪…":
@@ -151,6 +165,16 @@ unsigned pcp_rate_ui_stored_percent(void)
 void pcp_rate_ui_save_percent(unsigned percent) {
     if(percent>=PCP_RATE_MIN_PERCENT && percent<=PCP_RATE_MAX_PERCENT)
         [[NSUserDefaults standardUserDefaults] setInteger:percent forKey:@"PCPPracticeRatePercent"];
+}
+
+unsigned pcp_note_mode_get(void) {
+    NSInteger saved=[[NSUserDefaults standardUserDefaults] integerForKey:@"PCPNoteSpeedMode"];
+    return saved==1?PCP_NOTE_MODE_FIXED:PCP_NOTE_MODE_SYNC;
+}
+
+void pcp_note_mode_set(unsigned mode) {
+    [[NSUserDefaults standardUserDefaults] setInteger:(mode==PCP_NOTE_MODE_FIXED?1:0)
+                                               forKey:@"PCPNoteSpeedMode"];
 }
 
 void practice_rate_ui_start(void) {

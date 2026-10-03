@@ -18,6 +18,13 @@ int pcp_rate_ui_request(unsigned percent,uint64_t epoch);
 /* Persistent setting (NSUserDefaults); 100 when absent or invalid. */
 unsigned pcp_rate_ui_stored_percent(void);
 void pcp_rate_ui_save_percent(unsigned percent);
+/* Note-speed display mode (NSUserDefaults, key PCPNoteSpeedMode).
+ * 0 = notes scale with the practice rate (sync, default), 1 = fixed visual
+ * speed (the scroll scalar is divided by the rate by the tag8 bridge). */
+#define PCP_NOTE_MODE_SYNC  0u
+#define PCP_NOTE_MODE_FIXED 1u
+unsigned pcp_note_mode_get(void);
+void pcp_note_mode_set(unsigned mode);
 /* Native entry callback: request that the rate panel is shown. */
 void pcp_rate_ui_open(void);
 void practice_rate_ui_start(void);

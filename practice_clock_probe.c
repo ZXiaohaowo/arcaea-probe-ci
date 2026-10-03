@@ -144,7 +144,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v27c-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v27d-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -575,6 +575,15 @@ static uint64_t g_uip_logged;
 static uint32_t g_tb_numer, g_tb_denom; /* zero means unavailable */
 static PracticeRateUIState g_ui={0,0,0,0,0,100,1,0};
 static uint64_t g_ui_open_seq;
+/* ds4f v27d: note scroll-speed mode + tag8 bridge state. The main-thread cycle
+ * publishes the multiplier (100/rate, or 1.0 when sync/unpublished); the store
+ * hook in LogicChart::update reads it through pcp_obs_entry(tag 8) and writes
+ * the scaled value back to chart+0xf4. 0 scale bits means "not published yet"
+ * and the hook is an identity then. */
+static _Atomic unsigned g_note_mode;
+static _Atomic uint32_t g_note_scale_bits;
+static volatile uint64_t g_scroll_calls, g_scroll_prev_calls, g_scroll_chart;
+static volatile uint32_t g_scroll_raw_bits, g_scroll_out_bits;
 void pcp_rate_ui_open(void)
 {
     g_ui_open_seq++;
@@ -643,6 +652,23 @@ uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
     PoqRecord r;
     uint32_t validbits = 0;
     int on_main=pthread_main_np();
+    if (tag==8) {
+        /* ds4f v27d: note scroll scalar bridge. a = chart object (diagnostic),
+         * lr = raw float bits, return = scaled float bits for chart+0xf4. */
+        uint32_t in=(uint32_t)lr, out=in;
+        unsigned mode=atomic_load_explicit(&g_note_mode,memory_order_relaxed);
+        uint32_t sb=atomic_load_explicit(&g_note_scale_bits,memory_order_relaxed);
+        if (mode==PCP_NOTE_MODE_FIXED && sb) {
+            float v,s;
+            memcpy(&v,&in,4); memcpy(&s,&sb,4);
+            v*=s; memcpy(&out,&v,4);
+        }
+        g_scroll_calls++;
+        g_scroll_chart=a;
+        g_scroll_raw_bits=in;
+        g_scroll_out_bits=out;
+        return out;
+    }
     if (tag==6) {
         ds4f_ui_probe_entry(a,lr);
         return 0;
@@ -1188,6 +1214,9 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     uint64_t urv = 0;
     int ut20 = 0, ut28 = 0;
     unsigned int ust = 0;
+    unsigned int note_mode = 0;
+    uint64_t scroll_delta = 0;
+    float sc_raw = 0.0f, sc_out = 0.0f;
     int uh[6] = {0, 0, 0, 0, 0, 0};
     uint64_t sess_addr = 0, scene_addr = 0;
     uint64_t mach_now = 0;
@@ -1357,6 +1386,19 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                 }
             }
         }
+        /* ds4f v27d: publish the note scroll multiplier for the tag8 bridge.
+         * phase==1 means a non-1x rate is configured for this song; with mode
+         * 同步 (default) or an inactive session the multiplier stays 1.0. */
+        {
+            unsigned mode = pcp_note_mode_get();
+            float scale = 1.0f;
+            if (mode==PCP_NOTE_MODE_FIXED && g_rate.phase==1 && g_rate.clock.percent)
+                scale = 100.0f/(float)g_rate.clock.percent;
+            uint32_t bits;
+            memcpy(&bits,&scale,4);
+            atomic_store_explicit(&g_note_mode,mode,memory_order_relaxed);
+            atomic_store_explicit(&g_note_scale_bits,bits,memory_order_relaxed);
+        }
         sr_reads = g_sr_reads;
         sr_filt = g_sr_filtered;
         sr_fail = g_sr_failed;
@@ -1435,6 +1477,16 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     } else {
         snprintf(pitchbuf, sizeof(pitchbuf), "na");
     }
+    /* ds4f v27d: tag8 note-scroll bridge counters for this cycle. */
+    note_mode = atomic_load_explicit(&g_note_mode, memory_order_relaxed);
+    {
+        uint64_t calls = g_scroll_calls;
+        scroll_delta = calls - g_scroll_prev_calls;
+        g_scroll_prev_calls = calls;
+        uint32_t rb = g_scroll_raw_bits, ob = g_scroll_out_bits;
+        memcpy(&sc_raw, &rb, 4);
+        memcpy(&sc_out, &ob, 4);
+    }
     n = snprintf(line, sizeof(line),
                  "p seq=%llu t_ms=%llu t_q=%llu lag_ms=%llu tid=%llu main=%d am=%llx handle=%llx ok=%d pos_ms=%d"
                  " pitch=%s pchret=%d pcherr=%s safe=%d reads=%d/%d/%d/%d cD=%d via=%s soff=0x%x"
@@ -1485,6 +1537,12 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     }
     if (!ok && n > 0 && (size_t)n < sizeof(line) - 32) {
         n += snprintf(line + n, sizeof(line) - (size_t)n, " reason=%s", reason);
+    }
+    if (n > 0 && (size_t)n < sizeof(line) - 96) {
+        n += snprintf(line + n, sizeof(line) - (size_t)n,
+                      " scm=%u scc=%llu scr=%.3f sco=%.3f",
+                      note_mode, (unsigned long long)scroll_delta,
+                      (double)sc_raw, (double)sc_out);
     }
     if (n > 0 && (size_t)n < sizeof(line) - 2) {
         line[n++] = '\n';

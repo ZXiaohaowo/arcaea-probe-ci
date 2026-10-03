@@ -116,6 +116,40 @@ struct NativePanel {
     }
 };
 
+/* Deferred apply feedback (v27d): the request is consumed by the 1 Hz control
+ * cycle, so poll once or twice before reporting success/failure. The panel is
+ * NOT closed - the user closes it with the X (which restores the pause row). */
+struct ApplyCheck {
+    std::shared_ptr<NativePanel> panel;
+    uint64_t epoch;
+    unsigned want;
+    int tries;
+};
+
+void apply_check(void *context)
+{
+    auto *c = static_cast<ApplyCheck *>(context);
+    auto p = c->panel;
+    if (p->current() && p->open && p->epoch == c->epoch) {
+        auto state = pcp_rate_ui_state();
+        if (state.pending && c->tries < 2) {
+            c->tries++;
+            dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)900 * 1000000),
+                             dispatch_get_main_queue(), c, apply_check);
+            return;
+        }
+        char text[64];
+        if (state.result == 1 && state.applied == c->want)
+            std::snprintf(text, sizeof(text), "Applied %.2fx", c->want / 100.0);
+        else if (state.result == -2)
+            std::snprintf(text, sizeof(text), "Apply failed - stay paused and retry");
+        else
+            std::snprintf(text, sizeof(text), "Not applied - close and pause again");
+        setText(p->hint, text);
+    }
+    delete c;
+}
+
 bool buildPanel(const std::shared_ptr<NativePanel> &p)
 {
     auto base=(uintptr_t)_dyld_get_image_header(0);
@@ -147,8 +181,16 @@ bool buildPanel(const std::shared_ptr<NativePanel> &p)
     }
     listen(nodes[8],[p](void *,int event) {
         if(event!=2 || !p->current() || !p->open) return;
+        auto state=pcp_rate_ui_state();
+        if(state.pending || state.epoch!=p->epoch) return;
         if(pcp_rate_ui_request(p->draft,p->epoch)) {
-            pcp_rate_ui_save_percent(p->draft);p->close();
+            pcp_rate_ui_save_percent(p->draft);
+            char text[64];
+            std::snprintf(text,sizeof(text),"Applying %.2fx...",p->draft/100.0);
+            setText(p->hint,text);
+            auto *check=new ApplyCheck{p,p->epoch,p->draft,0};
+            dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW,(int64_t)1200*1000000),
+                             dispatch_get_main_queue(),check,apply_check);
         } else {setText(p->hint,"Not ready - close and pause again");}
     });
     listen(nodes[9],[p](void *,int event) {if(event==2) p->close();});
