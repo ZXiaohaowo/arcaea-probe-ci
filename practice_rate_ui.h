@@ -43,6 +43,7 @@ unsigned pcp_bookmark_add(void);
 unsigned pcp_ab_set(unsigned which);
 unsigned pcp_ab_have(unsigned which);
 unsigned pcp_ab_get(unsigned which);
+unsigned pcp_ab_jumps(void);
 void pcp_ab_jump(void);
 unsigned pcp_ab_loop_get(void);
 void pcp_ab_loop_set(unsigned on);

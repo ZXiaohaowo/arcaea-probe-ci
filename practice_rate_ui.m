@@ -163,16 +163,15 @@
 - (void)refreshAB {
     [self.abA setTitle:(pcp_ab_have(0)?[NSString stringWithFormat:@"A %us",pcp_ab_get(0)/1000]:@"设A") forState:UIControlStateNormal];
     [self.abB setTitle:(pcp_ab_have(1)?[NSString stringWithFormat:@"B %us",pcp_ab_get(1)/1000]:@"设B") forState:UIControlStateNormal];
-    unsigned m=pcp_ab_loop_get();
-    [self.abLoop setTitle:(m==2?@"循环 重试":(m==1?@"循环 跳转":@"循环 关"))
-                 forState:UIControlStateNormal];
+    unsigned n=pcp_ab_jumps();
+    [self.abJump setTitle:(n?[NSString stringWithFormat:@"跳A(%u)",n]:@"跳A") forState:UIControlStateNormal];
+    [self.abLoop setTitle:(pcp_ab_loop_get()?@"循环 开(重试)":@"循环 关") forState:UIControlStateNormal];
 }
 - (void)abSetA { pcp_ab_set(0); [self refreshAB]; }
 - (void)abSetB { pcp_ab_set(1); [self refreshAB]; }
 - (void)abJumpTap { pcp_ab_jump(); }
 - (void)abLoopTap {
-    unsigned m=pcp_ab_loop_get();
-    pcp_ab_loop_set(m==0?1:(m==1?2:0));
+    pcp_ab_loop_set(pcp_ab_loop_get()?0:1);
     [self refreshAB];
 }
 - (UIWindow *)gameWindow {

@@ -144,7 +144,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v33-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v34-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -878,6 +878,7 @@ unsigned pcp_ab_have(unsigned which) { return which>1?0u:(unsigned)g_ab_have[whi
 unsigned pcp_ab_get(unsigned which) { return which>1?0u:(unsigned)g_ab_pos[which]; }
 unsigned pcp_ab_loop_get(void) { return (unsigned)g_ab_loop; }
 void pcp_ab_loop_set(unsigned on) { g_ab_loop=on?1:0; }
+unsigned pcp_ab_jumps(void) { return (unsigned)g_sk_events; }
 void pcp_ab_jump(void) { g_sk_pending=1; }
 
 static int safe_read(uint64_t addr, void *dst, uint64_t len); /* defined below */
@@ -1840,13 +1841,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                 g_sk_pending=0;
                 if (g_ui.visible && cs.chan0) { ab_jump((void *)(uintptr_t)cs.chan0,0,0); did=1; }
                 else g_sk_skips++;
-            } else if (g_ab_loop==1 && g_ab_have[0] && g_ab_have[1] &&
-                       g_ab_pos[1]>g_ab_pos[0] && !g_ui.visible && cs.chan0 &&
-                       g_rate.phase && g_last_pos_ok &&
-                       (uint32_t)g_last_pos_ms>=g_ab_pos[1]) {
-                ab_jump((void *)(uintptr_t)cs.chan0,0,1);
-                did=1; automatic=1;
-            } else if (g_ab_loop==2 && g_ab_have[0] && g_ab_have[1] &&
+            } else if (g_ab_loop && g_ab_have[0] && g_ab_have[1] &&
                        g_ab_pos[1]>g_ab_pos[0] && !g_ui.visible &&
                        g_rate.phase && g_last_pos_ok &&
                        (uint32_t)g_last_pos_ms>=g_ab_pos[1]) {
