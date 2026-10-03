@@ -2,6 +2,12 @@
 #include <stdlib.h>
 int psk_busy(const PracticeSeek *s) { return s->phase>=PSK_QUEUED && s->phase<=PSK_VERIFY; }
 void psk_fail(PracticeSeek *s,int error) { s->phase=PSK_FAILED;s->error=error; }
+void psk_cancel(PracticeSeek *s) {uint64_t id=s->id;*s=(PracticeSeek){.id=id};}
+int psk_follow_retry(PracticeSeek *s,uint32_t target,uint64_t gen,uint64_t now) {
+    psk_cancel(s);
+    if(!psk_request(s,target,1,gen,now))return 0;
+    s->phase=PSK_NEW;return 1;
+}
 int psk_request(PracticeSeek *s,uint32_t target,int automatic,uint64_t gen,uint64_t now) {
     if(psk_busy(s) || !now || target>INT32_MAX) return 0;
     uint64_t id=s->id+1;

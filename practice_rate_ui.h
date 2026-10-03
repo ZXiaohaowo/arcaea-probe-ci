@@ -1,6 +1,7 @@
 #ifndef PRACTICE_RATE_UI_H
 #define PRACTICE_RATE_UI_H
 #include <stdint.h>
+#include "practice_points.h"
 #define PCP_RATE_MIN_PERCENT 50u
 #define PCP_RATE_MAX_PERCENT 200u
 #ifdef __cplusplus
@@ -47,6 +48,16 @@ unsigned pcp_ab_jumps(void);
 void pcp_ab_jump(void);
 unsigned pcp_seek_phase(void);
 unsigned pcp_seek_error(void);
+PracticePoints pcp_points_snapshot(void);
+unsigned pcp_points_current(void);
+unsigned pcp_points_extent(void);
+uint64_t pcp_points_epoch(void);
+unsigned pcp_loop_suspended(void);
+int pcp_point_capture(unsigned id);
+int pcp_point_update(unsigned id,unsigned ms);
+int pcp_point_delete(unsigned id);
+int pcp_point_jump(unsigned id);
+int pcp_native_retry(void);
 unsigned pcp_ab_loop_get(void);
 void pcp_ab_loop_set(unsigned on);
 /* Native entry callback: request that the rate panel is shown. */

@@ -17,6 +17,9 @@ typedef struct {
 } PracticeSeekSample;
 int psk_busy(const PracticeSeek *s);
 int psk_request(PracticeSeek *s,uint32_t target,int automatic,uint64_t gen,uint64_t now);
+/* An explicit native retry replaces the old operation and supplies its restart. */
+void psk_cancel(PracticeSeek *s);
+int psk_follow_retry(PracticeSeek *s,uint32_t target,uint64_t gen,uint64_t now);
 int psk_poll(PracticeSeek *s,PracticeSeekSample x);
 void psk_fail(PracticeSeek *s,int error);
 #endif

@@ -145,7 +145,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v38-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v39-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -863,6 +863,13 @@ static volatile uint64_t g_retry_obj, g_retry_vptr, g_retry_calls, g_retry_fail;
 static volatile int g_retry_valid;
 static volatile uint64_t g_scene_gen;
 static uint64_t g_song_bound_gen;
+static int g_restart_preserve;
+static PracticePoints g_points={.selected=-1};
+static uint32_t g_point_extent;
+static uint64_t g_point_epoch;
+static int g_loop_suspended;
+static uint64_t g_duration_gen;
+static unsigned g_duration_attempts;
 /* v35: the (chart - audio) offset is a property of the song; sample it while
  * actually playing and use it to derive the chart target at jump time, instead
  * of trusting a chart value captured while paused (t20 can keep running then). */
@@ -875,6 +882,7 @@ unsigned pcp_ab_set(unsigned which)
     char line[96];
     int n;
     if (which>1 || !g_last_pos_ok) return 0;
+    if (!pcp_point_capture(which)) return 0;
     g_ab_pos[which]=(uint32_t)g_last_pos_ms;
     g_ab_chart[which]=(int32_t)g_last_chart_ms;
     g_ab_have[which]=1;
@@ -887,16 +895,42 @@ unsigned pcp_ab_set(unsigned which)
 unsigned pcp_ab_have(unsigned which) { return which>1?0u:(unsigned)g_ab_have[which]; }
 unsigned pcp_ab_get(unsigned which) { return which>1?0u:(unsigned)g_ab_pos[which]; }
 unsigned pcp_ab_loop_get(void) { return (unsigned)g_ab_loop; }
-void pcp_ab_loop_set(unsigned on) { g_ab_loop=on?1:0; }
+void pcp_ab_loop_set(unsigned on) { g_ab_loop=on?1:0; g_loop_suspended=0; }
 unsigned pcp_ab_jumps(void) { return (unsigned)g_sk_events; }
 unsigned pcp_seek_phase(void) { return (unsigned)g_seek.phase; }
 unsigned pcp_seek_error(void) { return (unsigned)g_seek.error; }
-void pcp_ab_jump(void) {
-    uint64_t now=0;
-    if (!pthread_main_np() || !pcp_rate_ui_state().visible || !g_ab_have[0]) return;
-    if (ps_mach_us(mach_absolute_time(),g_tb_numer,g_tb_denom,&now))
-        (void)psk_request(&g_seek,g_ab_pos[0],0,g_scene_gen,now);
+PracticePoints pcp_points_snapshot(void) { return g_points; }
+unsigned pcp_points_current(void) {return g_last_pos_ok?(unsigned)g_last_pos_ms:0;}
+unsigned pcp_points_extent(void) {return g_points.duration?g_points.duration:g_point_extent;}
+uint64_t pcp_points_epoch(void) {return g_point_epoch;}
+unsigned pcp_loop_suspended(void) {return g_loop_suspended;}
+int pcp_point_update(unsigned id,unsigned ms) {
+    if (!pthread_main_np() || !pcp_rate_ui_state().visible || psk_busy(&g_seek) ||
+        ms>=INT32_MAX || (g_points.duration && ms>=g_points.duration) ||
+        (!g_points.duration && ms>g_point_extent) || !pp_set(&g_points,id,ms)) return 0;
+    if (id<2) {g_ab_pos[id]=ms;g_ab_have[id]=1;}
+    char l[96];int n=snprintf(l,sizeof(l),"point id=%u ms=%u revision=%u\n",id,ms,g_points.revision);
+    if(n>0 && n<(int)sizeof(l))padd(l,(size_t)n);
+    return 1;
 }
+int pcp_point_capture(unsigned id) {
+    return g_last_pos_ok && pcp_point_update(id,(unsigned)g_last_pos_ms);
+}
+int pcp_point_delete(unsigned id) {
+    if(!pthread_main_np() || !pcp_rate_ui_state().visible || psk_busy(&g_seek))return 0;
+    return pp_delete_t(&g_points,id);
+}
+int pcp_point_jump(unsigned id) {
+    uint64_t now=0;
+    if(!pthread_main_np() || !pcp_rate_ui_state().visible || id>=PP_COUNT ||
+       !(g_points.mask&(1u<<id)))return 0;
+    if(!ps_mach_us(mach_absolute_time(),g_tb_numer,g_tb_denom,&now) ||
+       !psk_request(&g_seek,g_points.ms[id],0,g_scene_gen,now))return 0;
+    if(g_ab_loop && (!g_ab_have[0] || !g_ab_have[1] ||
+       g_points.ms[id]<g_ab_pos[0] || g_points.ms[id]>=g_ab_pos[1]))g_loop_suspended=1;
+    return 1;
+}
+void pcp_ab_jump(void) { (void)pcp_point_jump(0); }
 
 static int safe_read(uint64_t addr, void *dst, uint64_t len); /* defined below */
 
@@ -911,22 +945,36 @@ static int retry_call(void)
     if (!safe_read(vt+0x10,&fn,8) || fn<0x100000000ull || fn>=0x200000000ull) {
         g_retry_fail++; return -1;
     }
+    g_restart_preserve=1;
     ((RetryFn)(uintptr_t)fn)((void *)(uintptr_t)g_retry_obj,0);
     g_retry_calls++;
     return 0;
 }
 
-unsigned pcp_bookmark_add(void)
-{
-    char line[96];
-    int n;
-    if (!g_last_pos_ok || g_bm_count>=PCP_BM_MAX) return (unsigned)g_bm_count;
-    g_bm_pos[g_bm_count]=(uint32_t)g_last_pos_ms;
-    g_bm_count++;
-    n=snprintf(line,sizeof(line),"bm n=%llu pos_ms=%d\n",
-               (unsigned long long)g_bm_count, g_last_pos_ms);
-    if (n>0 && (size_t)n<sizeof(line)) padd(line,(size_t)n);
-    return (unsigned)g_bm_count;
+/* Called by the original retry button's replacement touch callback. */
+int pcp_native_retry(void) {
+    uint64_t now=0;
+    if(!pthread_main_np() || !g_retry_valid ||
+       g_retry_generation!=g_scene_gen)return 0;
+    /* An explicit retry supersedes, rather than fails, an old transaction. */
+    psk_cancel(&g_seek);
+    g_loop_suspended=0;
+    if(g_ab_loop && g_ab_have[0] && g_ab_have[1] && g_ab_pos[1]>g_ab_pos[0] &&
+       ps_mach_us(mach_absolute_time(),g_tb_numer,g_tb_denom,&now)) {
+        (void)psk_follow_retry(&g_seek,g_ab_pos[0],g_scene_gen,now);
+    }
+    int rc=retry_call();
+    if(rc){psk_fail(&g_seek,10);g_ab_loop=0;}
+    char l[128];int n=snprintf(l,sizeof(l),"native_retry id=%llu loop=%d rc=%d gen=%llu\n",
+        (unsigned long long)g_seek.id,g_ab_loop,rc,(unsigned long long)g_scene_gen);
+    if(n>0 && n<(int)sizeof(l))padd(l,(size_t)n);
+    return rc==0;
+}
+unsigned pcp_bookmark_add(void) {
+    for(unsigned id=2;id<PP_COUNT;id++)if(!(g_points.mask&(1u<<id))) {
+        (void)pcp_point_capture(id);break;
+    }
+    return (unsigned)__builtin_popcount(g_points.mask>>2);
 }
 /* Main-thread drainer counters, not modified by hook callbacks. */
 static uint64_t g_e1_count, g_e1_mismatch, g_e1_nonmain, g_e1_invalid;
@@ -1000,6 +1048,12 @@ uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
         if (tag==4) {
             g_scroll_gen++; scroll_cache_clear();
             g_scene_gen++; g_retry_valid=0; g_live_offset_valid=0;
+            if (!g_restart_preserve) {
+                pp_init(&g_points,0);g_point_extent=0;g_point_epoch++;
+                g_ab_have[0]=g_ab_have[1]=0;g_ab_loop=0;g_loop_suspended=0;
+                psk_cancel(&g_seek);
+            }
+            g_restart_preserve=0;
         }
         if (tag==4) g_rate_dtor_events++; else g_rate_play_events++;
         if ((g_rate.phase || g_rate.audio_owned) &&
@@ -1685,6 +1739,24 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                     g_live_offset_ms=(int32_t)off;g_live_offset_valid=1;
                 }
             }
+            if (scene_ok && pos>=0 && (uint32_t)pos>g_point_extent) g_point_extent=(uint32_t)pos;
+            if(g_duration_gen!=g_scene_gen){g_duration_gen=g_scene_gen;g_duration_attempts=0;}
+            if (scene_ok && paused && !g_points.duration && g_duration_attempts<3) {
+                g_duration_attempts++;
+                typedef int32_t (*SoundFn)(void *,void **);
+                typedef int32_t (*LengthFn)(void *,uint32_t *,uint32_t);
+                uint64_t p1=0,p2=0;void *sound=0;uint32_t length=0;
+                if(safe_read(g_base+0x10372bc,&p1,8) && p1==0xa91257f6d10543ffULL &&
+                   safe_read(g_base+0x10a24d4,&p2,8) && p2==0xa9126ffcd105c3ffULL) {
+                    int a=((SoundFn)(uintptr_t)(g_base+0x10372bc))((void *)(uintptr_t)cs.chan0,&sound);
+                    int b=(a==0 && sound)?((LengthFn)(uintptr_t)(g_base+0x10a24d4))(sound,&length,1):-1;
+                    if(!a && !b && length>=1000 && length<=3600000 && length>=(uint32_t)pos) {
+                        g_points.duration=length;
+                        char l[100];int n=snprintf(l,sizeof(l),"duration ms=%u rc=%d/%d gen=%llu\n",length,a,b,(unsigned long long)g_scene_gen);
+                        if(n>0 && n<(int)sizeof(l))padd(l,(size_t)n);
+                    }
+                }
+            }
             g_ui.prep = prep?1:0;
             g_ui.ready = 0;
             if (prep || live) {
@@ -1877,7 +1949,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                 g_rate_owner.scene==scene_addr && g_rate_owner.handle==cs.chan0;
             x.can_restart=g_retry_valid && g_retry_generation==g_scene_gen;
             x.percent=g_rate.clock.percent;
-            if (!psk_busy(&g_seek) && g_ab_loop && g_ab_have[0] && g_ab_have[1] &&
+            if (!psk_busy(&g_seek) && g_ab_loop && !g_loop_suspended && g_ab_have[0] && g_ab_have[1] &&
                 g_ab_pos[1]>g_ab_pos[0] && x.valid && x.playing && x.pos>=g_ab_pos[1])
                 (void)psk_request(&g_seek,g_ab_pos[0],1,g_scene_gen,x.now_us);
             int old_phase=g_seek.phase;

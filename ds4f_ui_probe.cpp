@@ -203,11 +203,8 @@ void openPanel(const std::shared_ptr<NativePanel> &p)
     if(!p->current()) return;
     auto state=pcp_rate_ui_state();
     if(!state.visible || state.pending) return;
-    if(!p->panel && !buildPanel(p)) {pcp_rate_ui_open();return;}
-    p->epoch=state.epoch;p->draft=pcp_rate_ui_stored_percent();p->refresh();
-    p->row(false);
-    // Resource coordinates are 1280x960; the pause resource is 1280x720.
-    setPos(p->panel,0,-120);p->open=true;
+    pcp_rate_ui_open(); // Unified timeline panel; original pause entry retained.
+
 }
 
 /* One-shot deferred row repair (see the install path). Runs on the main queue;
@@ -216,6 +213,13 @@ void row_repair(void *context)
 {
     auto *held = static_cast<std::shared_ptr<NativePanel> *>(context);
     (*held)->row(true);
+    auto p=*held;
+    if(p->current()) {
+        void *retry=getChild(p->overlay,"retryButton-chinaonlylocalize");
+        if(retry) listen(retry,[p](void *,int event){
+            if(event==2 && p->current()) (void)pcp_native_retry();
+        });
+    }
     delete held;
 }
 
