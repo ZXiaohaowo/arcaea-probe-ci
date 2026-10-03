@@ -144,7 +144,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v27g-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v28-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -667,6 +667,94 @@ static int rate_set(void *context,float value)
     rate_owner_t *o=context;
     typedef int (*fn)(void *,float);
     return ((fn)(uintptr_t)(g_base+OFF_SETPITCH))((void *)(uintptr_t)o->handle,value);
+}
+
+/* ds4f v28 stage 1: pitch-shift DSP lifecycle probe. Creates the built-in
+ * pitch DSP through the FMOD system obtained from the channel, reads its info
+ * and FFT parameter (latency estimate = fft/48 ms), then releases it. Nothing
+ * is attached to the audio graph, so sound is untouched; this only proves the
+ * addresses, ABI and create/release lifecycle before any attach experiment. */
+#define OFF_CC_GETSYSTEMOBJ  0x10E5C90ULL
+#define OFF_SYS_CREATEDSP    0x10AEBC4ULL
+#define OFF_DSP_GETINFO      0x1067DD0ULL
+#define OFF_DSP_GETPARAMF    0x1067370ULL
+#define OFF_DSP_RELEASE      0x10657B8ULL
+static int g_pitch_probe_done;
+static volatile int g_pitch_hit = -1;
+static volatile uint64_t g_pitch_sys, g_pitch_dsp;
+static volatile int g_pitch_type = -1;
+static volatile int g_pitch_rc_sys, g_pitch_rc_create, g_pitch_rc_info, g_pitch_rc_get, g_pitch_rc_rel;
+static volatile float g_pitch_fft, g_pitch_lat_ms;
+static char g_pitch_name[40];
+
+static int pitch_probe_run(void *channel)
+{
+    typedef int32_t (*GetSysFn)(void *, void **);
+    typedef int32_t (*CreateDspFn)(void *, int32_t, void **);
+    typedef int32_t (*DspInfoFn)(void *, char *, uint32_t *, int32_t *, int32_t *, int32_t *);
+    typedef int32_t (*DspGetParamFn)(void *, int32_t, float *, char *, int32_t);
+    typedef int32_t (*DspReleaseFn)(void *);
+    GetSysFn getsys=(GetSysFn)(uintptr_t)(g_base+OFF_CC_GETSYSTEMOBJ);
+    CreateDspFn create=(CreateDspFn)(uintptr_t)(g_base+OFF_SYS_CREATEDSP);
+    DspInfoFn info=(DspInfoFn)(uintptr_t)(g_base+OFF_DSP_GETINFO);
+    DspGetParamFn getp=(DspGetParamFn)(uintptr_t)(g_base+OFF_DSP_GETPARAMF);
+    DspReleaseFn release=(DspReleaseFn)(uintptr_t)(g_base+OFF_DSP_RELEASE);
+    void *sys=NULL;
+    int32_t t;
+    g_pitch_probe_done=1;
+    if (!channel || !g_base) return 0;
+    g_pitch_rc_sys=getsys(channel,&sys);
+    if (g_pitch_rc_sys!=0 || !sys) return 0;
+    g_pitch_sys=(uint64_t)(uintptr_t)sys;
+    for (t=9;t<=18;t++) {
+        void *d=NULL;
+        char name[40]={0};
+        uint32_t ver=0;
+        int32_t nch=0,cw=0,chh=0,rci,rcg,rcr;
+        int32_t rc=create(sys,t,&d);
+        if (rc!=0 || !d) { if (rc!=0) g_pitch_rc_create=rc; continue; }
+        rci=info(d,name,&ver,&nch,&cw,&chh);
+        if (rci==0 && strstr(name,"Pitch")) {
+            float fft=0.0f;
+            char vs[40]={0};
+            rcg=getp(d,1,&fft,vs,sizeof(vs));
+            g_pitch_hit=1; g_pitch_type=t; g_pitch_dsp=(uint64_t)(uintptr_t)d;
+            g_pitch_rc_info=rci; g_pitch_rc_get=rcg;
+            g_pitch_fft=(rcg==0)?fft:0.0f;
+            g_pitch_lat_ms=(rcg==0 && fft>0.0f)?(fft/48.0f):0.0f;
+            snprintf(g_pitch_name,sizeof(g_pitch_name),"%s",name);
+            break;
+        }
+        rcr=release(d);
+        if (rcr!=0) g_pitch_rc_rel=rcr;
+    }
+    if (g_pitch_type>=0 && g_pitch_dsp) {
+        int32_t rcr=release((void *)(uintptr_t)g_pitch_dsp);
+        if (rcr!=0) g_pitch_rc_rel=rcr;
+    } else {
+        g_pitch_hit=0;
+    }
+    return g_pitch_hit;
+}
+
+/* ds4f v28 stage 1 (A/B stream): bookmark capture while paused. Positions are
+ * source-time ms from the same audio read the p-line uses; the list is kept in
+ * this process for now and every capture is logged. Seek/replay comes later. */
+#define PCP_BM_MAX 32
+static uint32_t g_bm_pos[PCP_BM_MAX];
+static volatile uint64_t g_bm_count;
+static volatile int g_last_pos_ms, g_last_pos_ok;
+unsigned pcp_bookmark_add(void)
+{
+    char line[96];
+    int n;
+    if (!g_last_pos_ok || g_bm_count>=PCP_BM_MAX) return (unsigned)g_bm_count;
+    g_bm_pos[g_bm_count]=(uint32_t)g_last_pos_ms;
+    g_bm_count++;
+    n=snprintf(line,sizeof(line),"bm n=%llu pos_ms=%d\n",
+               (unsigned long long)g_bm_count, g_last_pos_ms);
+    if (n>0 && (size_t)n<sizeof(line)) padd(line,(size_t)n);
+    return (unsigned)g_bm_count;
 }
 /* Main-thread drainer counters, not modified by hook callbacks. */
 static uint64_t g_e1_count, g_e1_mismatch, g_e1_nonmain, g_e1_invalid;
@@ -1495,6 +1583,18 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
             (void)field_ok;
             (void)bits;
         }
+        /* ds4f v28 stage 1: one-shot pitch DSP lifecycle probe while paused. */
+        if (!g_pitch_probe_done && g_ui.visible && cs.chan0) {
+            int hit=pitch_probe_run((void *)(uintptr_t)cs.chan0);
+            char pl[240];
+            int pn=snprintf(pl,sizeof(pl),
+                "pd seq=%llu hit=%d sys=%llx dsp=%llx type=%d name=%s fft=%.0f lat_ms=%.2f rc=%d/%d/%d/%d rel=%d\n",
+                (unsigned long long)task->q_seq, hit,
+                (unsigned long long)g_pitch_sys, (unsigned long long)g_pitch_dsp,
+                g_pitch_type, g_pitch_name, (double)g_pitch_fft, (double)g_pitch_lat_ms,
+                g_pitch_rc_sys, g_pitch_rc_create, g_pitch_rc_info, g_pitch_rc_get, g_pitch_rc_rel);
+            if (pn>0 && (size_t)pn<sizeof(pl)) padd(pl,(size_t)pn);
+        }
         sr_reads = g_sr_reads;
         sr_filt = g_sr_filtered;
         sr_fail = g_sr_failed;
@@ -1575,6 +1675,8 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     }
     /* ds4f v27d: tag8 note-scroll bridge counters for this cycle. */
     note_mode = atomic_load_explicit(&g_note_mode, memory_order_relaxed);
+    g_last_pos_ms = pos;
+    g_last_pos_ok = (ok && pos>=0);
     {
         uint64_t calls = g_scroll_calls;
         scroll_delta = calls - g_scroll_prev_calls;

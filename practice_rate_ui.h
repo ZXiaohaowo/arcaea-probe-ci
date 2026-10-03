@@ -25,6 +25,9 @@ void pcp_rate_ui_save_percent(unsigned percent);
 #define PCP_NOTE_MODE_FIXED 1u
 unsigned pcp_note_mode_get(void);
 void pcp_note_mode_set(unsigned mode);
+/* v28: capture the current paused audio position as a bookmark (first step of
+ * the A/B work; no seek yet). Returns the total bookmark count. */
+unsigned pcp_bookmark_add(void);
 /* Native entry callback: request that the rate panel is shown. */
 void pcp_rate_ui_open(void);
 void practice_rate_ui_start(void);

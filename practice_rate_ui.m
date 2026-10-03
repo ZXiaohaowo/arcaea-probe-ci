@@ -17,6 +17,7 @@
 @property(nonatomic,strong) UIView *panel;
 @property(nonatomic,strong) UIButton *entry,*apply,*reset;
 @property(nonatomic,strong) UIButton *noteMode;
+@property(nonatomic,strong) UIButton *bookmark;
 @property(nonatomic,strong) UILabel *value,*status;
 @property(nonatomic,strong) UISlider *slider;
 @property(nonatomic,strong) NSTimer *timer;
@@ -72,13 +73,15 @@
     self.noteMode.frame=CGRectMake(16,216,328,36);[self.panel addSubview:self.noteMode];
     self.status=[self label:13];self.status.numberOfLines=2;
     self.status.frame=CGRectMake(16,256,328,34);[self.panel addSubview:self.status];
+    self.bookmark=[self button:@"添加书签 n=0" action:@selector(addBookmark)];
+    self.bookmark.frame=CGRectMake(16,294,328,36);[self.panel addSubview:self.bookmark];
     self.reset=[self button:@"恢复 1.00x" action:@selector(resetRate)];
-    self.reset.frame=CGRectMake(16,294,158,44);[self.panel addSubview:self.reset];
+    self.reset.frame=CGRectMake(16,336,158,44);[self.panel addSubview:self.reset];
     self.apply=[self button:@"应用" action:@selector(applyRate)];
     self.apply.backgroundColor=[UIColor colorWithRed:0.48 green:0.36 blue:0.82 alpha:1];
-    self.apply.frame=CGRectMake(186,294,158,44);[self.panel addSubview:self.apply];
+    self.apply.frame=CGRectMake(186,336,158,44);[self.panel addSubview:self.apply];
     UIButton *close=[self button:@"收起" action:@selector(toggle)];
-    close.frame=CGRectMake(130,344,100,34);[self.panel addSubview:close];
+    close.frame=CGRectMake(130,386,100,34);[self.panel addSubview:close];
     self.draft=(NSInteger)pcp_rate_ui_stored_percent();[self updateDraft];
 }
 - (void)updateDraft {
@@ -110,6 +113,10 @@
     pcp_note_mode_set(next);
     [self refreshNoteMode];
 }
+- (void)addBookmark {
+    unsigned n=pcp_bookmark_add();
+    [self.bookmark setTitle:[NSString stringWithFormat:@"添加书签 n=%u",n] forState:UIControlStateNormal];
+}
 - (UIWindow *)gameWindow {
     UIApplication *app=UIApplication.sharedApplication;
     for(UIScene *scene in app.connectedScenes) {
@@ -135,8 +142,8 @@
     UIEdgeInsets safe=window.safeAreaInsets;CGSize size=window.bounds.size;
     self.entry.frame=CGRectMake(size.width-safe.right-150,safe.top+16,134,46);
     self.panel.transform=CGAffineTransformIdentity;
-    self.panel.bounds=CGRectMake(0,0,360,384);
-    CGFloat scale=MIN(1,MIN((size.width-safe.left-safe.right-24)/360,(size.height-safe.top-safe.bottom-24)/384));
+    self.panel.bounds=CGRectMake(0,0,360,428);
+    CGFloat scale=MIN(1,MIN((size.width-safe.left-safe.right-24)/360,(size.height-safe.top-safe.bottom-24)/428));
     self.panel.transform=CGAffineTransformMakeScale(MAX(0.5,scale),MAX(0.5,scale));
     self.panel.center=CGPointMake(size.width/2,size.height/2);
     [self.entry setTitle:[NSString stringWithFormat:@"倍率 %.2fx",state.applied/100.0] forState:UIControlStateNormal];
