@@ -27,6 +27,7 @@
 @property(nonatomic) NSInteger draft;
 @property(nonatomic) uint64_t epoch;
 @property(nonatomic) uint64_t lastOpenSeq;
+@property(nonatomic) NSTimeInterval statusHold;
 @end
 
 @implementation PCPRatePanel
@@ -169,7 +170,12 @@
 }
 - (void)abSetA { pcp_ab_set(0); [self refreshAB]; }
 - (void)abSetB { pcp_ab_set(1); [self refreshAB]; }
-- (void)abJumpTap { pcp_ab_jump(); }
+- (void)abJumpTap {
+    pcp_ab_jump();
+    self.status.text=@"已请求跳到 A（恢复播放后生效）";
+    self.statusHold=CFAbsoluteTimeGetCurrent()+2.5;
+    [self refreshAB];
+}
 - (void)abLoopTap {
     pcp_ab_loop_set(pcp_ab_loop_get()?0:1);
     [self refreshAB];
@@ -211,10 +217,11 @@
     [self refreshPitchMode];
     [self refreshPitchComp];
     [self refreshAB];
-    self.status.text=state.pending?@"正在应用…":state.result==-3?@"控制已停止，请退出并重新启动":state.result==-2?@"未能应用，请重新暂停后重试":
-        state.prep&&state.ready?[NSString stringWithFormat:@"已设定 %.2fx\n开始播放后生效",state.applied/100.0]:
-        !state.ready?@"等待暂停状态就绪…":
-        [NSString stringWithFormat:@"当前 %.2fx · 调整后点击应用\n音乐与谱面同步变速",state.applied/100.0];
+    if(CFAbsoluteTimeGetCurrent()>=self.statusHold)
+        self.status.text=state.pending?@"正在应用…":state.result==-3?@"控制已停止，请退出并重新启动":state.result==-2?@"未能应用，请重新暂停后重试":
+            state.prep&&state.ready?[NSString stringWithFormat:@"已设定 %.2fx\n开始播放后生效",state.applied/100.0]:
+            !state.ready?@"等待暂停状态就绪…":
+            [NSString stringWithFormat:@"当前 %.2fx · 调整后点击应用\n音乐与谱面同步变速",state.applied/100.0];
 }
 @end
 
