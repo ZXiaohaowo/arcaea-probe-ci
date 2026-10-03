@@ -97,7 +97,7 @@
     self.bookmark.frame=CGRectMake(16,376,328,36);[self.panel addSubview:self.bookmark];
     self.reset=[self button:@"恢复 1.00x" action:@selector(resetRate)];
     self.reset.frame=CGRectMake(16,416,158,44);[self.panel addSubview:self.reset];
-    self.apply=[self button:@"应用" action:@selector(applyRate)];
+    self.apply=[self button:@"应用倍率" action:@selector(applyRate)];
     self.apply.backgroundColor=[UIColor colorWithRed:0.48 green:0.36 blue:0.82 alpha:1];
     self.apply.frame=CGRectMake(186,416,158,44);[self.panel addSubview:self.apply];
     UIButton *close=[self button:@"收起" action:@selector(toggle)];

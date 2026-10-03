@@ -144,7 +144,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v34-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v35-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -859,6 +859,11 @@ static volatile int g_last_chart_ms;
 static volatile uint64_t g_retry_obj, g_retry_vptr, g_retry_calls, g_retry_fail;
 static volatile int g_retry_valid, g_retry_pending, g_seek_after_retry;
 static volatile uint64_t g_scene_gen, g_seek_deadline_mach;
+/* v35: the (chart - audio) offset is a property of the song; sample it while
+ * actually playing and use it to derive the chart target at jump time, instead
+ * of trusting a chart value captured while paused (t20 can keep running then). */
+static volatile int32_t g_live_offset_ms;
+static volatile int g_live_offset_valid;
 
 unsigned pcp_ab_set(unsigned which)
 {
@@ -905,7 +910,9 @@ static void ab_jump(void *chan, unsigned which, int automatic)
     typedef int32_t (*SetPosFn)(void *, uint32_t, uint32_t);
     uint32_t pos=0;
     int64_t before;
-    if (!chan || which>1 || !g_ab_have[which] || !g_rate.phase) { g_sk_skips++; return; }
+    if (!chan || which>1 || !g_ab_have[which] || !g_rate.phase || !g_live_offset_valid) {
+        g_sk_skips++; return;
+    }
     g_sk_rc_getpos=((GetPosFn)(uintptr_t)(g_base+OFF_CC_GETPOS))(chan,&pos,1);
     if (g_sk_rc_getpos!=0) { g_sk_skips++; return; }
     before=(int64_t)g_rate_last_native + g_rate.clock.bias_us/1000;
@@ -913,6 +920,8 @@ static void ab_jump(void *chan, unsigned which, int automatic)
     g_sk_rc_setpos=((SetPosFn)(uintptr_t)(g_base+OFF_CC_SETPOS))(chan,g_ab_pos[which],1);
     if (g_sk_rc_setpos!=0) { g_sk_skips++; return; }
     g_sk_pos_after=g_ab_pos[which];
+    /* Target chart = captured source position + the live song offset. */
+    g_ab_chart[which]=(int32_t)((int64_t)g_ab_pos[which]+g_live_offset_ms);
     g_rate.clock.bias_us=((int64_t)g_ab_chart[which]-(int64_t)g_rate_last_native)*1000;
     g_rate.clock.fraction=0;
     g_sk_rc_clock=0;
@@ -1656,12 +1665,14 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
             if (scene_ok && scene_addr!=g_song_scene) {
                 if (g_rate.phase || g_rate.audio_owned) prs_close(&g_rate,2);
                 memset(&g_rate,0,sizeof(g_rate));
+                g_live_offset_valid=0;
                 g_song_scene=scene_addr;g_song_timeline=tl;
                 g_song_started=0;g_song_attempts=0;g_rate_stable=0;
                 g_setting_percent=pcp_rate_ui_stored_percent();
                 g_ui.epoch++;g_ui.pending=0;g_ui.result=0;
             } else if (!scene_ok && g_song_scene) {
                 if (g_rate.phase || g_rate.audio_owned) prs_close(&g_rate,2);
+                g_live_offset_valid=0;
                 g_song_scene=0;g_song_timeline=0;g_song_started=0;
                 g_song_attempts=0;g_rate_stable=0;g_ui.epoch++;
             } else if (scene_ok && g_song_timeline && tl!=g_song_timeline) {
@@ -1674,6 +1685,13 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
             }
             g_ui_seen_mach=mach_absolute_time();
             g_ui.visible = ctCd && ctA && paused;
+            /* v35: sample the song's (chart - audio) offset while really playing. */
+            if (ctA && pok && ctCd && pos>=0 && !paused) {
+                int32_t off=(int32_t)((int64_t)t20-(int64_t)pos);
+                if (off>-20000 && off<20000) {
+                    g_live_offset_ms=off; g_live_offset_valid=1;
+                }
+            }
             g_ui.prep = prep?1:0;
             g_ui.ready = 0;
             if (prep || live) {
@@ -1701,7 +1719,20 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
             if (playing && !g_song_started && g_song_attempts<3 &&
                 g_setting_percent>=PCP_RATE_MIN_PERCENT && g_setting_percent<=PCP_RATE_MAX_PERCENT) {
                 if (g_setting_percent==100 && !g_rate.phase) {
-                    g_song_started=1;   /* nothing to apply */
+                    if (g_ab_have[0] || g_ab_have[1] || g_ab_loop) {
+                        /* v35: A/B needs a clock session even at exactly 1x so a
+                         * jump can rebase the chart clock; create one on demand. */
+                        int applied=0;
+                        PracticePitchOps ops={&g_rate_owner,rate_get,rate_set};
+                        g_song_attempts++;
+                        g_rate_owner=(rate_owner_t){cs.am,cs.pv,cs.chan0,scene_addr,tl};
+                        g_rate_requested=100;
+                        applied=prs_configure(&g_rate,now_us,g_rate_last_native,100,ops,rate_current);
+                        g_ui.result=applied?1:-2;
+                        if (applied || g_song_attempts>=3) g_song_started=1;
+                    } else {
+                        g_song_started=1;   /* nothing to apply */
+                    }
                 } else {
                     int applied=0;
                     g_song_attempts++;
