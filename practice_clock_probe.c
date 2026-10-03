@@ -1,4 +1,7 @@
-/* practice_clock_probe.c - S3a: anchor/units probe (v11).
+/* practice_clock_probe.c - v24 sustained rate experiment.
+ * Current behavior: W1 applies virtual-time bias; guarded setPitch controls BGM.
+ * Scene destruction / BGM replacement restore audio before native teardown.
+ * The following v9-v18 notes describe historical scopes, NOT current permissions.
  *
  * v9 scope (per the 2026-09-29 review), kept in v3:
  *   - NO active calls into game functions. Reads only.
@@ -135,12 +138,12 @@
 #include <unistd.h>
 #include "practice_obs_queue.h"
 #include "practice_shadow.h"
-#include "practice_pitch_trial.h"
+#include "practice_rate_session.h"
 
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "s3b-pitchtrial-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "s3b-rate-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -545,19 +548,68 @@ extern int mach_vm_read_overwrite(unsigned int task, unsigned long long addr,
 #define OBS_VALID_MAIN   0x4u   /* pthread_main_np() true at the site    */
 static PracticeObsQueue g_obs_q = POQ_INITIALIZER;
 static PracticeShadow g_shadow;
-static PracticePitchTrial g_pitch_trial;
-static int g_pitch_done, g_pitch_success;
-static uint64_t g_pitch_candidate_tl, g_pitch_candidate_handle;
-static unsigned g_pitch_stable;
-static int trial_get(void *handle, float *value)
+static int g_safe_ok;
+static unsigned int g_task_port;
+static PracticeRateSession g_rate;
+typedef struct { uint64_t am, pv, handle, scene, timeline; } rate_owner_t;
+static rate_owner_t g_rate_owner;
+static unsigned g_rate_requested = 75, g_rate_stable;
+static uint64_t g_rate_candidate_tl, g_rate_candidate_handle;
+static uint64_t g_rate_last_tl, g_rate_last_mach;
+static int32_t g_rate_last_native;
+static uint32_t g_rate_last_state;
+static uint64_t g_rate_dtor_events, g_rate_play_events;
+static _Atomic int g_rate_badthread;
+
+static int rate_read64(uint64_t addr, uint64_t *out)
 {
-    typedef int (*fn)(void *, float *);
-    return ((fn)(uintptr_t)(g_base + OFF_GETPITCH))(handle, value);
+    unsigned long long got=0;
+    if (!g_safe_ok || (addr & 7) || addr<0x100000000ULL || addr>=0x200000000ULL) return 0;
+    return mach_vm_read_overwrite(g_task_port,addr,8,(unsigned long long)(uintptr_t)out,&got)==0 && got==8;
 }
-static int trial_set(void *handle, float value)
+static int rate_current(void *context)
 {
-    typedef int (*fn)(void *, float);
-    return ((fn)(uintptr_t)(g_base + OFF_SETPITCH))(handle, value);
+    rate_owner_t *o=context;
+    uint64_t gg,am,pv,vt,begin,end,handle;
+    return rate_read64(g_base+OFF_SLOT,&gg) && rate_read64(gg+OFF_GG_AM,&am) && am==o->am &&
+        rate_read64(am,&vt) && vt==g_base+OFF_AM_VT &&
+        rate_read64(am+OFF_AM_PROVIDER,&pv) && pv==o->pv &&
+        rate_read64(pv,&vt) && vt==g_base+OFF_PV_VT &&
+        rate_read64(pv+OFF_PV_VEC_BEGIN,&begin) && rate_read64(pv+OFF_PV_VEC_END,&end) &&
+        end>=begin && end-begin>=16 && end-begin<=CHAN_COUNT_CAP*16 && (end-begin)%16==0 &&
+        rate_read64(begin+8,&handle) && handle==o->handle;
+}
+static int rate_get(void *context,float *value)
+{
+    rate_owner_t *o=context;
+    typedef int (*fn)(void *,float *);
+    return ((fn)(uintptr_t)(g_base+OFF_GETPITCH))((void *)(uintptr_t)o->handle,value);
+}
+static int rate_set(void *context,float value)
+{
+    rate_owner_t *o=context;
+    typedef int (*fn)(void *,float);
+    return ((fn)(uintptr_t)(g_base+OFF_SETPITCH))((void *)(uintptr_t)o->handle,value);
+}
+static void rate_config(void)
+{
+    char path[1024],line[64],*end;
+    const char *home=getenv("HOME");
+    FILE *f;
+    long value;
+    if (!home) return;
+    if (snprintf(path,sizeof(path),"%s/Documents/practice_rate_percent.txt",home)>=(int)sizeof(path)) {g_rate_requested=0;return;}
+    f=fopen(path,"rb");
+    if (!f) return; /* absent file: diagnostic default 75 percent */
+    g_rate_requested=0;
+    if (fgets(line,sizeof(line),f) && fgetc(f)==EOF) {
+        value=strtol(line,&end,10);
+        if (end!=line) {
+            while (*end==' ' || *end=='\t' || *end=='\r' || *end=='\n') end++;
+            if (!*end && value>=50 && value<=250) g_rate_requested=(unsigned)value;
+        }
+    }
+    fclose(f);
 }
 /* Main-thread drainer counters, not modified by hook callbacks. */
 static uint64_t g_e1_count, g_e1_mismatch, g_e1_nonmain, g_e1_invalid;
@@ -569,6 +621,17 @@ uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
 {
     PoqRecord r;
     uint32_t validbits = 0;
+    int on_main=pthread_main_np();
+    if (tag==3 && !on_main)
+        atomic_store_explicit(&g_rate_badthread,1,memory_order_relaxed);
+    if (tag==4 || tag==5) {
+        if (!on_main) {atomic_store_explicit(&g_rate_badthread,1,memory_order_relaxed);return 0;}
+        if (tag==4) g_rate_dtor_events++; else g_rate_play_events++;
+        if ((g_rate.phase || g_rate.audio_owned) &&
+            ((tag==4 && a==g_rate_owner.scene) || (tag==5 && a==g_rate_owner.pv)))
+            prs_close(&g_rate,tag==4?2:3);
+        return 0;
+    }
     r.mach = mach_absolute_time();
     r.tag = tag;
     r.object = a;
@@ -597,18 +660,33 @@ uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
             validbits |= OBS_VALID_READS;
         }
     }
-    if (pthread_main_np()) {
+    if (on_main) {
         validbits |= OBS_VALID_MAIN;
     }
     r.valid = validbits;
     (void)poq_push(&g_obs_q, &r);
-    /* E1 is unconditional identity. No model value, pitch, anchor or t28 write.
-     * The W1 bridge places this uint32 result in w9 AND t20 on the same call. */
-    return tag == 3 ? (uint32_t)lr : 0;
+    if (tag==1 && on_main && g_rate.phase && a==g_rate_owner.timeline &&
+        ((r.state >> 8) & 255u)!=1) prs_close(&g_rate,7);
+    if (tag==3 && on_main) {
+        uint64_t now_us=0;
+        g_rate_last_tl=a;g_rate_last_mach=r.mach;
+        g_rate_last_native=(int32_t)(uint32_t)lr;g_rate_last_state=r.state;
+        if (g_rate.phase && a==g_rate_owner.timeline &&
+            ps_mach_us(r.mach,g_tb_numer,g_tb_denom,&now_us)) {
+            int paused=(r.state & 255u)==1;
+            if ((r.valid & OBS_VALID_READS) &&
+                (*(volatile int32_t *)(uintptr_t)(a+0x30)!=0 ||
+                 *(volatile int32_t *)(uintptr_t)(a+0x34)!=0 ||
+                 *(volatile int32_t *)(uintptr_t)(a+0x38)!=0)) {
+                g_rate.errors++;
+                prs_fallback(&g_rate,now_us,(int32_t)(uint32_t)lr,paused,7);
+            }
+            return (uint32_t)prs_tick(&g_rate,now_us,(int32_t)(uint32_t)lr,paused);
+        }
+    }
+    return tag==3?(uint32_t)lr:0;
 }
 
-static int g_safe_ok;
-static unsigned int g_task_port;
 
 static void saferead_init(void)
 {
@@ -1146,31 +1224,34 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                      &sf, &s470, &s474, &t30, &sess_addr, &scene_addr, &xf,
                      (uint64_t)task->q_seq, via, sizeof(via), &dg, &te);
         }
-        /* One synchronous transaction while natively paused. No pitch remains
-         * intentionally changed on return. Never scheduled onto a later frame. */
-        if (!g_pitch_done) {
-            uint64_t marker = 0;
-            int eligible = pthread_main_np() && ctCd && ctA &&
-                f2c == 1 && f2d == 1 && sf == 1 && s470 == 1 &&
-                t30 == 0 && te.t34 == 0 && te.t38 == 0 &&
-                (int64_t)t20 - t28 > 1000 && cs.chan0 && pok &&
-                safe_read(g_base + OFF_SETPITCH, &marker, 8) &&
-                marker == 0x6d1223e9d10583ffULL;
-            if (!eligible) g_pitch_stable = 0;
+        /* Apply once while stably paused; next native pause restores 1x in W1.
+         * No delayed work carries a game pointer or audio handle. */
+        if (g_rate.phase && (atomic_load_explicit(&g_rate_badthread,memory_order_relaxed) ||
+            (g_rate.audio_owned && !rate_current(&g_rate_owner)) ||
+            (ctCd && ctA && (tl!=g_rate_owner.timeline || scene_addr!=g_rate_owner.scene))))
+            prs_close(&g_rate,6);
+        if (!g_rate.ever && g_rate_requested &&
+            !atomic_load_explicit(&g_rate_badthread,memory_order_relaxed)) {
+            uint64_t marker=0,now_us=0,last_us=0;
+            uint32_t dtor_word=0,play_word=0;
+            int eligible=pthread_main_np() && ctCd && ctA && f2c==1 && f2d==1 &&
+                sf==1 && s470==1 && f2e==1 && t30==0 && te.t34==0 && te.t38==0 &&
+                (int64_t)t20-t28>1000 && cs.chan0 && pok &&
+                g_rate_last_tl==tl && (g_rate_last_state & 0xffffu)==0x101u &&
+                ps_mach_us(mach_absolute_time(),g_tb_numer,g_tb_denom,&now_us) &&
+                ps_mach_us(g_rate_last_mach,g_tb_numer,g_tb_denom,&last_us) &&
+                now_us>=last_us && now_us-last_us<100000 &&
+                safe_read(g_base+OFF_SETPITCH,&marker,8) && marker==0x6d1223e9d10583ffULL &&
+                safe_read(g_base+0x9237fc,&dtor_word,4) && dtor_word==0x17db8461u &&
+                safe_read(g_base+0x8e3900,&play_word,4) && play_word==0x17dc8480u;
+            if (!eligible) g_rate_stable=0;
             else {
-                chain_snap_t fresh;
-                if (g_pitch_candidate_tl != tl || g_pitch_candidate_handle != cs.chan0)
-                    g_pitch_stable = 0;
-                g_pitch_candidate_tl = tl;
-                g_pitch_candidate_handle = cs.chan0;
-                if (++g_pitch_stable >= 2) {
-                    snapshot_chain(&fresh);
-                    if (fresh.state == CH_READY && fresh.am == cs.am &&
-                        fresh.pv == cs.pv && fresh.chan0 == cs.chan0) {
-                        PracticePitchOps ops = {(void *)(uintptr_t)fresh.chan0, trial_get, trial_set};
-                        g_pitch_done = 1;
-                        g_pitch_success = ppt_run(ops, 75, &g_pitch_trial);
-                    }
+                if (g_rate_candidate_tl!=tl || g_rate_candidate_handle!=cs.chan0) g_rate_stable=0;
+                g_rate_candidate_tl=tl;g_rate_candidate_handle=cs.chan0;
+                if (++g_rate_stable>=2) {
+                    PracticePitchOps ops={&g_rate_owner,rate_get,rate_set};
+                    g_rate_owner=(rate_owner_t){cs.am,cs.pv,cs.chan0,scene_addr,tl};
+                    (void)prs_begin(&g_rate,now_us,g_rate_last_native,g_rate_requested,ops,rate_current);
                 }
             }
         }
@@ -1198,7 +1279,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                     if (!(rec.valid & OBS_VALID_READS)) g_e1_invalid++;
                     else if ((uint32_t)rec.t20 != (uint32_t)rec.invocation) g_e1_mismatch++;
                 }
-                ps_observe(&g_shadow, &rec, g_tb_numer, g_tb_denom);
+                if (!g_rate.ever) ps_observe(&g_shadow, &rec, g_tb_numer, g_tb_denom);
                 if (rec.tag == 1) ub1++; else if (rec.tag == 2) ub2++;
                 if (rec.valid & OBS_VALID_MAIN) upm++; else unm++;
                 if (rec.valid & OBS_VALID_READS) uv++;
@@ -1319,25 +1400,27 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                  (long long)g_shadow.last_error_us, g_shadow.bound, g_shadow.paused);
     if (n > 0 && (size_t)n < sizeof(line)) padd(line, (size_t)n);
     n = snprintf(line, sizeof(line),
-                 "e1 seq=%llu calls=%llu input_mismatch=%llu nonmain=%llu invalid=%llu rate=100\n",
+                 "e1 seq=%llu calls=%llu input_mismatch=%llu nonmain=%llu invalid=%llu rate=%u\n",
                  (unsigned long long)task->q_seq, (unsigned long long)g_e1_count,
                  (unsigned long long)g_e1_mismatch, (unsigned long long)g_e1_nonmain,
-                 (unsigned long long)g_e1_invalid);
+                 (unsigned long long)g_e1_invalid, g_rate.phase?g_rate.clock.percent:100);
     if (n > 0 && (size_t)n < sizeof(line)) padd(line, (size_t)n);
     if (!ok) {
         pflush();   /* keep skip events durable */
     }
-    n = snprintf(line, sizeof(line),
-                 "pt seq=%llu done=%d success=%d attempted=%d target_ok=%d restore_ok=%d"
-                 " baseline=%.4f target=%.4f observed=%.4f restored=%.4f rc=%d/%d/%d/%d/%d\n",
-                 (unsigned long long)task->q_seq, g_pitch_done, g_pitch_success,
-                 g_pitch_trial.attempted, g_pitch_trial.target_ok, g_pitch_trial.restore_ok,
-                 (double)g_pitch_trial.baseline, (double)g_pitch_trial.target,
-                 (double)g_pitch_trial.observed, (double)g_pitch_trial.restored,
-                 g_pitch_trial.baseline_rc, g_pitch_trial.set_rc, g_pitch_trial.read_rc,
-                 g_pitch_trial.restore_rc, g_pitch_trial.final_rc);
-    if (n > 0 && (size_t)n < sizeof(line)) padd(line, (size_t)n);
-    if (g_pitch_done) pflush();
+    n = snprintf(line,sizeof(line),
+        "rt seq=%llu wanted=%u ever=%d phase=%d rate=%u owned=%d errors=%d reason=%d"
+        " ticks=%llu restores=%llu bias_us=%lld baseline=%.4f applied=%.4f readback=%.4f restored=%.4f"
+        " rc=%d/%d/%d/%d life=%llu/%llu badthread=%d shadow_active=%d\n",
+        (unsigned long long)task->q_seq,g_rate_requested,g_rate.ever,g_rate.phase,
+        g_rate.phase?g_rate.clock.percent:100,g_rate.audio_owned,g_rate.errors,g_rate.close_reason,
+        (unsigned long long)g_rate.ticks,(unsigned long long)g_rate.restores,(long long)g_rate.clock.bias_us,
+        (double)g_rate.baseline,(double)g_rate.applied,(double)g_rate.readback,(double)g_rate.restored,
+        g_rate.apply_rc,g_rate.read_rc,g_rate.restore_rc,g_rate.restore_read_rc,
+        (unsigned long long)g_rate_dtor_events,(unsigned long long)g_rate_play_events,
+        atomic_load_explicit(&g_rate_badthread,memory_order_relaxed),!g_rate.ever);
+    if(n>0 && (size_t)n<sizeof(line)) padd(line,(size_t)n);
+    if(g_rate.ever) pflush();
     g_read_inflight = 0;
 }
 
@@ -1503,6 +1586,7 @@ static void practice_clock_probe_ctor(void)
     int n;
 
     init_log_path();
+    rate_config();
     ident_check();
     saferead_init();
 
