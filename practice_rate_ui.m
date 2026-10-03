@@ -224,7 +224,6 @@ unsigned pcp_pitch_comp_get(void) {
     NSInteger v=[[NSUserDefaults standardUserDefaults] integerForKey:@"PCPPitchCompMs"];
     if(v<0) v=0;
     if(v>80) v=80;
-    if(v==0 && ![[NSUserDefaults standardUserDefaults] objectForKey:@"PCPPitchCompMs"]) v=21;
     return (unsigned)v;
 }
 
