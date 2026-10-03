@@ -31,6 +31,10 @@ void pcp_note_mode_set(unsigned mode);
 #define PCP_PITCH_KEEP 1u
 unsigned pcp_pitch_mode_get(void);
 void pcp_pitch_mode_set(unsigned mode);
+/* v30: keep-pitch latency compensation in milliseconds (persisted). The
+ * channel position is advanced by rate*comp once when the DSP is attached. */
+unsigned pcp_pitch_comp_get(void);
+void pcp_pitch_comp_set(unsigned ms);
 /* v28: capture the current paused audio position as a bookmark (first step of
  * the A/B work; no seek yet). Returns the total bookmark count. */
 unsigned pcp_bookmark_add(void);

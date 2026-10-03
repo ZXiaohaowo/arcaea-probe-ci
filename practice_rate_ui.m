@@ -18,6 +18,7 @@
 @property(nonatomic,strong) UIButton *entry,*apply,*reset;
 @property(nonatomic,strong) UIButton *noteMode;
 @property(nonatomic,strong) UIButton *pitchMode;
+@property(nonatomic,strong) UIButton *compDown,*compValue,*compUp;
 @property(nonatomic,strong) UIButton *bookmark;
 @property(nonatomic,strong) UILabel *value,*status;
 @property(nonatomic,strong) UISlider *slider;
@@ -74,17 +75,24 @@
     self.noteMode.frame=CGRectMake(16,216,158,36);[self.panel addSubview:self.noteMode];
     self.pitchMode=[self button:@"音高 随速" action:@selector(togglePitchMode)];
     self.pitchMode.frame=CGRectMake(186,216,158,36);[self.panel addSubview:self.pitchMode];
+    self.compDown=[self button:@"-5ms" action:@selector(compDownTap)];
+    self.compDown.frame=CGRectMake(16,256,96,36);[self.panel addSubview:self.compDown];
+    self.compValue=[self button:@"补偿 21ms" action:nil];
+    self.compValue.enabled=NO;
+    self.compValue.frame=CGRectMake(122,256,116,36);[self.panel addSubview:self.compValue];
+    self.compUp=[self button:@"+5ms" action:@selector(compUpTap)];
+    self.compUp.frame=CGRectMake(248,256,96,36);[self.panel addSubview:self.compUp];
     self.status=[self label:13];self.status.numberOfLines=2;
-    self.status.frame=CGRectMake(16,256,328,34);[self.panel addSubview:self.status];
+    self.status.frame=CGRectMake(16,296,328,34);[self.panel addSubview:self.status];
     self.bookmark=[self button:@"添加书签 n=0" action:@selector(addBookmark)];
-    self.bookmark.frame=CGRectMake(16,294,328,36);[self.panel addSubview:self.bookmark];
+    self.bookmark.frame=CGRectMake(16,334,328,36);[self.panel addSubview:self.bookmark];
     self.reset=[self button:@"恢复 1.00x" action:@selector(resetRate)];
-    self.reset.frame=CGRectMake(16,336,158,44);[self.panel addSubview:self.reset];
+    self.reset.frame=CGRectMake(16,376,158,44);[self.panel addSubview:self.reset];
     self.apply=[self button:@"应用" action:@selector(applyRate)];
     self.apply.backgroundColor=[UIColor colorWithRed:0.48 green:0.36 blue:0.82 alpha:1];
-    self.apply.frame=CGRectMake(186,336,158,44);[self.panel addSubview:self.apply];
+    self.apply.frame=CGRectMake(186,376,158,44);[self.panel addSubview:self.apply];
     UIButton *close=[self button:@"收起" action:@selector(toggle)];
-    close.frame=CGRectMake(130,386,100,34);[self.panel addSubview:close];
+    close.frame=CGRectMake(130,426,100,34);[self.panel addSubview:close];
     self.draft=(NSInteger)pcp_rate_ui_stored_percent();[self updateDraft];
 }
 - (void)updateDraft {
@@ -130,6 +138,19 @@
     pcp_pitch_mode_set(next);
     [self refreshPitchMode];
 }
+- (void)refreshPitchComp {
+    [self.compValue setTitle:[NSString stringWithFormat:@"补偿 %ums",pcp_pitch_comp_get()]
+                    forState:UIControlStateNormal];
+}
+- (void)compDownTap {
+    NSInteger v=(NSInteger)pcp_pitch_comp_get()-5;
+    pcp_pitch_comp_set((unsigned)MAX(0,v));
+    [self refreshPitchComp];
+}
+- (void)compUpTap {
+    pcp_pitch_comp_set(pcp_pitch_comp_get()+5);
+    [self refreshPitchComp];
+}
 - (UIWindow *)gameWindow {
     UIApplication *app=UIApplication.sharedApplication;
     for(UIScene *scene in app.connectedScenes) {
@@ -155,8 +176,8 @@
     UIEdgeInsets safe=window.safeAreaInsets;CGSize size=window.bounds.size;
     self.entry.frame=CGRectMake(size.width-safe.right-150,safe.top+16,134,46);
     self.panel.transform=CGAffineTransformIdentity;
-    self.panel.bounds=CGRectMake(0,0,360,428);
-    CGFloat scale=MIN(1,MIN((size.width-safe.left-safe.right-24)/360,(size.height-safe.top-safe.bottom-24)/428));
+    self.panel.bounds=CGRectMake(0,0,360,468);
+    CGFloat scale=MIN(1,MIN((size.width-safe.left-safe.right-24)/360,(size.height-safe.top-safe.bottom-24)/468));
     self.panel.transform=CGAffineTransformMakeScale(MAX(0.5,scale),MAX(0.5,scale));
     self.panel.center=CGPointMake(size.width/2,size.height/2);
     [self.entry setTitle:[NSString stringWithFormat:@"倍率 %.2fx",state.applied/100.0] forState:UIControlStateNormal];
@@ -165,6 +186,7 @@
     self.slider.enabled=!state.pending;
     [self refreshNoteMode];
     [self refreshPitchMode];
+    [self refreshPitchComp];
     self.status.text=state.pending?@"正在应用…":state.result==-3?@"控制已停止，请退出并重新启动":state.result==-2?@"未能应用，请重新暂停后重试":
         state.prep&&state.ready?[NSString stringWithFormat:@"已设定 %.2fx\n开始播放后生效",state.applied/100.0]:
         !state.ready?@"等待暂停状态就绪…":
@@ -196,6 +218,19 @@ unsigned pcp_note_mode_get(void) {
 unsigned pcp_pitch_mode_get(void) {
     NSInteger saved=[[NSUserDefaults standardUserDefaults] integerForKey:@"PCPPitchMode"];
     return saved==1?PCP_PITCH_KEEP:PCP_PITCH_TAPE;
+}
+
+unsigned pcp_pitch_comp_get(void) {
+    NSInteger v=[[NSUserDefaults standardUserDefaults] integerForKey:@"PCPPitchCompMs"];
+    if(v<0) v=0;
+    if(v>80) v=80;
+    if(v==0 && ![[NSUserDefaults standardUserDefaults] objectForKey:@"PCPPitchCompMs"]) v=21;
+    return (unsigned)v;
+}
+
+void pcp_pitch_comp_set(unsigned ms) {
+    if(ms>80) ms=80;
+    [[NSUserDefaults standardUserDefaults] setInteger:(NSInteger)ms forKey:@"PCPPitchCompMs"];
 }
 
 void pcp_pitch_mode_set(unsigned mode) {

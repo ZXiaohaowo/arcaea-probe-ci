@@ -144,7 +144,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v29-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v30-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -744,11 +744,15 @@ static int pitch_probe_run(void *channel)
 #define OFF_CC_ADDDSP      0x10E82F4ULL
 #define OFF_CC_REMOVEDSP   0x10E8424ULL
 #define OFF_DSP_SETPARAMF  0x1066ED4ULL
+#define OFF_CC_GETPOS      0x1036D1CULL
+#define OFF_CC_SETPOS      0x1036BF4ULL
 static void *g_pd_dsp, *g_pd_chan;
 static volatile int g_pd_attached;
 static volatile int g_pd_rc_create, g_pd_rc_add, g_pd_rc_set, g_pd_rc_get, g_pd_rc_rm, g_pd_rc_rel;
 static volatile float g_pd_ratio, g_pd_readback;
 static volatile uint64_t g_pd_attach_events, g_pd_detach_events;
+static volatile int g_pd_comp_ms, g_pd_last_comp, g_pd_rc_getpos, g_pd_rc_setpos;
+static volatile uint32_t g_pd_pos_before, g_pd_pos_after, g_pd_bump;
 
 static int32_t pd_setparam(void *d, float v)
 {
@@ -780,11 +784,34 @@ static void *pd_apply(float ratio, void *chan)
     }
     g_pd_ratio=ratio;
     if (!g_pd_attached || g_pd_chan!=chan) {
+        int attached_now=0;
         g_pd_rc_add=((AddFn)(uintptr_t)(g_base+OFF_CC_ADDDSP))(chan,0,g_pd_dsp);
         if (g_pd_rc_add==0) {
             g_pd_chan=chan;
             g_pd_attached=1;
             g_pd_attach_events++;
+            attached_now=1;
+        }
+        /* v30: latency compensation, only on a fresh attach (never per set,
+         * otherwise the offset would accumulate). bump = rate * comp_ms in
+         * content time. */
+        if (attached_now) {
+            unsigned comp=pcp_pitch_comp_get();
+            g_pd_comp_ms=(int)comp; g_pd_last_comp=(int)comp;
+            if (comp) {
+                typedef int32_t (*GetPosFn)(void *, uint32_t *, uint32_t);
+                typedef int32_t (*SetPosFn)(void *, uint32_t, uint32_t);
+                uint32_t pos=0;
+                g_pd_rc_getpos=((GetPosFn)(uintptr_t)(g_base+OFF_CC_GETPOS))(chan,&pos,1);
+                if (g_pd_rc_getpos==0) {
+                    uint32_t bump=(uint32_t)((double)ratio*(double)comp+0.5);
+                    g_pd_pos_before=pos; g_pd_bump=bump;
+                    if (bump) {
+                        g_pd_rc_setpos=((SetPosFn)(uintptr_t)(g_base+OFF_CC_SETPOS))(chan,pos+bump,1);
+                        if (g_pd_rc_setpos==0) g_pd_pos_after=pos+bump;
+                    }
+                }
+            }
         }
     }
     return g_pd_dsp;
@@ -1419,6 +1446,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     float sc_desired = 0.0f, sc_baked = 1.0f;
     unsigned int pitch_mode = 0;
     int pitch_attached = 0;
+    int pitch_comp = 0;
     float pitch_ratio = 1.0f, pitch_readback = 0.0f;
     int uh[6] = {0, 0, 0, 0, 0, 0};
     uint64_t sess_addr = 0, scene_addr = 0;
@@ -1672,12 +1700,18 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                 ratio=100.0f/(float)g_rate.clock.percent;
             if (keep && g_rate.phase==1 && cs.chan0 && (g_pd_dsp || g_ui.visible)) {
                 float before=g_pd_ratio;
-                if (pd_apply(ratio,(void *)(uintptr_t)cs.chan0) && ratio!=before) {
-                    char al[200];
+                uint64_t att0=g_pd_attach_events;
+                if (g_pd_dsp && g_pd_attached && (int)pcp_pitch_comp_get()!=g_pd_last_comp)
+                    pd_restore();   /* compensation changed: re-attach cleanly */
+                if (pd_apply(ratio,(void *)(uintptr_t)cs.chan0) &&
+                    (ratio!=before || g_pd_attach_events!=att0)) {
+                    char al[260];
                     int an=snprintf(al,sizeof(al),
-                        "pa seq=%llu act=set chan=%llx dsp=%llx ratio=%.3f rb=%.3f rc=%d/%d/%d/%d/%d/%d att=%llu det=%llu\n",
+                        "pa seq=%llu act=set chan=%llx dsp=%llx ratio=%.3f rb=%.3f comp=%d bump=%u pos=%u/%u rcp=%d/%d rc=%d/%d/%d/%d/%d/%d att=%llu det=%llu\n",
                         (unsigned long long)task->q_seq,(unsigned long long)cs.chan0,
                         (unsigned long long)(uintptr_t)g_pd_dsp,(double)ratio,(double)g_pd_readback,
+                        g_pd_comp_ms,(unsigned)g_pd_bump,(unsigned)g_pd_pos_before,(unsigned)g_pd_pos_after,
+                        g_pd_rc_getpos,g_pd_rc_setpos,
                         g_pd_rc_create,g_pd_rc_add,g_pd_rc_set,g_pd_rc_get,g_pd_rc_rm,g_pd_rc_rel,
                         (unsigned long long)g_pd_attach_events,(unsigned long long)g_pd_detach_events);
                     if (an>0 && (size_t)an<sizeof(al)) padd(al,(size_t)an);
@@ -1777,6 +1811,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     note_mode = atomic_load_explicit(&g_note_mode, memory_order_relaxed);
     pitch_mode = pcp_pitch_mode_get();
     pitch_attached = g_pd_attached;
+    pitch_comp = g_pd_comp_ms;
     pitch_ratio = g_pd_ratio;
     pitch_readback = g_pd_readback;
     g_last_pos_ms = pos;
@@ -1858,7 +1893,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     if (n > 0 && (size_t)n < sizeof(line) - 96) {
         n += snprintf(line + n, sizeof(line) - (size_t)n,
                       " scm=%u scc=%llu scr=%.3f sco=%.3f scd=%.3f scf=%.3f scb=%.3f scw=%llu scx=%llu srl=%llu srf=%llu"
-                      " ptm=%u pta=%d ptr=%.3f ptb=%.3f",
+                      " ptm=%u pta=%d ptr=%.3f ptb=%.3f ptc=%d",
                       note_mode, (unsigned long long)scroll_delta,
                       (double)sc_raw, (double)sc_out, (double)sc_desired,
                       (double)sc_field, (double)sc_baked,
@@ -1867,7 +1902,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                       (unsigned long long)scroll_relayouts,
                       (unsigned long long)scroll_relayout_fail,
                       pitch_mode, pitch_attached, (double)pitch_ratio,
-                      (double)pitch_readback);
+                      (double)pitch_readback, pitch_comp);
     }
     if (n > 0 && (size_t)n < sizeof(line) - 2) {
         line[n++] = '\n';
