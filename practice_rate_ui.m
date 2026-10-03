@@ -17,6 +17,7 @@
 @property(nonatomic,strong) UIView *panel;
 @property(nonatomic,strong) UIButton *entry,*apply,*reset;
 @property(nonatomic,strong) UIButton *noteMode;
+@property(nonatomic,strong) UIButton *pitchMode;
 @property(nonatomic,strong) UIButton *bookmark;
 @property(nonatomic,strong) UILabel *value,*status;
 @property(nonatomic,strong) UISlider *slider;
@@ -70,7 +71,9 @@
         b.frame=CGRectMake(16+i*84,160+(52-h)/2,76,h);[self.panel addSubview:b];
     }
     self.noteMode=[self button:@"Note 同步变速" action:@selector(toggleNoteMode)];
-    self.noteMode.frame=CGRectMake(16,216,328,36);[self.panel addSubview:self.noteMode];
+    self.noteMode.frame=CGRectMake(16,216,158,36);[self.panel addSubview:self.noteMode];
+    self.pitchMode=[self button:@"音高 随速" action:@selector(togglePitchMode)];
+    self.pitchMode.frame=CGRectMake(186,216,158,36);[self.panel addSubview:self.pitchMode];
     self.status=[self label:13];self.status.numberOfLines=2;
     self.status.frame=CGRectMake(16,256,328,34);[self.panel addSubview:self.status];
     self.bookmark=[self button:@"添加书签 n=0" action:@selector(addBookmark)];
@@ -117,6 +120,16 @@
     unsigned n=pcp_bookmark_add();
     [self.bookmark setTitle:[NSString stringWithFormat:@"添加书签 n=%u",n] forState:UIControlStateNormal];
 }
+- (void)refreshPitchMode {
+    unsigned mode=pcp_pitch_mode_get();
+    [self.pitchMode setTitle:(mode==PCP_PITCH_KEEP?@"音高 保持":@"音高 随速")
+                    forState:UIControlStateNormal];
+}
+- (void)togglePitchMode {
+    unsigned next=pcp_pitch_mode_get()==PCP_PITCH_KEEP?PCP_PITCH_TAPE:PCP_PITCH_KEEP;
+    pcp_pitch_mode_set(next);
+    [self refreshPitchMode];
+}
 - (UIWindow *)gameWindow {
     UIApplication *app=UIApplication.sharedApplication;
     for(UIScene *scene in app.connectedScenes) {
@@ -151,6 +164,7 @@
     self.apply.alpha=self.reset.alpha=self.apply.enabled?1:0.45;
     self.slider.enabled=!state.pending;
     [self refreshNoteMode];
+    [self refreshPitchMode];
     self.status.text=state.pending?@"正在应用…":state.result==-3?@"控制已停止，请退出并重新启动":state.result==-2?@"未能应用，请重新暂停后重试":
         state.prep&&state.ready?[NSString stringWithFormat:@"已设定 %.2fx\n开始播放后生效",state.applied/100.0]:
         !state.ready?@"等待暂停状态就绪…":
@@ -177,6 +191,16 @@ void pcp_rate_ui_save_percent(unsigned percent) {
 unsigned pcp_note_mode_get(void) {
     NSInteger saved=[[NSUserDefaults standardUserDefaults] integerForKey:@"PCPNoteSpeedMode"];
     return saved==1?PCP_NOTE_MODE_FIXED:PCP_NOTE_MODE_SYNC;
+}
+
+unsigned pcp_pitch_mode_get(void) {
+    NSInteger saved=[[NSUserDefaults standardUserDefaults] integerForKey:@"PCPPitchMode"];
+    return saved==1?PCP_PITCH_KEEP:PCP_PITCH_TAPE;
+}
+
+void pcp_pitch_mode_set(unsigned mode) {
+    [[NSUserDefaults standardUserDefaults] setInteger:(mode==PCP_PITCH_KEEP?1:0)
+                                               forKey:@"PCPPitchMode"];
 }
 
 void pcp_note_mode_set(unsigned mode) {
