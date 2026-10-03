@@ -144,7 +144,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v27e-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v27f-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -593,6 +593,11 @@ static volatile uint32_t g_scroll_field_bits;   /* last value seen in chart+0xf4
 static volatile uint64_t g_scroll_writes, g_scroll_write_fail;
 static volatile uint64_t g_scroll_gen, g_scroll_gen_at_hook;
 static volatile uint64_t g_scroll_vptr;        /* chart vptr captured at hook time */
+/* v27f: call-site context for the chart's note-geometry rebuild (0x910CE0). */
+static volatile uint64_t g_scroll_build_x1, g_scroll_build_x2;
+static volatile uint32_t g_scroll_baked_scale_bits;  /* scale used at last build/relayout */
+static volatile uint64_t g_scroll_relayouts, g_scroll_relayout_fail;
+static volatile int g_scroll_relayout_blocked;
 static void scroll_cache_clear(void)
 {
     g_scroll_chart_valid = 0;
@@ -600,6 +605,10 @@ static void scroll_cache_clear(void)
     g_scroll_raw_bits = 0;
     g_scroll_field_bits = 0;
     g_scroll_vptr = 0;
+    g_scroll_build_x1 = 0;
+    g_scroll_build_x2 = 0;
+    g_scroll_baked_scale_bits = 0;
+    g_scroll_relayout_blocked = 0;
 }
 void pcp_rate_ui_open(void)
 {
@@ -681,6 +690,9 @@ uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
             float v,s;
             memcpy(&v,&in,4); memcpy(&s,&sb,4);
             v*=s; memcpy(&out,&v,4);
+            g_scroll_baked_scale_bits=sb;
+        } else {
+            g_scroll_baked_scale_bits=0x3F800000u;  /* 1.0f */
         }
         g_scroll_calls++;
         g_scroll_chart=a;
@@ -699,6 +711,8 @@ uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
         ds4f_ui_probe_entry(a,lr);
         return 0;
     }
+    if (tag==9) { g_scroll_build_x1=lr; return 0; }
+    if (tag==10) { g_scroll_build_x2=lr; return 0; }
     if (tag==3 && !on_main)
         atomic_store_explicit(&g_rate_badthread,1,memory_order_relaxed);
     if (tag==4 || tag==5) {
@@ -1246,8 +1260,10 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     unsigned int note_mode = 0;
     uint64_t scroll_delta = 0;
     uint64_t scroll_writes = 0, scroll_fail = 0;
+    uint64_t scroll_relayouts = 0, scroll_relayout_fail = 0;
     float sc_raw = 0.0f, sc_out = 0.0f;
     float sc_field = 0.0f;
+    float sc_desired = 0.0f, sc_baked = 1.0f;
     int uh[6] = {0, 0, 0, 0, 0, 0};
     uint64_t sess_addr = 0, scene_addr = 0;
     uint64_t mach_now = 0;
@@ -1417,7 +1433,10 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                 }
             }
         }
-        /* ds4f v27d: publish the note scroll multiplier for the tag8 bridge.
+        /* ds4f v27d/v27e/v27f: publish the note scroll multiplier, keep
+         * chart+0xf4 corrected, and - when the chart's baked note geometry
+         * still uses the old multiplier - repeat the game's own geometry
+         * rebuild (0x910CE0, captured at the call site) while paused.
          * phase==1 means a non-1x rate is configured for this song; with mode
          * 同步 (default) or an inactive session the multiplier stays 1.0. */
         {
@@ -1426,6 +1445,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
             if (mode==PCP_NOTE_MODE_FIXED && g_rate.phase==1 && g_rate.clock.percent)
                 scale = 100.0f/(float)g_rate.clock.percent;
             uint32_t bits;
+            int field_ok = 0;
             memcpy(&bits,&scale,4);
             atomic_store_explicit(&g_note_mode,mode,memory_order_relaxed);
             atomic_store_explicit(&g_note_scale_bits,bits,memory_order_relaxed);
@@ -1459,10 +1479,31 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                         }
                     }
                     g_scroll_field_bits=field;
+                    field_ok = (field==want_bits);
                 } else {
                     g_scroll_chart_valid=0;
                     g_scroll_chart=0;
                     g_scroll_write_fail++;
+                }
+            }
+            /* v27f experiment: the note geometry is baked at chart build time,
+             * so a mode/rate change only becomes visible after the chart is
+             * rebuilt. Repeat the captured rebuild call while the game is
+             * paused; guarded by the same chart/vptr/generation checks. */
+            if (field_ok && paused && g_scroll_build_x1 && !g_scroll_relayout_blocked &&
+                g_scroll_baked_scale_bits && g_scroll_baked_scale_bits!=bits) {
+                uint64_t vptr = 0;
+                if (g_scroll_vptr && safe_read((uint64_t)g_scroll_chart,&vptr,8) &&
+                    vptr==g_scroll_vptr) {
+                    typedef void (*RelayoutFn)(void *, uint64_t, uint64_t);
+                    RelayoutFn fn = (RelayoutFn)(uintptr_t)(g_main_base+0x910CE0ull);
+                    fn((void *)(uintptr_t)g_scroll_chart,
+                       (uint64_t)g_scroll_build_x1, (uint64_t)g_scroll_build_x2);
+                    g_scroll_relayouts++;
+                    g_scroll_baked_scale_bits=bits;
+                } else {
+                    g_scroll_relayout_blocked=1;
+                    g_scroll_relayout_fail++;
                 }
             }
         }
@@ -1557,6 +1598,17 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
         memcpy(&sc_field, &fb, 4);
         scroll_writes = g_scroll_writes;
         scroll_fail = g_scroll_write_fail;
+        scroll_relayouts = g_scroll_relayouts;
+        scroll_relayout_fail = g_scroll_relayout_fail;
+        {
+            uint32_t sb = atomic_load_explicit(&g_note_scale_bits,memory_order_relaxed);
+            uint32_t bb = g_scroll_baked_scale_bits;
+            float cur_scale = 1.0f, baked_scale = 0.0f;
+            if (sb) memcpy(&cur_scale,&sb,4);
+            if (bb) memcpy(&baked_scale,&bb,4);
+            sc_desired = sc_raw*cur_scale;
+            sc_baked = baked_scale;
+        }
     }
     n = snprintf(line, sizeof(line),
                  "p seq=%llu t_ms=%llu t_q=%llu lag_ms=%llu tid=%llu main=%d am=%llx handle=%llx ok=%d pos_ms=%d"
@@ -1611,11 +1663,14 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     }
     if (n > 0 && (size_t)n < sizeof(line) - 96) {
         n += snprintf(line + n, sizeof(line) - (size_t)n,
-                      " scm=%u scc=%llu scr=%.3f sco=%.3f scf=%.3f scw=%llu scx=%llu",
+                      " scm=%u scc=%llu scr=%.3f sco=%.3f scd=%.3f scf=%.3f scb=%.3f scw=%llu scx=%llu srl=%llu srf=%llu",
                       note_mode, (unsigned long long)scroll_delta,
-                      (double)sc_raw, (double)sc_out, (double)sc_field,
+                      (double)sc_raw, (double)sc_out, (double)sc_desired,
+                      (double)sc_field, (double)sc_baked,
                       (unsigned long long)scroll_writes,
-                      (unsigned long long)scroll_fail);
+                      (unsigned long long)scroll_fail,
+                      (unsigned long long)scroll_relayouts,
+                      (unsigned long long)scroll_relayout_fail);
     }
     if (n > 0 && (size_t)n < sizeof(line) - 2) {
         line[n++] = '\n';
