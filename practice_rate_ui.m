@@ -21,6 +21,7 @@
 @property(nonatomic,strong) NSTimer *timer;
 @property(nonatomic) NSInteger draft;
 @property(nonatomic) uint64_t epoch;
+@property(nonatomic) uint64_t lastOpenSeq;
 @end
 
 @implementation PCPRatePanel
@@ -112,6 +113,7 @@
     }
     if(self.overlay.superview!=window) { [self.overlay removeFromSuperview];[window addSubview:self.overlay]; }
     self.overlay.frame=window.bounds;[window bringSubviewToFront:self.overlay];self.overlay.hidden=NO;
+    if(state.visible&&state.open_seq!=self.lastOpenSeq){self.lastOpenSeq=state.open_seq;self.panel.hidden=NO;}
     if(self.epoch!=state.epoch) self.panel.hidden=YES;
     self.epoch=state.epoch;
     UIEdgeInsets safe=window.safeAreaInsets;CGSize size=window.bounds.size;

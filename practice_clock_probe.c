@@ -144,7 +144,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v26b-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v27a-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -569,9 +569,16 @@ static int g_song_started, g_song_attempts;
 extern void ds4f_ui_probe_entry(uint64_t node, uint64_t layer);
 extern volatile uint64_t g_uip_node, g_uip_layer, g_uip_child, g_uip_seq;
 extern volatile int g_uip_slot_ok;
+extern volatile int g_uip_install;
+extern volatile uint64_t g_uip_practice, g_uip_fake;
 static uint64_t g_uip_logged;
 static uint32_t g_tb_numer, g_tb_denom; /* zero means unavailable */
-static PracticeRateUIState g_ui={0,0,0,0,0,100,1};
+static PracticeRateUIState g_ui={0,0,0,0,0,100,1,0};
+static uint64_t g_ui_open_seq;
+void pcp_rate_ui_open(void)
+{
+    g_ui_open_seq++;
+}
 static uint64_t g_ui_seen_mach,g_ui_request_epoch;
 static unsigned g_ui_request_percent;
 PracticeRateUIState pcp_rate_ui_state(void)
@@ -580,6 +587,7 @@ PracticeRateUIState pcp_rate_ui_state(void)
     uint64_t now=0,last=0;
     if (!pthread_main_np()) return s;
     s=g_ui;s.applied=g_rate.phase?g_rate.clock.percent:g_setting_percent;
+    s.open_seq=g_ui_open_seq;
     if (atomic_load_explicit(&g_rate_badthread,memory_order_relaxed)) {s.ready=0;s.result=-3;}
     if (!ps_mach_us(mach_absolute_time(),g_tb_numer,g_tb_denom,&now) ||
         !ps_mach_us(g_ui_seen_mach,g_tb_numer,g_tb_denom,&last) || now<last || now-last>1500000 ||
@@ -1517,10 +1525,12 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     if(n>0 && (size_t)n<sizeof(line)) padd(line,(size_t)n);
     if(g_uip_seq!=g_uip_logged) {
         g_uip_logged=g_uip_seq;
-        n=snprintf(line,sizeof(line),"uip seq=%llu node=%llx layer=%llx child=%llx slot=%d\n",
+        n=snprintf(line,sizeof(line),
+            "uip seq=%llu node=%llx layer=%llx child=%llx slot=%d inst=%d prac=%llx fake=%llx\n",
             (unsigned long long)g_uip_logged,(unsigned long long)g_uip_node,
             (unsigned long long)g_uip_layer,(unsigned long long)g_uip_child,
-            g_uip_slot_ok?1:0);
+            g_uip_slot_ok?1:0,g_uip_install,
+            (unsigned long long)g_uip_practice,(unsigned long long)g_uip_fake);
         if(n>0 && (size_t)n<sizeof(line)) padd(line,(size_t)n);
     }
     if(g_rate.ever || g_uip_seq) pflush();
