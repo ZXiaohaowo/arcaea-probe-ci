@@ -883,7 +883,7 @@ unsigned pcp_ab_set(unsigned which)
     int n;
     if (which>1 || !g_last_pos_ok) return 0;
     if (!pcp_point_capture(which)) return 0;
-    g_ab_pos[which]=(uint32_t)g_last_pos_ms;
+    g_ab_pos[which]=g_points.ms[which];
     g_ab_chart[which]=(int32_t)g_last_chart_ms;
     g_ab_have[which]=1;
     n=snprintf(line,sizeof(line),"ab set=%c pos_ms=%d chart_ms=%d\n",
@@ -899,8 +899,19 @@ void pcp_ab_loop_set(unsigned on) { g_ab_loop=on?1:0; g_loop_suspended=0; }
 unsigned pcp_ab_jumps(void) { return (unsigned)g_sk_events; }
 unsigned pcp_seek_phase(void) { return (unsigned)g_seek.phase; }
 unsigned pcp_seek_error(void) { return (unsigned)g_seek.error; }
+static int point_read_position(uint32_t *position) {
+    typedef int32_t (*GetPosFn)(void *,uint32_t *,uint32_t);
+    uint64_t gg=0,am=0,pv=0,begin=0,handle=0;
+    if(!pthread_main_np() || !pcp_rate_ui_state().visible ||
+       !rate_read64(g_base+OFF_SLOT,&gg) || !rate_read64(gg+OFF_GG_AM,&am) ||
+       !rate_read64(am+OFF_AM_PROVIDER,&pv) || !rate_read64(pv+OFF_PV_VEC_BEGIN,&begin) ||
+       !rate_read64(begin+8,&handle))return 0;
+    rate_owner_t owner={am,pv,handle,g_song_scene,g_song_timeline};
+    if(!rate_current(&owner))return 0;
+    return !((GetPosFn)(uintptr_t)(g_base+OFF_CC_GETPOS))((void *)(uintptr_t)handle,position,1);
+}
 PracticePoints pcp_points_snapshot(void) { return g_points; }
-unsigned pcp_points_current(void) {return g_last_pos_ok?(unsigned)g_last_pos_ms:0;}
+unsigned pcp_points_current(void) {uint32_t ms=0;return point_read_position(&ms)?ms:(g_last_pos_ok?(unsigned)g_last_pos_ms:0);}
 unsigned pcp_points_extent(void) {return g_points.duration?g_points.duration:g_point_extent;}
 uint64_t pcp_points_epoch(void) {return g_point_epoch;}
 unsigned pcp_loop_suspended(void) {return g_loop_suspended;}
@@ -914,7 +925,10 @@ int pcp_point_update(unsigned id,unsigned ms) {
     return 1;
 }
 int pcp_point_capture(unsigned id) {
-    return g_last_pos_ok && pcp_point_update(id,(unsigned)g_last_pos_ms);
+    uint32_t ms=0;
+    if(!point_read_position(&ms))return 0;
+    if(ms>g_point_extent)g_point_extent=ms;
+    return pcp_point_update(id,ms);
 }
 int pcp_point_delete(unsigned id) {
     if(!pthread_main_np() || !pcp_rate_ui_state().visible || psk_busy(&g_seek))return 0;
