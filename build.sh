@@ -38,19 +38,24 @@ xcrun --sdk iphoneos clang \
 cp bootstrap-Info.plist out/practice_bootstrap.framework/Info.plist
 
 echo "==== build clock probe (build id: ${BUILD_ID}) ===="
+CLOCK_CFLAGS=(-arch arm64 -mios-version-min=15.0 -O2 "-DPRACTICE_BUILD_ID=\"${BUILD_ID}\"")
+for src in practice_clock_probe practice_obs_queue practice_time practice_shadow practice_rate_bias practice_rate_session; do
+  xcrun --sdk iphoneos clang "${CLOCK_CFLAGS[@]}" -std=gnu11 -c "${src}.c" -o "out/${src}.o"
+done
 xcrun --sdk iphoneos clang -arch arm64 -mios-version-min=15.0 -fobjc-arc -O2 \
   -c practice_rate_ui.m -o out/practice_rate_ui.o
-xcrun --sdk iphoneos clang \
+xcrun --sdk iphoneos clang++ -arch arm64 -mios-version-min=15.0 -std=c++17 -O2 \
+  -c ds4f_ui_probe.cpp -o out/ds4f_ui_probe.o
+xcrun --sdk iphoneos clang++ \
   -arch arm64 \
   -mios-version-min=15.0 \
-  -std=gnu11 \
   -dynamiclib -O2 \
-  "-DPRACTICE_BUILD_ID=\"${BUILD_ID}\"" \
   -framework CoreFoundation \
   -framework UIKit -framework Foundation -framework CoreGraphics \
   -install_name @executable_path/Frameworks/practice_clock_probe.framework/practice_clock_probe \
   -o out/practice_clock_probe.framework/practice_clock_probe \
-  practice_clock_probe.c practice_obs_queue.c practice_time.c practice_shadow.c practice_rate_bias.c practice_rate_session.c out/practice_rate_ui.o
+  out/practice_clock_probe.o out/practice_obs_queue.o out/practice_time.o out/practice_shadow.o \
+  out/practice_rate_bias.o out/practice_rate_session.o out/practice_rate_ui.o out/ds4f_ui_probe.o
 cp clock_probe-Info.plist out/practice_clock_probe.framework/Info.plist
 
 echo "==== verify ===="

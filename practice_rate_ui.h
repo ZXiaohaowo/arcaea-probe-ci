@@ -2,12 +2,14 @@
 #define PRACTICE_RATE_UI_H
 #include <stdint.h>
 typedef struct {
-    int visible,ready,pending,result;
+    int visible,ready,pending,result,prep;
     unsigned applied;
     uint64_t epoch;
 } PracticeRateUIState;
 /* Main-thread only. The C adapter revalidates every request before writing. */
 PracticeRateUIState pcp_rate_ui_state(void);
 int pcp_rate_ui_request(unsigned percent,uint64_t epoch);
+/* Persistent setting (NSUserDefaults); 100 when absent or invalid. */
+unsigned pcp_rate_ui_stored_percent(void);
 void practice_rate_ui_start(void);
 #endif

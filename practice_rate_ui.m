@@ -75,8 +75,7 @@
     self.apply.frame=CGRectMake(186,267,158,48);[self.panel addSubview:self.apply];
     UIButton *close=[self button:@"收起" action:@selector(toggle)];
     close.frame=CGRectMake(130,326,100,38);[self.panel addSubview:close];
-    NSInteger saved=[[NSUserDefaults standardUserDefaults] integerForKey:@"PCPPracticeRatePercent"];
-    self.draft=(saved>=50&&saved<=250)?saved:75;[self updateDraft];
+    self.draft=(NSInteger)pcp_rate_ui_stored_percent();[self updateDraft];
 }
 - (void)updateDraft {
     self.draft=MAX(50,MIN(250,self.draft));
@@ -126,11 +125,18 @@
     self.apply.enabled=self.reset.enabled=state.ready&&!state.pending;
     self.apply.alpha=self.reset.alpha=self.apply.enabled?1:0.45;
     self.slider.enabled=!state.pending;
-    self.status.text=state.pending?@"正在应用…":state.result==-2?@"控制已停止，请退出并重新启动":state.result<0?@"未能应用，请重新暂停后重试":
+    self.status.text=state.pending?@"正在应用…":state.result==-3?@"控制已停止，请退出并重新启动":state.result==-2?@"未能应用，请重新暂停后重试":
+        state.prep&&state.ready?[NSString stringWithFormat:@"已设定 %.2fx\n开始播放后生效",state.applied/100.0]:
         !state.ready?@"等待暂停状态就绪…":
         [NSString stringWithFormat:@"当前 %.2fx · 调整后点击应用\n音乐与谱面同步变速",state.applied/100.0];
 }
 @end
+
+unsigned pcp_rate_ui_stored_percent(void)
+{
+    NSInteger saved=[[NSUserDefaults standardUserDefaults] integerForKey:@"PCPPracticeRatePercent"];
+    return (saved>=50&&saved<=250)?(unsigned)saved:100u;
+}
 
 void practice_rate_ui_start(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
