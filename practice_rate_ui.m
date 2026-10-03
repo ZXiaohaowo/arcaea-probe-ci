@@ -53,12 +53,12 @@
     self.value=[self label:34];self.value.font=[UIFont monospacedDigitSystemFontOfSize:34 weight:UIFontWeightBold];
     self.value.frame=CGRectMake(20,49,320,44);[self.panel addSubview:self.value];
     self.slider=[[UISlider alloc] initWithFrame:CGRectMake(28,100,304,38)];
-    self.slider.minimumValue=50;self.slider.maximumValue=250;self.slider.continuous=YES;
+    self.slider.minimumValue=PCP_RATE_MIN_PERCENT;self.slider.maximumValue=PCP_RATE_MAX_PERCENT;self.slider.continuous=YES;
     self.slider.tintColor=[UIColor colorWithRed:0.73 green:0.63 blue:1 alpha:1];
-    self.slider.accessibilityLabel=@"练习倍率，0.50 至 2.50 倍";
+    self.slider.accessibilityLabel=@"练习倍率，0.50 至 2.00 倍";
     [self.slider addTarget:self action:@selector(slide:) forControlEvents:UIControlEventValueChanged];
     [self.panel addSubview:self.slider];
-    UILabel *range=[self label:12];range.text=@"0.50x                                      2.50x";
+    UILabel *range=[self label:12];range.text=@"0.50x                                      2.00x";
     range.frame=CGRectMake(28,134,304,20);[self.panel addSubview:range];
     NSArray *names=@[@"− 0.05",@"− 0.01",@"+ 0.01",@"+ 0.05"];
     int steps[]={-5,-1,1,5};
@@ -79,17 +79,20 @@
     self.draft=(NSInteger)pcp_rate_ui_stored_percent();[self updateDraft];
 }
 - (void)updateDraft {
-    self.draft=MAX(50,MIN(250,self.draft));
+    self.draft=MAX((NSInteger)PCP_RATE_MIN_PERCENT,MIN((NSInteger)PCP_RATE_MAX_PERCENT,self.draft));
     self.value.text=[NSString stringWithFormat:@"%.2fx",self.draft/100.0];
     self.slider.value=(float)self.draft;
     self.slider.accessibilityValue=self.value.text;
 }
 - (void)slide:(UISlider *)sender {self.draft=lroundf(sender.value);[self updateDraft];}
 - (void)step:(UIButton *)sender {self.draft+=sender.tag;[self updateDraft];}
-- (void)toggle {self.panel.hidden=!self.panel.hidden;}
+- (void)toggle {
+    if(self.panel.hidden) {self.draft=pcp_rate_ui_stored_percent();[self updateDraft];}
+    self.panel.hidden=!self.panel.hidden;
+}
 - (void)applyRate {
     if(pcp_rate_ui_request((unsigned)self.draft,self.epoch)) {
-        [[NSUserDefaults standardUserDefaults] setInteger:self.draft forKey:@"PCPPracticeRatePercent"];
+        pcp_rate_ui_save_percent((unsigned)self.draft);
         [self tick];
     } else {self.status.text=@"状态已变化，请保持暂停后重试";}
 }
@@ -113,7 +116,7 @@
     }
     if(self.overlay.superview!=window) { [self.overlay removeFromSuperview];[window addSubview:self.overlay]; }
     self.overlay.frame=window.bounds;[window bringSubviewToFront:self.overlay];self.overlay.hidden=NO;
-    if(state.visible&&state.open_seq!=self.lastOpenSeq){self.lastOpenSeq=state.open_seq;self.panel.hidden=NO;}
+    if(state.visible&&state.open_seq!=self.lastOpenSeq){self.lastOpenSeq=state.open_seq;self.draft=pcp_rate_ui_stored_percent();[self updateDraft];self.panel.hidden=NO;}
     if(self.epoch!=state.epoch) self.panel.hidden=YES;
     self.epoch=state.epoch;
     UIEdgeInsets safe=window.safeAreaInsets;CGSize size=window.bounds.size;
@@ -137,7 +140,17 @@
 unsigned pcp_rate_ui_stored_percent(void)
 {
     NSInteger saved=[[NSUserDefaults standardUserDefaults] integerForKey:@"PCPPracticeRatePercent"];
-    return (saved>=50&&saved<=250)?(unsigned)saved:100u;
+    if(saved>=PCP_RATE_MIN_PERCENT && saved<=250) {
+        unsigned bounded=(unsigned)MIN(saved,(NSInteger)PCP_RATE_MAX_PERCENT);
+        if(bounded!=(unsigned)saved) pcp_rate_ui_save_percent(bounded);
+        return bounded;
+    }
+    return 100u;
+}
+
+void pcp_rate_ui_save_percent(unsigned percent) {
+    if(percent>=PCP_RATE_MIN_PERCENT && percent<=PCP_RATE_MAX_PERCENT)
+        [[NSUserDefaults standardUserDefaults] setInteger:percent forKey:@"PCPPracticeRatePercent"];
 }
 
 void practice_rate_ui_start(void) {

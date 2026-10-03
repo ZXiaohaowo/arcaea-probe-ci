@@ -597,7 +597,7 @@ PracticeRateUIState pcp_rate_ui_state(void)
 int pcp_rate_ui_request(unsigned percent,uint64_t epoch)
 {
     PracticeRateUIState s=pcp_rate_ui_state();
-    if (!pthread_main_np() || !s.visible || !s.ready || s.pending || epoch!=s.epoch || percent<50 || percent>250) return 0;
+    if (!pthread_main_np() || !s.visible || !s.ready || s.pending || epoch!=s.epoch || percent<PCP_RATE_MIN_PERCENT || percent>PCP_RATE_MAX_PERCENT) return 0;
     g_ui_request_percent=percent;g_ui_request_epoch=epoch;
     g_ui.pending=1;g_ui.result=0;
     return 1;
@@ -1331,7 +1331,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                 }
             }
             if (playing && !g_song_started && g_song_attempts<3 &&
-                g_setting_percent>=50 && g_setting_percent<=250) {
+                g_setting_percent>=PCP_RATE_MIN_PERCENT && g_setting_percent<=PCP_RATE_MAX_PERCENT) {
                 if (g_setting_percent==100 && !g_rate.phase) {
                     g_song_started=1;   /* nothing to apply */
                 } else {
