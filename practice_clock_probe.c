@@ -954,6 +954,15 @@ PracticeHUDState pcp_hud_state(void) {
             h.scroll_valid=1;h.current_note_speed=base*scale;h.note_speed=h.current_note_speed*h.percent/100.0;
         }
     }
+    static uint64_t last_log_ms;
+    uint64_t log_ms=monotonic_ms();
+    if(log_ms-last_log_ms>=1000) {
+        char line[240];last_log_ms=log_ms;
+        int n=snprintf(line,sizeof(line),"hud gen=%llu score=%d pure=%u far=%u lost=%u acc=%.4f speed=%u scroll=%d current_note=%.4f note=%.4f pitch_attached=%d\n",
+            (unsigned long long)g_scene_gen,h.score_valid,h.pure,h.far,h.lost,h.accuracy,h.percent,
+            h.scroll_valid,h.current_note_speed,h.note_speed,h.pitch_attached);
+        if(n>0 && n<(int)sizeof(line))padd(line,(size_t)n);
+    }
     return h;
 }
 int pcp_point_update(unsigned id,unsigned ms) {
@@ -2388,12 +2397,15 @@ static void *sampler_main(void *arg)
         chain_snap_t cs;
         int n, gap;
 
-        int interval=atomic_load(&g_fast_control)?100:SAMPLE_INTERVAL_MS;
-        ts.tv_sec = interval / 1000;
-        ts.tv_nsec = (long)(interval % 1000) * 1000000L;
+        /* Cheap wake polling also makes a newly queued UI request responsive;
+         * full reads/logging remain 1 Hz outside an active control transaction. */
+        ts.tv_sec = 0;
+        ts.tv_nsec = 100000000L;
         nanosleep(&ts, NULL);
 
         now = monotonic_ms();
+        int interval=atomic_load(&g_fast_control)?100:SAMPLE_INTERVAL_MS;
+        if(now-prev<(uint64_t)interval)continue;
         dt = now - prev;
         prev = now;
         seq += 1;
