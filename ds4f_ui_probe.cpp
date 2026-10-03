@@ -1,4 +1,4 @@
-// ds4f v27a native practice entry (route A).
+// ds4f v27b native practice entry and native step-based rate panel (route A).
 //
 // Called from the PauseLayer init trampoline (tag=6) with the freshly loaded
 // PauseOverlay node and the PauseLayer this pointer.
@@ -6,7 +6,8 @@
 //   2. native entry install: load a second PauseOverlay tree, take its retry button,
 //      relabel it "练习", move the unused children off-screen, reflow the three
 //      native buttons into a four-slot row, attach a touch listener that opens the
-//      rate panel, and add the second tree under the real overlay.
+//      native panel (UIKit remains the drag fallback), and add the second tree
+//      under the real overlay. Native nodes remain owned by the engine tree.
 // All engine access uses slots/addresses confirmed by static disassembly:
 //   setPosition = vtable+0x98, addChild = vtable+0x1E8, getChildByName = vtable+0x210
 //   loader 0xF35924, Label::setString 0xE4C02C, addTouchEventListener 0xE10728
