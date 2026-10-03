@@ -15,9 +15,14 @@ typedef struct {
     float baseline, applied, readback, restored;
     uint64_t ticks, restores;
 } PracticeRateSession;
-/* phase: 0 inactive, 1 configured rate, 2 1x with continuity offset retained. */
+/* phase: 0 inactive, 1 configured rate, 2 1x with continuity offset retained.
+ * v26: every close is best-effort; a dead handle drops ownership without a
+ * permanent error latch. The adapter re-arms a fresh session per song. */
 int prs_begin(PracticeRateSession *, uint64_t, int32_t, unsigned,
               PracticePitchOps, int (*is_current)(void *));
+/* Called at the first live (playing) sample of a song: rebases the clock at the
+ * boundary, keeps the accumulated offset, and re-asserts/verifies the audio rate. */
+int prs_live_begin(PracticeRateSession *, uint64_t, int32_t, unsigned);
 int32_t prs_tick(PracticeRateSession *, uint64_t, int32_t, int paused);
 void prs_close(PracticeRateSession *, int reason);
 void prs_fallback(PracticeRateSession *, uint64_t, int32_t, int paused, int reason);
