@@ -144,7 +144,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v26-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v26b-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -1261,8 +1261,13 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
             time_ok = ps_mach_us(mach_absolute_time(),g_tb_numer,g_tb_denom,&now_us) &&
                 ps_mach_us(g_rate_last_mach,g_tb_numer,g_tb_denom,&last_us) &&
                 now_us>=last_us && now_us-last_us<100000;
-            fresh_paused = g_rate_last_tl==tl && (g_rate_last_state & 0xffffu)==0x101u && time_ok;
-            fresh_playing = g_rate_last_tl==tl && (g_rate_last_state & 0xffffu)==0x001u && time_ok;
+            /* State bytes are little-endian: low byte = f2c (+0x2c), next = f2d (+0x2d).
+             * Playing is f2c=0,f2d=1 -> 0x0100; paused is 1,1 -> 0x0101. Log (18)
+             * showed the previous 0x0001 expectation never matched on device. */
+            fresh_paused = g_rate_last_tl==tl && (g_rate_last_state & 0xffu)==1u &&
+                ((g_rate_last_state >> 8) & 0xffu)==1u && time_ok;
+            fresh_playing = g_rate_last_tl==tl && (g_rate_last_state & 0xffu)==0u &&
+                ((g_rate_last_state >> 8) & 0xffu)==1u && time_ok;
             patched = safe_read(g_base+OFF_SETPITCH,&marker,8) && marker==0x6d1223e9d10583ffULL &&
                 safe_read(g_base+0x9237fc,&dtor_word,4) && dtor_word==0x17db8461u &&
                 safe_read(g_base+0x8e3900,&play_word,4) && play_word==0x17dc8480u;
