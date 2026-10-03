@@ -127,6 +127,7 @@
 #include <mach-o/dyld.h>
 #include <mach/mach_time.h>
 #include <math.h>
+#include "practice_seek.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -144,7 +145,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v37-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v38-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -846,7 +847,9 @@ static volatile uint32_t g_ab_pos[2];
 static volatile int32_t g_ab_chart[2];
 static volatile int g_ab_have[2];
 static volatile int g_ab_loop;
-static volatile int g_sk_pending;
+static PracticeSeek g_seek;
+static PracticeSeekSample g_seek_sample;
+static uint64_t g_retry_generation;
 static volatile uint64_t g_sk_events, g_sk_loop_events, g_sk_skips;
 static volatile int g_sk_rc_getpos, g_sk_rc_setpos, g_sk_rc_clock;
 static volatile uint32_t g_sk_pos_before, g_sk_pos_after;
@@ -857,14 +860,14 @@ static volatile int g_last_chart_ms;
  * "重试" mode calls its vtable slot 2 (retry) while playing, then jumps to A
  * on the fresh chart. Slot 0 = resume (verified from the button lambdas). */
 static volatile uint64_t g_retry_obj, g_retry_vptr, g_retry_calls, g_retry_fail;
-static volatile int g_retry_valid, g_retry_pending, g_seek_after_retry;
-static volatile uint64_t g_scene_gen, g_seek_deadline_mach;
+static volatile int g_retry_valid;
+static volatile uint64_t g_scene_gen;
 /* v35: the (chart - audio) offset is a property of the song; sample it while
  * actually playing and use it to derive the chart target at jump time, instead
  * of trusting a chart value captured while paused (t20 can keep running then). */
 static volatile int32_t g_live_offset_ms;
 static volatile int g_live_offset_valid;
-static volatile uint64_t g_sk_deadline;
+
 
 unsigned pcp_ab_set(unsigned which)
 {
@@ -885,7 +888,14 @@ unsigned pcp_ab_get(unsigned which) { return which>1?0u:(unsigned)g_ab_pos[which
 unsigned pcp_ab_loop_get(void) { return (unsigned)g_ab_loop; }
 void pcp_ab_loop_set(unsigned on) { g_ab_loop=on?1:0; }
 unsigned pcp_ab_jumps(void) { return (unsigned)g_sk_events; }
-void pcp_ab_jump(void) { g_sk_pending=1; }
+unsigned pcp_seek_phase(void) { return (unsigned)g_seek.phase; }
+unsigned pcp_seek_error(void) { return (unsigned)g_seek.error; }
+void pcp_ab_jump(void) {
+    uint64_t now=0;
+    if (!pthread_main_np() || !pcp_rate_ui_state().visible || !g_ab_have[0]) return;
+    if (ps_mach_us(mach_absolute_time(),g_tb_numer,g_tb_denom,&now))
+        (void)psk_request(&g_seek,g_ab_pos[0],0,g_scene_gen,now);
+}
 
 static int safe_read(uint64_t addr, void *dst, uint64_t len); /* defined below */
 
@@ -903,31 +913,6 @@ static int retry_call(void)
     ((RetryFn)(uintptr_t)fn)((void *)(uintptr_t)g_retry_obj,0);
     g_retry_calls++;
     return 0;
-}
-
-static void ab_jump(void *chan, unsigned which, int automatic)
-{
-    typedef int32_t (*GetPosFn)(void *, uint32_t *, uint32_t);
-    typedef int32_t (*SetPosFn)(void *, uint32_t, uint32_t);
-    uint32_t pos=0;
-    int64_t before;
-    if (!chan || which>1 || !g_ab_have[which] || !g_rate.phase || !g_live_offset_valid) {
-        g_sk_skips++; return;
-    }
-    g_sk_rc_getpos=((GetPosFn)(uintptr_t)(g_base+OFF_CC_GETPOS))(chan,&pos,1);
-    if (g_sk_rc_getpos!=0) { g_sk_skips++; return; }
-    before=(int64_t)g_rate_last_native + g_rate.clock.bias_us/1000;
-    g_sk_pos_before=pos; g_sk_chart_before=(int32_t)before;
-    g_sk_rc_setpos=((SetPosFn)(uintptr_t)(g_base+OFF_CC_SETPOS))(chan,g_ab_pos[which],1);
-    if (g_sk_rc_setpos!=0) { g_sk_skips++; return; }
-    g_sk_pos_after=g_ab_pos[which];
-    /* Target chart = captured source position + the live song offset. */
-    g_ab_chart[which]=(int32_t)((int64_t)g_ab_pos[which]+g_live_offset_ms);
-    g_rate.clock.bias_us=((int64_t)g_ab_chart[which]-(int64_t)g_rate_last_native)*1000;
-    g_rate.clock.fraction=0;
-    g_sk_rc_clock=0;
-    g_sk_chart_after=g_ab_chart[which];
-    if (automatic) g_sk_loop_events++; else g_sk_events++;
 }
 
 unsigned pcp_bookmark_add(void)
@@ -993,7 +978,7 @@ uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
                 if (vt>0x100000000ull && vt<0x200000000ull) {
                     char pl[96];
                     int pn;
-                    g_retry_obj=obj; g_retry_vptr=vt; g_retry_valid=1;
+                    g_retry_obj=obj; g_retry_vptr=vt; g_retry_valid=1; g_retry_generation=g_scene_gen;
                     pn=snprintf(pl,sizeof(pl),"pc obj=%llx vt=%llx\n",
                                 (unsigned long long)obj,(unsigned long long)vt);
                     if (pn>0 && (size_t)pn<sizeof(pl)) padd(pl,(size_t)pn);
@@ -1013,7 +998,7 @@ uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
          * chart. tag5 also fires mid-song for BGM events, so it must not clear. */
         if (tag==4) {
             g_scroll_gen++; scroll_cache_clear();
-            g_scene_gen++; g_retry_valid=0;
+            g_scene_gen++; g_retry_valid=0; g_live_offset_valid=0;
         }
         if (tag==4) g_rate_dtor_events++; else g_rate_play_events++;
         if ((g_rate.phase || g_rate.audio_owned) &&
@@ -1623,6 +1608,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
         } else if (!dumpr) {
             xf = "dump";
         }
+        g_seek_sample=(PracticeSeekSample){0};
         if (cs.state == CH_READY) {
             ct_probe(&tl, &ctCd, &ctA, &t20, &t24, &t28, &f2c, &f2d, &f2e,
                      &sf, &s470, &s474, &t30, &sess_addr, &scene_addr, &xf,
@@ -1686,11 +1672,15 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
             }
             g_ui_seen_mach=mach_absolute_time();
             g_ui.visible = ctCd && ctA && paused;
-            /* v35: sample the song's (chart - audio) offset while really playing. */
-            if (ctA && pok && ctCd && pos>=0 && !paused) {
-                int32_t off=(int32_t)((int64_t)t20-(int64_t)pos);
+            /* v38: sample the actual consumer, excluding paused/preroll samples. */
+            g_seek_sample=(PracticeSeekSample){.now_us=now_us,.generation=g_scene_gen,
+                .valid=main_ok && scene_ok && patched && time_ok,
+                .playing=playing && pos>0,.pos=pos>=0?(uint32_t)pos:0,
+                .consumer=(int64_t)t20-t28,.percent=g_setting_percent};
+            if (playing && pos>0) {
+                int64_t off=(int64_t)t20-t28-pos;
                 if (off>-20000 && off<20000) {
-                    g_live_offset_ms=off; g_live_offset_valid=1;
+                    g_live_offset_ms=(int32_t)off;g_live_offset_valid=1;
                 }
             }
             g_ui.prep = prep?1:0;
@@ -1875,90 +1865,66 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                 }
             }
         }
-        /* ds4f v32: A/B jump experiment. Manual jump runs while paused; the
-         * loop jump runs while playing once the position reaches B. */
+        /* v38: one restart/locate/verify transaction for manual and loop jumps.
+         * All calls execute on this main-thread sampling callback. No seek in pause. */
         {
-            int did=0, automatic=0;
-            if (g_sk_pending) {
-                /* v36: keep the request until its prerequisites exist (clock
-                 * session + sampled offset + channel); it may execute while
-                 * playing after the user resumes. Bounded by a 30 s deadline. */
-                uint64_t now=mach_absolute_time();
-                if (!g_sk_deadline) g_sk_deadline=now+24000000ull*30ull;
-                if (g_ab_have[0] && g_rate.phase && g_live_offset_valid && cs.chan0) {
-                    g_sk_pending=0; g_sk_deadline=0;
-                    ab_jump((void *)(uintptr_t)cs.chan0,0,0);
-                    did=1;
-                } else if (now>=g_sk_deadline) {
-                    char wl[128];
-                    int wn;
-                    g_sk_pending=0; g_sk_deadline=0; g_sk_skips++;
-                    wn=snprintf(wl,sizeof(wl),
-                        "skw seq=%llu drop have=%d phase=%d offv=%d\n",
-                        (unsigned long long)task->q_seq,g_ab_have[0],g_rate.phase,
-                        g_live_offset_valid);
-                    if (wn>0 && (size_t)wn<sizeof(wl)) padd(wl,(size_t)wn);
-                }
-            } else if (g_ab_loop && g_ab_have[0] && g_ab_have[1] &&
-                       g_ab_pos[1]>g_ab_pos[0] && !g_ui.visible &&
-                       g_rate.phase && g_last_pos_ok &&
-                       (uint32_t)g_last_pos_ms>=g_ab_pos[1]) {
-                g_retry_pending=1;
-            }
-            if (did) {
-                char sl[240];
-                int sn=snprintf(sl,sizeof(sl),
-                    "sk seq=%llu act=%s rc=%d/%d/%d pos=%u->%u chart=%d->%d bias_us=%lld sk=%llu lk=%llu skip=%llu\n",
-                    (unsigned long long)task->q_seq, automatic?"loop":"manual",
-                    g_sk_rc_getpos,g_sk_rc_setpos,g_sk_rc_clock,
-                    (unsigned)g_sk_pos_before,(unsigned)g_sk_pos_after,
-                    g_sk_chart_before,g_sk_chart_after,(long long)g_rate.clock.bias_us,
-                    (unsigned long long)g_sk_events,(unsigned long long)g_sk_loop_events,
-                    (unsigned long long)g_sk_skips);
-                if (sn>0 && (size_t)sn<sizeof(sl)) padd(sl,(size_t)sn);
-            }
-        }
-        /* ds4f v33: retry-based loop (route B) - call the game's own retry
-         * while playing, then jump to A once the fresh session is live. */
-        if (g_retry_pending) {
-            g_retry_pending=0;
-            if (g_retry_valid) {
+            PracticeSeekSample x=g_seek_sample;
+            char line[320]; int n=0;
+            x.valid=x.valid && ctA && ctCd && pok && g_rate.phase &&
+                rate_current(&g_rate_owner) && g_rate_owner.timeline==tl &&
+                g_rate_owner.scene==scene_addr && g_rate_owner.handle==cs.chan0;
+            x.can_restart=g_retry_valid && g_retry_generation==g_scene_gen;
+            x.percent=g_rate.clock.percent;
+            if (!psk_busy(&g_seek) && g_ab_loop && g_ab_have[0] && g_ab_have[1] &&
+                g_ab_pos[1]>g_ab_pos[0] && x.valid && x.playing && x.pos>=g_ab_pos[1])
+                (void)psk_request(&g_seek,g_ab_pos[0],1,g_scene_gen,x.now_us);
+            int old_phase=g_seek.phase;
+            int action=psk_poll(&g_seek,x);
+            if (action==PSK_RESTART) {
                 int rc=retry_call();
-                char rl[160];
-                int rn=snprintf(rl,sizeof(rl),
-                    "rt2 seq=%llu rc=%d obj=%llx vt=%llx pos=%d calls=%llu fail=%llu\n",
-                    (unsigned long long)task->q_seq, rc,
-                    (unsigned long long)g_retry_obj,(unsigned long long)g_retry_vptr,
-                    g_last_pos_ms,(unsigned long long)g_retry_calls,
-                    (unsigned long long)g_retry_fail);
-                if (rn>0 && (size_t)rn<sizeof(rl)) padd(rl,(size_t)rn);
-                if (rc==0) {
-                    g_seek_after_retry=1;
-                    g_seek_deadline_mach=mach_absolute_time()+24000000ull*20ull; /* 20 s */
+                if (rc) psk_fail(&g_seek,10);
+                n=snprintf(line,sizeof(line),"seek id=%llu act=restart target=%u gen=%llu rc=%d auto=%d\n",
+                    (unsigned long long)g_seek.id,g_seek.target,(unsigned long long)g_scene_gen,rc,g_seek.automatic);
+            } else if (action==PSK_LOCATE) {
+                typedef int32_t (*PosFn)(void *,uint32_t,uint32_t);
+                typedef int32_t (*ReadFn)(void *,uint32_t *,uint32_t);
+                int32_t anchor=0; uint32_t actual=0;
+                int rc=-1,rb=-1;
+                int64_t target_consumer=(int64_t)g_seek.target+g_seek.offset;
+                if (x.playing && safe_read(tl+0x28,&anchor,4) &&
+                    target_consumer+anchor>=INT32_MIN && target_consumer+anchor<=INT32_MAX) {
+                    rc=((PosFn)(uintptr_t)(g_base+OFF_CC_SETPOS))((void *)(uintptr_t)cs.chan0,g_seek.target,1);
+                    if (!rc) {
+                        g_rate.clock.bias_us=(target_consumer+anchor-(int64_t)g_rate_last_native)*1000;
+                        g_rate.clock.fraction=0;
+                        rb=((ReadFn)(uintptr_t)(g_base+OFF_CC_GETPOS))((void *)(uintptr_t)cs.chan0,&actual,1);
+                    }
                 }
-            } else {
-                g_retry_fail++;
+                if (rc || rb || llabs((int64_t)actual-g_seek.target)>150) psk_fail(&g_seek,11);
+                n=snprintf(line,sizeof(line),"seek id=%llu act=locate target=%u actual=%u consumer_target=%lld anchor=%d offset=%d rc=%d/%d gen=%llu\n",
+                    (unsigned long long)g_seek.id,g_seek.target,actual,(long long)target_consumer,
+                    anchor,g_seek.offset,rc,rb,(unsigned long long)g_scene_gen);
+            } else if (action==PSK_SUCCESS) {
+                if (g_seek.automatic) g_sk_loop_events++; else g_sk_events++;
             }
-        }
-        if (g_seek_after_retry && g_rate.phase && g_last_pos_ok && cs.chan0 &&
-            g_live_offset_valid &&
-            (uint32_t)g_last_pos_ms < g_ab_pos[0] &&
-            mach_absolute_time() < g_seek_deadline_mach) {
-            ab_jump((void *)(uintptr_t)cs.chan0,0,1);
-            g_seek_after_retry=0;
-            {
-                char rl[160];
-                int rn=snprintf(rl,sizeof(rl),
-                    "sk seq=%llu act=after-retry pos=%u->%u chart=%d->%d sk=%llu lk=%llu\n",
-                    (unsigned long long)task->q_seq,
-                    (unsigned)g_sk_pos_before,(unsigned)g_sk_pos_after,
-                    g_sk_chart_before,g_sk_chart_after,
-                    (unsigned long long)g_sk_events,(unsigned long long)g_sk_loop_events);
-                if (rn>0 && (size_t)rn<sizeof(rl)) padd(rl,(size_t)rn);
+            if (n>0 && (size_t)n<sizeof(line)) padd(line,(size_t)n);
+            if (psk_busy(&g_seek) || old_phase!=g_seek.phase) {
+                n=snprintf(line,sizeof(line),"seek id=%llu phase=%d error=%d target=%u actual=%u consumer=%lld gen=%llu playing=%d valid=%d stable=%d verified=%d\n",
+                    (unsigned long long)g_seek.id,g_seek.phase,g_seek.error,g_seek.target,x.pos,
+                    (long long)x.consumer,(unsigned long long)g_scene_gen,x.playing,x.valid,g_seek.stable,g_seek.verified);
+                if (n>0 && (size_t)n<sizeof(line)) padd(line,(size_t)n);
             }
-        } else if (g_seek_after_retry && mach_absolute_time()>=g_seek_deadline_mach) {
-            g_seek_after_retry=0;
-            g_retry_fail++;
+            if (g_seek.phase==PSK_FAILED && old_phase!=PSK_FAILED) {
+                g_ab_loop=0;g_sk_skips++;
+                /* A partial locate must not keep running with mismatched clocks.
+                 * Reset through the native retry path once, with looping disabled. */
+                if ((old_phase==PSK_VERIFY || action==PSK_LOCATE) &&
+                    g_retry_valid && g_retry_generation==g_scene_gen) {
+                    int rc=retry_call();
+                    n=snprintf(line,sizeof(line),"seek id=%llu act=recover-retry rc=%d\n",(unsigned long long)g_seek.id,rc);
+                    if (n>0 && (size_t)n<sizeof(line)) padd(line,(size_t)n);
+                }
+            }
         }
         sr_reads = g_sr_reads;
         sr_filt = g_sr_filtered;

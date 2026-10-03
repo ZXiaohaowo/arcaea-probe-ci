@@ -45,6 +45,8 @@ unsigned pcp_ab_have(unsigned which);
 unsigned pcp_ab_get(unsigned which);
 unsigned pcp_ab_jumps(void);
 void pcp_ab_jump(void);
+unsigned pcp_seek_phase(void);
+unsigned pcp_seek_error(void);
 unsigned pcp_ab_loop_get(void);
 void pcp_ab_loop_set(unsigned on);
 /* Native entry callback: request that the rate panel is shown. */

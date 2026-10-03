@@ -172,7 +172,7 @@
 - (void)abSetB { pcp_ab_set(1); [self refreshAB]; }
 - (void)abJumpTap {
     pcp_ab_jump();
-    self.status.text=@"已请求跳到 A（恢复播放后生效）";
+    self.status.text=@"正在重试并定位到 A…";
     self.statusHold=CFAbsoluteTimeGetCurrent()+2.5;
     [self refreshAB];
 }
@@ -217,7 +217,12 @@
     [self refreshPitchMode];
     [self refreshPitchComp];
     [self refreshAB];
-    if(CFAbsoluteTimeGetCurrent()>=self.statusHold)
+    unsigned seekPhase=pcp_seek_phase();
+    if(seekPhase>=1 && seekPhase<=4) {
+        self.status.text=seekPhase==1?@"跳转排队中…":seekPhase==2?@"正在重试，等待新会话…":seekPhase==3?@"等待预备段结束并定位…":@"正在验证跳转结果…";
+    } else if(seekPhase==6) {
+        self.status.text=[NSString stringWithFormat:@"跳转未通过验证 (%u)，循环已停止",pcp_seek_error()];
+    } else if(CFAbsoluteTimeGetCurrent()>=self.statusHold)
         self.status.text=state.pending?@"正在应用…":state.result==-3?@"控制已停止，请退出并重新启动":state.result==-2?@"未能应用，请重新暂停后重试":
             state.prep&&state.ready?[NSString stringWithFormat:@"已设定 %.2fx\n开始播放后生效",state.applied/100.0]:
             !state.ready?@"等待暂停状态就绪…":
