@@ -1,4 +1,4 @@
-/* practice_clock_probe.c - v24 sustained rate experiment.
+/* practice_clock_probe.c - v25 pause UI and sustained rate control.
  * Current behavior: W1 applies virtual-time bias; guarded setPitch controls BGM.
  * Scene destruction / BGM replacement restore audio before native teardown.
  * The following v9-v18 notes describe historical scopes, NOT current permissions.
@@ -139,6 +139,7 @@
 #include "practice_obs_queue.h"
 #include "practice_shadow.h"
 #include "practice_rate_session.h"
+#include "practice_rate_ui.h"
 
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
@@ -560,6 +561,30 @@ static int32_t g_rate_last_native;
 static uint32_t g_rate_last_state;
 static uint64_t g_rate_dtor_events, g_rate_play_events;
 static _Atomic int g_rate_badthread;
+static uint32_t g_tb_numer, g_tb_denom; /* zero means unavailable */
+static PracticeRateUIState g_ui={0,0,0,0,100,1};
+static uint64_t g_ui_seen_mach,g_ui_request_epoch;
+static unsigned g_ui_request_percent;
+PracticeRateUIState pcp_rate_ui_state(void)
+{
+    PracticeRateUIState s={0};
+    uint64_t now=0,last=0;
+    if (!pthread_main_np()) return s;
+    s=g_ui;s.applied=g_rate.phase?g_rate.clock.percent:100;
+    if (g_rate.errors) {s.ready=0;s.result=-2;}
+    if (!ps_mach_us(mach_absolute_time(),g_tb_numer,g_tb_denom,&now) ||
+        !ps_mach_us(g_ui_seen_mach,g_tb_numer,g_tb_denom,&last) || now<last || now-last>1500000 ||
+        (g_rate_last_state & 0xffffu)!=0x101u) s.visible=s.ready=0;
+    return s;
+}
+int pcp_rate_ui_request(unsigned percent,uint64_t epoch)
+{
+    PracticeRateUIState s=pcp_rate_ui_state();
+    if (!pthread_main_np() || !s.visible || !s.ready || s.pending || epoch!=s.epoch || percent<50 || percent>250) return 0;
+    g_ui_request_percent=percent;g_ui_request_epoch=epoch;
+    g_ui.pending=1;g_ui.result=0;
+    return 1;
+}
 
 static int rate_read64(uint64_t addr, uint64_t *out)
 {
@@ -591,30 +616,9 @@ static int rate_set(void *context,float value)
     typedef int (*fn)(void *,float);
     return ((fn)(uintptr_t)(g_base+OFF_SETPITCH))((void *)(uintptr_t)o->handle,value);
 }
-static void rate_config(void)
-{
-    char path[1024],line[64],*end;
-    const char *home=getenv("HOME");
-    FILE *f;
-    long value;
-    if (!home) return;
-    if (snprintf(path,sizeof(path),"%s/Documents/practice_rate_percent.txt",home)>=(int)sizeof(path)) {g_rate_requested=0;return;}
-    f=fopen(path,"rb");
-    if (!f) return; /* absent file: diagnostic default 75 percent */
-    g_rate_requested=0;
-    if (fgets(line,sizeof(line),f) && fgetc(f)==EOF) {
-        value=strtol(line,&end,10);
-        if (end!=line) {
-            while (*end==' ' || *end=='\t' || *end=='\r' || *end=='\n') end++;
-            if (!*end && value>=50 && value<=250) g_rate_requested=(unsigned)value;
-        }
-    }
-    fclose(f);
-}
 /* Main-thread drainer counters, not modified by hook callbacks. */
 static uint64_t g_e1_count, g_e1_mismatch, g_e1_nonmain, g_e1_invalid;
 static uint64_t g_main_base;
-static uint32_t g_tb_numer, g_tb_denom; /* zero means unavailable, never guessed */
 
 __attribute__((used, noinline))
 uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
@@ -626,6 +630,7 @@ uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
         atomic_store_explicit(&g_rate_badthread,1,memory_order_relaxed);
     if (tag==4 || tag==5) {
         if (!on_main) {atomic_store_explicit(&g_rate_badthread,1,memory_order_relaxed);return 0;}
+        g_ui.epoch++;g_ui.visible=g_ui.ready=0;
         if (tag==4) g_rate_dtor_events++; else g_rate_play_events++;
         if ((g_rate.phase || g_rate.audio_owned) &&
             ((tag==4 && a==g_rate_owner.scene) || (tag==5 && a==g_rate_owner.pv)))
@@ -665,6 +670,11 @@ uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
     }
     r.valid = validbits;
     (void)poq_push(&g_obs_q, &r);
+    if (on_main && tag==1 && (r.valid & OBS_VALID_READS) &&
+        (r.state & 255u)!=1 && (g_ui.visible || g_ui.pending)) {
+        g_ui.epoch++;g_ui.visible=g_ui.ready=0;
+        if (g_ui.pending) {g_ui.pending=0;g_ui.result=-1;}
+    }
     if (tag==1 && on_main && g_rate.phase && a==g_rate_owner.timeline &&
         ((r.state >> 8) & 255u)!=1) prs_close(&g_rate,7);
     if (tag==3 && on_main) {
@@ -1224,17 +1234,17 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                      &sf, &s470, &s474, &t30, &sess_addr, &scene_addr, &xf,
                      (uint64_t)task->q_seq, via, sizeof(via), &dg, &te);
         }
-        /* Apply once while stably paused; next native pause restores 1x in W1.
-         * No delayed work carries a game pointer or audio handle. */
+        /* Explicit UI requests: freshly revalidate pause and ownership here.
+         * Requests carry only a percent and lifecycle epoch, never a pointer. */
         if (g_rate.phase && (atomic_load_explicit(&g_rate_badthread,memory_order_relaxed) ||
             (g_rate.audio_owned && !rate_current(&g_rate_owner)) ||
             (ctCd && ctA && (tl!=g_rate_owner.timeline || scene_addr!=g_rate_owner.scene))))
             prs_close(&g_rate,6);
-        if (!g_rate.ever && g_rate_requested &&
-            !atomic_load_explicit(&g_rate_badthread,memory_order_relaxed)) {
+        {
             uint64_t marker=0,now_us=0,last_us=0;
             uint32_t dtor_word=0,play_word=0;
-            int eligible=pthread_main_np() && ctCd && ctA && f2c==1 && f2d==1 &&
+            int eligible=!g_rate.errors && !atomic_load_explicit(&g_rate_badthread,memory_order_relaxed) &&
+                pthread_main_np() && ctCd && ctA && f2c==1 && f2d==1 &&
                 sf==1 && s470==1 && f2e==1 && t30==0 && te.t34==0 && te.t38==0 &&
                 (int64_t)t20-t28>1000 && cs.chan0 && pok &&
                 g_rate_last_tl==tl && (g_rate_last_state & 0xffffu)==0x101u &&
@@ -1244,14 +1254,27 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                 safe_read(g_base+OFF_SETPITCH,&marker,8) && marker==0x6d1223e9d10583ffULL &&
                 safe_read(g_base+0x9237fc,&dtor_word,4) && dtor_word==0x17db8461u &&
                 safe_read(g_base+0x8e3900,&play_word,4) && play_word==0x17dc8480u;
+            g_ui_seen_mach=mach_absolute_time();
+            g_ui.visible=ctCd && ctA && f2c==1 && sf==1 && s470==1;
             if (!eligible) g_rate_stable=0;
             else {
-                if (g_rate_candidate_tl!=tl || g_rate_candidate_handle!=cs.chan0) g_rate_stable=0;
+                if (g_rate_candidate_tl!=tl || g_rate_candidate_handle!=cs.chan0) {
+                    g_rate_stable=0;g_ui.epoch++;g_ui.result=0;
+                }
                 g_rate_candidate_tl=tl;g_rate_candidate_handle=cs.chan0;
-                if (++g_rate_stable>=2) {
+                if (g_rate_stable<2) ++g_rate_stable;
+            }
+            g_ui.ready=eligible && g_rate_stable>=2;
+            if (g_ui.pending) {
+                g_ui.pending=0;g_ui.result=-1;
+                if (g_ui.ready && g_ui_request_epoch==g_ui.epoch &&
+                    (!g_rate.phase || (g_rate_owner.timeline==tl && g_rate_owner.scene==scene_addr &&
+                     g_rate_owner.handle==cs.chan0 && rate_current(&g_rate_owner)))) {
                     PracticePitchOps ops={&g_rate_owner,rate_get,rate_set};
-                    g_rate_owner=(rate_owner_t){cs.am,cs.pv,cs.chan0,scene_addr,tl};
-                    (void)prs_begin(&g_rate,now_us,g_rate_last_native,g_rate_requested,ops,rate_current);
+                    if (!g_rate.phase && !g_rate.audio_owned)
+                        g_rate_owner=(rate_owner_t){cs.am,cs.pv,cs.chan0,scene_addr,tl};
+                    g_rate_requested=g_ui_request_percent;
+                    g_ui.result=prs_configure(&g_rate,now_us,g_rate_last_native,g_rate_requested,ops,rate_current)?1:-2;
                 }
             }
         }
@@ -1420,6 +1443,9 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
         (unsigned long long)g_rate_dtor_events,(unsigned long long)g_rate_play_events,
         atomic_load_explicit(&g_rate_badthread,memory_order_relaxed),!g_rate.ever);
     if(n>0 && (size_t)n<sizeof(line)) padd(line,(size_t)n);
+    n=snprintf(line,sizeof(line),"ui seq=%llu epoch=%llu visible=%d ready=%d pending=%d result=%d requested=%u\n",
+        (unsigned long long)task->q_seq,(unsigned long long)g_ui.epoch,g_ui.visible,g_ui.ready,g_ui.pending,g_ui.result,g_rate_requested);
+    if(n>0 && (size_t)n<sizeof(line)) padd(line,(size_t)n);
     if(g_rate.ever) pflush();
     g_read_inflight = 0;
 }
@@ -1586,7 +1612,7 @@ static void practice_clock_probe_ctor(void)
     int n;
 
     init_log_path();
-    rate_config();
+    practice_rate_ui_start();
     ident_check();
     saferead_init();
 
