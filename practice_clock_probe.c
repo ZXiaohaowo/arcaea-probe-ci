@@ -144,7 +144,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v35-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v36-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -864,6 +864,7 @@ static volatile uint64_t g_scene_gen, g_seek_deadline_mach;
  * of trusting a chart value captured while paused (t20 can keep running then). */
 static volatile int32_t g_live_offset_ms;
 static volatile int g_live_offset_valid;
+static volatile uint64_t g_sk_deadline;
 
 unsigned pcp_ab_set(unsigned which)
 {
@@ -1751,6 +1752,16 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                     if (applied || g_song_attempts>=3) g_song_started=1;
                 }
             }
+            /* v36: when A/B is armed, keep a 1x clock session alive so jumps are
+             * never skipped for lack of a session (created while natively paused). */
+            if (!g_rate.phase && paused && scene_ok && cs.chan0 && pok &&
+                (g_ab_have[0] || g_ab_have[1] || g_ab_loop)) {
+                PracticePitchOps ops={&g_rate_owner,rate_get,rate_set};
+                g_rate_owner=(rate_owner_t){cs.am,cs.pv,cs.chan0,scene_addr,tl};
+                g_rate_requested=100;
+                (void)prs_configure(&g_rate,now_us,g_rate_last_native,100,ops,rate_current);
+                g_ui.result=1;
+            }
         }
         /* ds4f v27d/v27e/v27f: publish the note scroll multiplier, keep
          * chart+0xf4 corrected, and - when the chart's baked note geometry
@@ -1869,9 +1880,25 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
         {
             int did=0, automatic=0;
             if (g_sk_pending) {
-                g_sk_pending=0;
-                if (g_ui.visible && cs.chan0) { ab_jump((void *)(uintptr_t)cs.chan0,0,0); did=1; }
-                else g_sk_skips++;
+                /* v36: keep the request until its prerequisites exist (clock
+                 * session + sampled offset + channel); it may execute while
+                 * playing after the user resumes. Bounded by a 30 s deadline. */
+                uint64_t now=mach_absolute_time();
+                if (!g_sk_deadline) g_sk_deadline=now+24000000ull*30ull;
+                if (g_ab_have[0] && g_rate.phase && g_live_offset_valid && cs.chan0) {
+                    g_sk_pending=0; g_sk_deadline=0;
+                    ab_jump((void *)(uintptr_t)cs.chan0,0,0);
+                    did=1;
+                } else if (now>=g_sk_deadline) {
+                    char wl[128];
+                    int wn;
+                    g_sk_pending=0; g_sk_deadline=0; g_sk_skips++;
+                    wn=snprintf(wl,sizeof(wl),
+                        "skw seq=%llu drop have=%d phase=%d offv=%d\n",
+                        (unsigned long long)task->q_seq,g_ab_have[0],g_rate.phase,
+                        g_live_offset_valid);
+                    if (wn>0 && (size_t)wn<sizeof(wl)) padd(wl,(size_t)wn);
+                }
             } else if (g_ab_loop && g_ab_have[0] && g_ab_have[1] &&
                        g_ab_pos[1]>g_ab_pos[0] && !g_ui.visible &&
                        g_rate.phase && g_last_pos_ok &&
@@ -1914,6 +1941,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
             }
         }
         if (g_seek_after_retry && g_rate.phase && g_last_pos_ok && cs.chan0 &&
+            g_live_offset_valid &&
             (uint32_t)g_last_pos_ms < g_ab_pos[0] &&
             mach_absolute_time() < g_seek_deadline_mach) {
             ab_jump((void *)(uintptr_t)cs.chan0,0,1);
