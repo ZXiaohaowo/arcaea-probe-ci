@@ -144,7 +144,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v32-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v33-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -852,6 +852,13 @@ static volatile int g_sk_rc_getpos, g_sk_rc_setpos, g_sk_rc_clock;
 static volatile uint32_t g_sk_pos_before, g_sk_pos_after;
 static volatile int32_t g_sk_chart_before, g_sk_chart_after;
 static volatile int g_last_chart_ms;
+/* ds4f v33 route B: the PauseLayer stores the resume/retry target at +0x2a0
+ * (constructor arg1). Cache that object + its vtable while paused; the loop
+ * "重试" mode calls its vtable slot 2 (retry) while playing, then jumps to A
+ * on the fresh chart. Slot 0 = resume (verified from the button lambdas). */
+static volatile uint64_t g_retry_obj, g_retry_vptr, g_retry_calls, g_retry_fail;
+static volatile int g_retry_valid, g_retry_pending, g_seek_after_retry;
+static volatile uint64_t g_scene_gen, g_seek_deadline_mach;
 
 unsigned pcp_ab_set(unsigned which)
 {
@@ -872,6 +879,24 @@ unsigned pcp_ab_get(unsigned which) { return which>1?0u:(unsigned)g_ab_pos[which
 unsigned pcp_ab_loop_get(void) { return (unsigned)g_ab_loop; }
 void pcp_ab_loop_set(unsigned on) { g_ab_loop=on?1:0; }
 void pcp_ab_jump(void) { g_sk_pending=1; }
+
+static int safe_read(uint64_t addr, void *dst, uint64_t len); /* defined below */
+
+static int retry_call(void)
+{
+    typedef void (*RetryFn)(void *, uint64_t);
+    uint64_t vt=0, fn=0;
+    if (!g_retry_obj || (g_retry_obj&7ull)) { g_retry_fail++; return -1; }
+    if (!safe_read(g_retry_obj,&vt,8) || vt!=g_retry_vptr) {
+        g_retry_valid=0; g_retry_fail++; return -1;
+    }
+    if (!safe_read(vt+0x10,&fn,8) || fn<0x100000000ull || fn>=0x200000000ull) {
+        g_retry_fail++; return -1;
+    }
+    ((RetryFn)(uintptr_t)fn)((void *)(uintptr_t)g_retry_obj,0);
+    g_retry_calls++;
+    return 0;
+}
 
 static void ab_jump(void *chan, unsigned which, int automatic)
 {
@@ -947,6 +972,23 @@ uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
     }
     if (tag==6) {
         ds4f_ui_probe_entry(a,lr);
+        /* v33: cache the resume/retry target object (PauseLayer+0x2a0). */
+        if (lr && (lr&7ull)==0) {
+            uint64_t obj=*(volatile uint64_t *)(uintptr_t)(lr+0x2a0ull);
+            if (obj && (obj&7ull)==0) {
+                uint64_t vt=0;
+                obj=obj;
+                vt=*(volatile uint64_t *)(uintptr_t)obj;
+                if (vt>0x100000000ull && vt<0x200000000ull) {
+                    char pl[96];
+                    int pn;
+                    g_retry_obj=obj; g_retry_vptr=vt; g_retry_valid=1;
+                    pn=snprintf(pl,sizeof(pl),"pc obj=%llx vt=%llx\n",
+                                (unsigned long long)obj,(unsigned long long)vt);
+                    if (pn>0 && (size_t)pn<sizeof(pl)) padd(pl,(size_t)pn);
+                }
+            }
+        }
         return 0;
     }
     if (tag==9) { g_scroll_build_x1=lr; return 0; }
@@ -958,7 +1000,10 @@ uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
         g_ui.epoch++;g_ui.visible=g_ui.ready=0;
         /* Scene destructor (tag4): the cached chart scalar belongs to the old
          * chart. tag5 also fires mid-song for BGM events, so it must not clear. */
-        if (tag==4) { g_scroll_gen++; scroll_cache_clear(); }
+        if (tag==4) {
+            g_scroll_gen++; scroll_cache_clear();
+            g_scene_gen++; g_retry_valid=0;
+        }
         if (tag==4) g_rate_dtor_events++; else g_rate_play_events++;
         if ((g_rate.phase || g_rate.audio_owned) &&
             ((tag==4 && a==g_rate_owner.scene) || (tag==5 && a==g_rate_owner.pv)))
@@ -1795,12 +1840,17 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                 g_sk_pending=0;
                 if (g_ui.visible && cs.chan0) { ab_jump((void *)(uintptr_t)cs.chan0,0,0); did=1; }
                 else g_sk_skips++;
-            } else if (g_ab_loop && g_ab_have[0] && g_ab_have[1] &&
+            } else if (g_ab_loop==1 && g_ab_have[0] && g_ab_have[1] &&
                        g_ab_pos[1]>g_ab_pos[0] && !g_ui.visible && cs.chan0 &&
                        g_rate.phase && g_last_pos_ok &&
                        (uint32_t)g_last_pos_ms>=g_ab_pos[1]) {
                 ab_jump((void *)(uintptr_t)cs.chan0,0,1);
                 did=1; automatic=1;
+            } else if (g_ab_loop==2 && g_ab_have[0] && g_ab_have[1] &&
+                       g_ab_pos[1]>g_ab_pos[0] && !g_ui.visible &&
+                       g_rate.phase && g_last_pos_ok &&
+                       (uint32_t)g_last_pos_ms>=g_ab_pos[1]) {
+                g_retry_pending=1;
             }
             if (did) {
                 char sl[240];
@@ -1814,6 +1864,47 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                     (unsigned long long)g_sk_skips);
                 if (sn>0 && (size_t)sn<sizeof(sl)) padd(sl,(size_t)sn);
             }
+        }
+        /* ds4f v33: retry-based loop (route B) - call the game's own retry
+         * while playing, then jump to A once the fresh session is live. */
+        if (g_retry_pending) {
+            g_retry_pending=0;
+            if (g_retry_valid) {
+                int rc=retry_call();
+                char rl[160];
+                int rn=snprintf(rl,sizeof(rl),
+                    "rt2 seq=%llu rc=%d obj=%llx vt=%llx pos=%d calls=%llu fail=%llu\n",
+                    (unsigned long long)task->q_seq, rc,
+                    (unsigned long long)g_retry_obj,(unsigned long long)g_retry_vptr,
+                    g_last_pos_ms,(unsigned long long)g_retry_calls,
+                    (unsigned long long)g_retry_fail);
+                if (rn>0 && (size_t)rn<sizeof(rl)) padd(rl,(size_t)rn);
+                if (rc==0) {
+                    g_seek_after_retry=1;
+                    g_seek_deadline_mach=mach_absolute_time()+24000000ull*20ull; /* 20 s */
+                }
+            } else {
+                g_retry_fail++;
+            }
+        }
+        if (g_seek_after_retry && g_rate.phase && g_last_pos_ok && cs.chan0 &&
+            (uint32_t)g_last_pos_ms < g_ab_pos[0] &&
+            mach_absolute_time() < g_seek_deadline_mach) {
+            ab_jump((void *)(uintptr_t)cs.chan0,0,1);
+            g_seek_after_retry=0;
+            {
+                char rl[160];
+                int rn=snprintf(rl,sizeof(rl),
+                    "sk seq=%llu act=after-retry pos=%u->%u chart=%d->%d sk=%llu lk=%llu\n",
+                    (unsigned long long)task->q_seq,
+                    (unsigned)g_sk_pos_before,(unsigned)g_sk_pos_after,
+                    g_sk_chart_before,g_sk_chart_after,
+                    (unsigned long long)g_sk_events,(unsigned long long)g_sk_loop_events);
+                if (rn>0 && (size_t)rn<sizeof(rl)) padd(rl,(size_t)rn);
+            }
+        } else if (g_seek_after_retry && mach_absolute_time()>=g_seek_deadline_mach) {
+            g_seek_after_retry=0;
+            g_retry_fail++;
         }
         sr_reads = g_sr_reads;
         sr_filt = g_sr_filtered;
@@ -1993,9 +2084,11 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     }
     if (n > 0 && (size_t)n < sizeof(line) - 64) {
         n += snprintf(line + n, sizeof(line) - (size_t)n,
-                      " ab=%d/%d/%d skc=%llu",
+                      " ab=%d/%d/%d skc=%llu rtc=%llu rtf=%llu",
                       g_ab_have[0], g_ab_have[1], g_ab_loop,
-                      (unsigned long long)(g_sk_events+g_sk_loop_events));
+                      (unsigned long long)(g_sk_events+g_sk_loop_events),
+                      (unsigned long long)g_retry_calls,
+                      (unsigned long long)g_retry_fail);
     }
     if (n > 0 && (size_t)n < sizeof(line) - 2) {
         line[n++] = '\n';
