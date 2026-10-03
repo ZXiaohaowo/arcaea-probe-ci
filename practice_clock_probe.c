@@ -144,7 +144,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v27b-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v27c-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -705,13 +705,12 @@ uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
         if (g_rate.phase && a==g_rate_owner.timeline &&
             ps_mach_us(r.mach,g_tb_numer,g_tb_denom,&now_us)) {
             int paused=(r.state & 255u)==1;
-            if ((r.valid & OBS_VALID_READS) &&
-                (*(volatile int32_t *)(uintptr_t)(a+0x30)!=0 ||
-                 *(volatile int32_t *)(uintptr_t)(a+0x34)!=0 ||
-                 *(volatile int32_t *)(uintptr_t)(a+0x38)!=0)) {
-                g_rate.errors++;
-                prs_fallback(&g_rate,now_us,(int32_t)(uint32_t)lr,paused,7);
-            }
+            /* ds4f v27c: the former t30/t34/t38 "must be zero" fallback treated a
+             * per-song sync/boundary constant as an error. On songs with t30 != 0 it
+             * fired every tick (log (20): errors grew ~120/s, any applied rate was
+             * reverted to 1x within a second). The clock model already faults on real
+             * native-time jumps and the drainer closes sessions on identity change, so
+             * no extra check is needed here; the values stay visible in the p-line. */
             return (uint32_t)prs_tick(&g_rate,now_us,(int32_t)(uint32_t)lr,paused);
         }
     }
@@ -1280,8 +1279,13 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                 safe_read(g_base+0x9237fc,&dtor_word,4) && dtor_word==0x17db8461u &&
                 safe_read(g_base+0x8e3900,&play_word,4) && play_word==0x17dc8480u;
             prep = main_ok && scene_ok && paused && f2e==0 && fresh_paused && patched;
-            live = main_ok && scene_ok && paused && f2e==1 && t30==0 && te.t34==0 &&
-                te.t38==0 && (int64_t)t20-t28>1000 && fresh_paused && patched;
+            /* ds4f v27c: t30/t34/t38 are per-song boundary/sync metadata, not error
+             * or readiness signals. Log (20) shows a legitimate song with t30=-1371,
+             * t38=1371 for the whole session; the old "all zero" live gate excluded
+             * it (ready=0 while paused) and the tag3 path below also reverted every
+             * apply. Readiness now relies on freshness, identity and position only. */
+            live = main_ok && scene_ok && paused && f2e==1 &&
+                (int64_t)t20-t28>1000 && fresh_paused && patched;
             playing = main_ok && scene_ok && !paused && f2c==0 && f2e==1 &&
                 (int64_t)t20-t28>0 && fresh_playing && patched;
 

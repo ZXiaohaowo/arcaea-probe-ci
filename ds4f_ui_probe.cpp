@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <pthread.h>
 #include <mach-o/dyld.h>
+#include <dispatch/dispatch.h>
 #include "practice_rate_ui.h"
 #include "ds4f_native_ui_profile.h"
 
@@ -96,6 +97,7 @@ struct NativePanel {
     bool open{};
     bool current() const { return pthread_main_np() && generation==g_uip_seq; }
     void row(bool show) {
+        if (!current()) return;
         static const char *names[]={"resumeButton-chinaonlylocalize",
             "retryButton-chinaonlylocalize","quitButton-chinaonlylocalize"};
         const float xs[]={256,512,1024};
@@ -164,6 +166,15 @@ void openPanel(const std::shared_ptr<NativePanel> &p)
     p->row(false);
     // Resource coordinates are 1280x960; the pause resource is 1280x720.
     setPos(p->panel,0,-120);p->open=true;
+}
+
+/* One-shot deferred row repair (see the install path). Runs on the main queue;
+ * row() re-checks the pause generation before touching any node. */
+void row_repair(void *context)
+{
+    auto *held = static_cast<std::shared_ptr<NativePanel> *>(context);
+    (*held)->row(true);
+    delete held;
 }
 
 }  // namespace
@@ -243,6 +254,15 @@ extern "C" void ds4f_ui_probe_entry(uint64_t node, uint64_t layer)
     auto addChild = (AddChildFn)vslot(overlay, kAddChildSlot);
     if (!addChild) { g_uip_install = -15; return; }
     addChild(overlay, fake);
+    /* First-pause alignment (device feedback on v27b): the second tree can still
+     * apply its own CSB position to the entry after the pre-attach setPosition
+     * above, leaving "练习" slightly off until the panel close path re-runs the
+     * row. Re-apply the row once right after the attach and once on the next
+     * main-runloop turns; row() is idempotent and re-checks its generation. */
+    panel->row(true);
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)150 * 1000000),
+                     dispatch_get_main_queue(),
+                     new std::shared_ptr<NativePanel>(panel), row_repair);
 
     g_uip_practice = (uint64_t)(uintptr_t)practice;
     g_uip_install = 1;
