@@ -145,7 +145,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v39-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "v40-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -805,7 +805,7 @@ static void *pd_apply(float ratio, void *chan)
                 uint32_t pos=0;
                 g_pd_rc_getpos=((GetPosFn)(uintptr_t)(g_base+OFF_CC_GETPOS))(chan,&pos,1);
                 if (g_pd_rc_getpos==0) {
-                    uint32_t bump=(uint32_t)((double)ratio*(double)comp+0.5);
+                    uint32_t bump=(uint32_t)((double)comp/(double)ratio+0.5);
                     g_pd_pos_before=pos; g_pd_bump=bump;
                     if (bump) {
                         g_pd_rc_setpos=((SetPosFn)(uintptr_t)(g_base+OFF_CC_SETPOS))(chan,pos+bump,1);
@@ -848,6 +848,7 @@ static volatile int32_t g_ab_chart[2];
 static volatile int g_ab_have[2];
 static volatile int g_ab_loop;
 static PracticeSeek g_seek;
+static _Atomic int g_fast_control;
 static PracticeSeekSample g_seek_sample;
 static uint64_t g_retry_generation;
 static volatile uint64_t g_sk_events, g_sk_loop_events, g_sk_skips;
@@ -895,7 +896,7 @@ unsigned pcp_ab_set(unsigned which)
 unsigned pcp_ab_have(unsigned which) { return which>1?0u:(unsigned)g_ab_have[which]; }
 unsigned pcp_ab_get(unsigned which) { return which>1?0u:(unsigned)g_ab_pos[which]; }
 unsigned pcp_ab_loop_get(void) { return (unsigned)g_ab_loop; }
-void pcp_ab_loop_set(unsigned on) { g_ab_loop=on?1:0; g_loop_suspended=0; }
+void pcp_ab_loop_set(unsigned on) { g_ab_loop=on?1:0; g_loop_suspended=0; atomic_store(&g_fast_control,1); }
 unsigned pcp_ab_jumps(void) { return (unsigned)g_sk_events; }
 unsigned pcp_seek_phase(void) { return (unsigned)g_seek.phase; }
 unsigned pcp_seek_error(void) { return (unsigned)g_seek.error; }
@@ -915,6 +916,46 @@ unsigned pcp_points_current(void) {uint32_t ms=0;return point_read_position(&ms)
 unsigned pcp_points_extent(void) {return g_points.duration?g_points.duration:g_point_extent;}
 uint64_t pcp_points_epoch(void) {return g_point_epoch;}
 unsigned pcp_loop_suspended(void) {return g_loop_suspended;}
+PracticeHUDState pcp_hud_state(void) {
+    PracticeHUDState h={.percent=100};
+    uint64_t root=0,session=0,vt=0,scene=0,tl=0,score=0,chart=0,counts0=0,counts1=0,setting=0;
+    if(!pthread_main_np() || !g_ident_ok || !rate_read64(g_base+OFF_SINGLETON,&root))return h;
+    /* Fresh root traversal, no cached UI object, no game function call. */
+    for(unsigned i=0;i<2;i++) {
+        if(!rate_read64(root+(i?OFF_SING_OBJ:OFF_SING_H140),&session) || !rate_read64(session,&vt))continue;
+        if(vt==g_base+WRAP_VT_OFF && (!rate_read64(session+OFF_WRAP_SESS,&session) || !rate_read64(session,&vt)))continue;
+        if(vt==g_base+SESS_VT_OFF)break;
+    }
+    if(vt!=g_base+SESS_VT_OFF || !rate_read64(session+OFF_SESS_SCENE,&scene) ||
+       !rate_read64(scene,&vt) || vt!=g_base+SCENE_MARKER_OFF ||
+       !rate_read64(scene+OFF_SCENE_TL,&tl) || !rate_read64(tl,&vt) || vt!=g_base+TL_MARKER_OFF ||
+       scene!=g_song_scene || tl!=g_song_timeline || g_song_bound_gen!=g_scene_gen)return h;
+    h.visible=1;
+    if(g_rate.phase && g_rate_owner.scene==scene && g_rate_owner.timeline==tl && rate_current(&g_rate_owner))
+        h.percent=g_rate.clock.percent;
+    h.pitch_attached=g_pd_attached && g_pd_chan==(void *)(uintptr_t)g_rate_owner.handle &&
+        !g_pd_rc_set && !g_pd_rc_get && fabsf(g_pd_readback-100.0f/h.percent)<0.001f;
+    /* ScoreState RTTI -> vtable 0x14e6030. +20 shiny subset, +24 Pure,
+     * +28 Far, +2c Lost. These are judgement counters, never score writes. */
+    if(rate_read64(scene+0x38,&score) && rate_read64(score,&vt) && vt==g_base+0x14e6030 &&
+       rate_read64(score+0x20,&counts0) && rate_read64(score+0x28,&counts1)) {
+        unsigned shiny=(unsigned)counts0;h.pure=(unsigned)(counts0>>32);
+        h.far=(unsigned)counts1;h.lost=(unsigned)(counts1>>32);
+        uint64_t total=(uint64_t)h.pure+h.far+h.lost;
+        if(shiny<=h.pure && total<=10000000) {
+            h.score_valid=1;h.accuracy=total?100.0*(h.pure+0.5*h.far)/total:100.0;
+        }
+    }
+    if(rate_read64(scene+0x28,&chart) && chart==g_scroll_chart && g_scroll_chart_valid &&
+       rate_read64(chart,&vt) && vt==g_base+0x14c0b08 && rate_read64(chart+0xf0,&setting)) {
+        uint32_t bits=(uint32_t)setting,baked=g_scroll_baked_scale_bits;float base=0,scale=0;
+        memcpy(&base,&bits,4);memcpy(&scale,&baked,4);
+        if(isfinite(base) && base>0 && base<=30 && isfinite(scale) && scale>=0.49f && scale<=2.01f) {
+            h.scroll_valid=1;h.current_note_speed=base*scale;h.note_speed=h.current_note_speed*h.percent/100.0;
+        }
+    }
+    return h;
+}
 int pcp_point_update(unsigned id,unsigned ms) {
     if (!pthread_main_np() || !pcp_rate_ui_state().visible || psk_busy(&g_seek) ||
         ms>=INT32_MAX || (g_points.duration && ms>=g_points.duration) ||
@@ -940,6 +981,7 @@ int pcp_point_jump(unsigned id) {
        !(g_points.mask&(1u<<id)))return 0;
     if(!ps_mach_us(mach_absolute_time(),g_tb_numer,g_tb_denom,&now) ||
        !psk_request(&g_seek,g_points.ms[id],0,g_scene_gen,now))return 0;
+    atomic_store(&g_fast_control,1);
     if(g_ab_loop && (!g_ab_have[0] || !g_ab_have[1] ||
        g_points.ms[id]<g_ab_pos[0] || g_points.ms[id]>=g_ab_pos[1]))g_loop_suspended=1;
     return 1;
@@ -977,6 +1019,7 @@ int pcp_native_retry(void) {
        ps_mach_us(mach_absolute_time(),g_tb_numer,g_tb_denom,&now)) {
         (void)psk_follow_retry(&g_seek,g_ab_pos[0],g_scene_gen,now);
     }
+    atomic_store(&g_fast_control,1);
     int rc=retry_call();
     if(rc){psk_fail(&g_seek,10);g_ab_loop=0;}
     char l[128];int n=snprintf(l,sizeof(l),"native_retry id=%llu loop=%d rc=%d gen=%llu\n",
@@ -1060,6 +1103,7 @@ uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
         /* Scene destructor (tag4): the cached chart scalar belongs to the old
          * chart. tag5 also fires mid-song for BGM events, so it must not clear. */
         if (tag==4) {
+            atomic_store(&g_fast_control,1);
             g_scroll_gen++; scroll_cache_clear();
             g_scene_gen++; g_retry_valid=0; g_live_offset_valid=0;
             if (!g_restart_preserve) {
@@ -1069,10 +1113,12 @@ uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
             }
             g_restart_preserve=0;
         }
-        if (tag==4) g_rate_dtor_events++; else g_rate_play_events++;
+        if (tag==4) g_rate_dtor_events++; else {g_rate_play_events++;atomic_store(&g_fast_control,1);}
         if ((g_rate.phase || g_rate.audio_owned) &&
-            ((tag==4 && a==g_rate_owner.scene) || (tag==5 && a==g_rate_owner.pv)))
+            ((tag==4 && a==g_rate_owner.scene) || (tag==5 && a==g_rate_owner.pv))) {
+            if(g_pd_dsp)pd_restore(); /* detach while the old channel still exists */
             prs_close(&g_rate,tag==4?2:3);
+        }
         return 0;
     }
     r.mach = mach_absolute_time();
@@ -1745,7 +1791,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
             /* v38: sample the actual consumer, excluding paused/preroll samples. */
             g_seek_sample=(PracticeSeekSample){.now_us=now_us,.generation=g_scene_gen,
                 .valid=main_ok && scene_ok && patched && time_ok,
-                .playing=playing && pos>0,.pos=pos>=0?(uint32_t)pos:0,
+                .playing=playing && pos>0,.paused=paused && f2e==1,.pos=pos>=0?(uint32_t)pos:0,
                 .consumer=(int64_t)t20-t28,.percent=g_setting_percent};
             if (playing && pos>0) {
                 int64_t off=(int64_t)t20-t28-pos;
@@ -1904,7 +1950,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
             (void)bits;
         }
         /* ds4f v28 stage 1: one-shot pitch DSP lifecycle probe while paused. */
-        if (!g_pitch_probe_done && g_ui.visible && cs.chan0) {
+        if (!g_pitch_probe_done && g_rate.phase && cs.chan0 && rate_current(&g_rate_owner)) {
             int hit=pitch_probe_run((void *)(uintptr_t)cs.chan0);
             char pl[240];
             int pn=snprintf(pl,sizeof(pl),
@@ -1922,12 +1968,14 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
             float ratio=1.0f;
             if (keep && g_rate.phase==1 && g_rate.clock.percent)
                 ratio=100.0f/(float)g_rate.clock.percent;
-            if (keep && g_rate.phase==1 && cs.chan0 && (g_pd_dsp || g_ui.visible)) {
+            if (keep && g_rate.phase==1 && cs.chan0 && rate_current(&g_rate_owner)) {
                 float before=g_pd_ratio;
                 uint64_t att0=g_pd_attach_events;
-                if (g_pd_dsp && g_pd_attached && (int)pcp_pitch_comp_get()!=g_pd_last_comp)
+                if (g_pd_dsp && ((g_pd_attached && (int)pcp_pitch_comp_get()!=g_pd_last_comp) || g_pd_chan!=(void *)(uintptr_t)cs.chan0))
                     pd_restore();   /* compensation changed: re-attach cleanly */
-                if (pd_apply(ratio,(void *)(uintptr_t)cs.chan0) &&
+                int update=!g_pd_attached || g_pd_chan!=(void *)(uintptr_t)cs.chan0 ||
+                    fabsf(g_pd_ratio-ratio)>0.0001f || g_pd_rc_set || g_pd_rc_get;
+                if (update && pd_apply(ratio,(void *)(uintptr_t)cs.chan0) &&
                     (ratio!=before || g_pd_attach_events!=att0)) {
                     char al[260];
                     int an=snprintf(al,sizeof(al),
@@ -2014,6 +2062,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                 }
             }
         }
+        atomic_store(&g_fast_control,psk_busy(&g_seek) || g_ab_loop || (g_setting_percent!=100 && !g_song_started));
         sr_reads = g_sr_reads;
         sr_filt = g_sr_filtered;
         sr_fail = g_sr_failed;
@@ -2339,8 +2388,9 @@ static void *sampler_main(void *arg)
         chain_snap_t cs;
         int n, gap;
 
-        ts.tv_sec = SAMPLE_INTERVAL_MS / 1000;
-        ts.tv_nsec = (long)(SAMPLE_INTERVAL_MS % 1000) * 1000000L;
+        int interval=atomic_load(&g_fast_control)?100:SAMPLE_INTERVAL_MS;
+        ts.tv_sec = interval / 1000;
+        ts.tv_nsec = (long)(interval % 1000) * 1000000L;
         nanosleep(&ts, NULL);
 
         now = monotonic_ms();
@@ -2381,7 +2431,7 @@ static void *sampler_main(void *arg)
             }
             if (g_ident_ok && g_read_source != NULL && cs.chan0 != 0 &&
                 (now - g_last_handle_change_ms) >= 250 &&
-                (now - g_last_enqueue_ms) >= 500 &&
+                (now - g_last_enqueue_ms) >= (uint64_t)(interval==100?80:500) &&
                 !g_read_inflight) {
                 if (__sync_bool_compare_and_swap(&g_read_inflight, 0, 1)) {
                     g_read_task.q_seq = seq;

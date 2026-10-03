@@ -17,6 +17,32 @@ int psk_request(PracticeSeek *s,uint32_t target,int automatic,uint64_t gen,uint6
 }
 int psk_poll(PracticeSeek *s,PracticeSeekSample x) {
     if(!psk_busy(s)) return PSK_NONE;
+    /* Only a confirmed pause in the bound scene suspends the transaction.
+     * Missing reads and destroyed/replaced scenes still fail normally. */
+    if(s->phase>=PSK_READY && x.generation!=s->generation) {psk_fail(s,2);return PSK_ERROR;}
+    if(x.valid && x.paused && s->phase>=PSK_READY) {
+        if(s->phase==PSK_VERIFY) {
+            if(!s->pause_us) {
+                int64_t expected=(int64_t)s->verify_origin+(int64_t)((x.now_us-s->located_us)*s->percent/100000);
+                if((int64_t)x.pos<(int64_t)s->previous_pos-50 || (int64_t)x.pos>expected+250) {psk_fail(s,4);return PSK_ERROR;}
+                s->pause_pos=x.pos;
+            } else if(llabs((int64_t)x.pos-s->pause_pos)>50) {psk_fail(s,4);return PSK_ERROR;}
+        }
+        if(!s->pause_us)s->pause_us=x.now_us;
+        if(s->last_us && x.now_us>=s->last_us)s->deadline+=x.now_us-s->last_us;
+        s->last_us=x.now_us;s->stable=0;return PSK_NONE;
+    }
+    if(s->pause_us && x.valid && x.playing) {
+        uint64_t dt=x.now_us>=s->last_us?x.now_us-s->last_us:0;
+        s->deadline+=dt;
+        if(s->phase==PSK_VERIFY) {
+            int64_t advance=(int64_t)x.pos-s->pause_pos;
+            if(advance< -50 || advance>(int64_t)(dt*s->percent/100000)+250) {psk_fail(s,4);return PSK_ERROR;}
+            s->verify_origin=x.pos;s->located_us=x.now_us;s->verified=0;
+        }
+        s->pause_us=0;
+    }
+    s->last_us=x.now_us;
     if(x.now_us>=s->deadline) {psk_fail(s,1);return PSK_ERROR;}
     if(s->phase==PSK_QUEUED) {
         if(x.generation!=s->origin) {psk_fail(s,2);return PSK_ERROR;}
@@ -39,16 +65,17 @@ int psk_poll(PracticeSeek *s,PracticeSeekSample x) {
         else s->stable++;
         s->previous_pos=x.pos;s->offset=(int32_t)offset;
         if(s->stable>=3) {
-            s->percent=x.percent;s->phase=PSK_VERIFY;s->located_us=x.now_us;
+            s->percent=x.percent;s->phase=PSK_VERIFY;s->located_us=x.now_us;s->verify_origin=s->target;s->previous_pos=s->target;
             s->deadline=x.now_us+8000000;return PSK_LOCATE;
         }
     } else if(s->phase==PSK_VERIFY) {
         if(x.now_us<s->located_us || x.percent!=s->percent) {psk_fail(s,3);return PSK_ERROR;}
-        int64_t expected=(int64_t)s->target+(int64_t)((x.now_us-s->located_us)*s->percent/100000);
+        int64_t expected=(int64_t)s->verify_origin+(int64_t)((x.now_us-s->located_us)*s->percent/100000);
         if(llabs((int64_t)x.pos-expected)>250 || llabs(offset-s->offset)>150) {
             psk_fail(s,4);return PSK_ERROR;
         }
-        if(++s->verified>=2) {s->phase=PSK_DONE;return PSK_SUCCESS;}
+        s->previous_pos=x.pos;
+        if(++s->verified>=2 && x.now_us-s->located_us>=1500000) {s->phase=PSK_DONE;return PSK_SUCCESS;}
     }
     return PSK_NONE;
 }

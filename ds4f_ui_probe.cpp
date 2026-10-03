@@ -100,9 +100,9 @@ struct NativePanel {
         if (!current()) return;
         static const char *names[]={"resumeButton-chinaonlylocalize",
             "retryButton-chinaonlylocalize","quitButton-chinaonlylocalize"};
-        const float xs[]={256,512,1024};
+        const float xs[]={190,490,1090};
         for(int i=0;i<3;i++) setPos(getChild(overlay,names[i]),xs[i],show?300.0f:-30000.0f);
-        setPos(entry,768,show?300.0f:-30000.0f);
+        setPos(entry,790,show?300.0f:-30000.0f);
         setPos(getChild(overlay,"pauseText"),640,show?366.38f:-30000.0f);
     }
     void refresh() {
@@ -283,12 +283,12 @@ extern "C" void ds4f_ui_probe_entry(uint64_t node, uint64_t layer)
         void *n = getChild(fake, name);
         if (n) setPos(n, 0.0f, -30000.0f);
     }
-    setPos(practice, 768.0f, 300.0f);
+    setPos(practice, 790.0f, 300.0f);
 
     /* four-slot native row: 256 / 512 / 768 (practice) / 1024 */
-    if (void *r = getChild(overlay, "resumeButton-chinaonlylocalize")) setPos(r, 256.0f, 300.0f);
-    if (void *r = getChild(overlay, "retryButton-chinaonlylocalize")) setPos(r, 512.0f, 300.0f);
-    if (void *r = getChild(overlay, "quitButton-chinaonlylocalize")) setPos(r, 1024.0f, 300.0f);
+    if (void *r = getChild(overlay, "resumeButton-chinaonlylocalize")) setPos(r, 190.0f, 300.0f);
+    if (void *r = getChild(overlay, "retryButton-chinaonlylocalize")) setPos(r, 490.0f, 300.0f);
+    if (void *r = getChild(overlay, "quitButton-chinaonlylocalize")) setPos(r, 1090.0f, 300.0f);
 
     auto panel=std::make_shared<NativePanel>();
     panel->overlay=overlay;panel->entry=practice;panel->generation=g_uip_seq;

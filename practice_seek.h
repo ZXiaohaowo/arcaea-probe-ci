@@ -5,13 +5,13 @@ enum { PSK_IDLE, PSK_QUEUED, PSK_NEW, PSK_READY, PSK_VERIFY, PSK_DONE, PSK_FAILE
 enum { PSK_NONE, PSK_RESTART, PSK_LOCATE, PSK_SUCCESS, PSK_ERROR };
 typedef struct {
     int phase, automatic, error, stable, verified;
-    uint32_t target, previous_pos, percent;
+    uint32_t target, previous_pos, percent, verify_origin, pause_pos;
     int32_t offset;
-    uint64_t id, generation, origin, deadline, located_us;
+    uint64_t id, generation, origin, deadline, located_us, pause_us, last_us;
 } PracticeSeek;
 typedef struct {
     uint64_t now_us, generation;
-    int valid, playing, can_restart;
+    int valid, playing, can_restart, paused;
     uint32_t pos, percent;
     int64_t consumer;
 } PracticeSeekSample;

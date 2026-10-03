@@ -10,6 +10,23 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     UIView *hit=[super hitTest:p withEvent:e];return hit==self?nil:hit;
 }
 @end
+@interface PTBackdrop : UIView @end
+@implementation PTBackdrop
+- (void)drawRect:(CGRect)rect {
+    CGContextRef c=UIGraphicsGetCurrentContext();
+    CGColorSpaceRef space=CGColorSpaceCreateDeviceRGB();
+    CGFloat colors[]={0.12,0.08,0.28,0.92, 0.24,0.16,0.43,0.88, 0.10,0.07,0.23,0.94};
+    CGFloat stops[]={0,0.5,1};CGGradientRef g=CGGradientCreateWithColorComponents(space,colors,stops,3);
+    CGContextDrawLinearGradient(c,g,CGPointZero,CGPointMake(0,rect.size.height),0);CGGradientRelease(g);CGColorSpaceRelease(space);
+    CGContextSetStrokeColorWithColor(c,[UIColor colorWithRed:0.77 green:0.67 blue:1 alpha:0.12].CGColor);
+    CGContextSetLineWidth(c,1);
+    for(int i=0;i<9;i++) {
+        CGFloat x=rect.size.width/2+(i-4)*32,y=rect.size.height*0.48,h=42+(i%3)*24;
+        CGContextMoveToPoint(c,x,y-h);CGContextAddLineToPoint(c,x+25,y);
+        CGContextAddLineToPoint(c,x,y+h);CGContextAddLineToPoint(c,x-25,y);CGContextClosePath(c);CGContextStrokePath(c);
+    }
+}
+@end
 @interface PTHexButton : UIButton @end
 @implementation PTHexButton
 - (void)drawRect:(CGRect)rect {
@@ -24,6 +41,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     [[UIColor colorWithRed:0.38 green:0.30 blue:0.59 alpha:self.selected?0.8:0.35] setFill];[p fill];
     [[UIColor colorWithWhite:1 alpha:self.selected?1:0.65] setStroke];p.lineWidth=self.selected?2:1;[p stroke];
 }
+- (void)setEnabled:(BOOL)v {[super setEnabled:v];self.alpha=v?1:0.32;[self setNeedsDisplay];}
 - (void)setSelected:(BOOL)s {[super setSelected:s];[self setNeedsDisplay];}
 @end
 @interface PTTimeline : UIView
@@ -40,7 +58,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     [s drawAtPoint:CGPointMake(MAX(0,MIN(self.bounds.size.width-w,x-w/2)),y) withAttributes:a];
 }
 - (void)drawRect:(CGRect)rect {
-    CGContextRef c=UIGraphicsGetCurrentContext();CGFloat w=self.bounds.size.width,y=65;
+    CGContextRef c=UIGraphicsGetCurrentContext();CGFloat w=self.bounds.size.width,y=101;
     if((self.points.mask&3)==3 && self.points.ms[1]>self.points.ms[0]) {
         [[UIColor colorWithRed:0.65 green:0.5 blue:1 alpha:0.22] setFill];
         UIRectFill(CGRectMake([self xFor:self.points.ms[0]],y-16,[self xFor:self.points.ms[1]]-[self xFor:self.points.ms[0]],32));
@@ -52,20 +70,27 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
         [self drawText:PTTime((unsigned)((uint64_t)self.extent*i/4)) x:x y:118 color:[UIColor colorWithWhite:1 alpha:0.55]];
     }
     for(unsigned i=0;i<5;i++) if(self.points.mask&(1u<<i)) {
-        CGFloat x=[self xFor:self.points.ms[i]],labelY=i%2?87:12;
+        CGFloat x=[self xFor:self.points.ms[i]],labelY=4+i*18;
         UIColor *color=self.selected==(NSInteger)i?[UIColor colorWithRed:0.7 green:0.87 blue:1 alpha:1]:UIColor.whiteColor;
-        CGContextSetStrokeColorWithColor(c,color.CGColor);CGContextMoveToPoint(c,x,y);CGContextAddLineToPoint(c,x,i%2?85:40);CGContextStrokePath(c);
+        CGContextSetStrokeColorWithColor(c,color.CGColor);CGContextMoveToPoint(c,x,y);CGContextAddLineToPoint(c,x,labelY+16);CGContextStrokePath(c);
         UIBezierPath *d=[UIBezierPath bezierPath];[d moveToPoint:CGPointMake(x,y-7)];[d addLineToPoint:CGPointMake(x+7,y)];[d addLineToPoint:CGPointMake(x,y+7)];[d addLineToPoint:CGPointMake(x-7,y)];[d closePath];[color setFill];[d fill];
         [self drawText:[NSString stringWithFormat:@"%@ %@",PTName(i),PTTime(self.points.ms[i])] x:x y:labelY color:color];
     }
     CGFloat currentX=[self xFor:self.current];
     CGContextSetStrokeColorWithColor(c,[UIColor colorWithRed:0.5 green:0.95 blue:0.87 alpha:1].CGColor);
-    CGContextSetLineWidth(c,2);CGContextMoveToPoint(c,currentX,46);CGContextAddLineToPoint(c,currentX,81);CGContextStrokePath(c);
-    [self drawText:@"C" x:currentX y:43 color:[UIColor colorWithRed:0.5 green:0.95 blue:0.87 alpha:1]];
+    CGContextSetLineWidth(c,2);CGContextMoveToPoint(c,currentX,90);CGContextAddLineToPoint(c,currentX,112);CGContextStrokePath(c);
+    [self drawText:@"C" x:currentX y:94 color:[UIColor colorWithRed:0.5 green:0.95 blue:0.87 alpha:1]];
 }
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     CGPoint p=[touches.anyObject locationInView:self];NSInteger best=-1;CGFloat distance=26;
-    for(unsigned i=0;i<5;i++)if(self.points.mask&(1u<<i)) {
+    if(p.y<96) {
+        for(unsigned i=0;i<5;i++) if(self.points.mask&(1u<<i)) {
+            NSString *label=[NSString stringWithFormat:@"%@ %@",PTName(i),PTTime(self.points.ms[i])];
+            CGFloat width=[label sizeWithAttributes:@{NSFontAttributeName:[UIFont monospacedDigitSystemFontOfSize:14 weight:UIFontWeightMedium]}].width;
+            CGFloat left=MAX(0,MIN(self.bounds.size.width-width,[self xFor:self.points.ms[i]]-width/2));
+            if(CGRectContainsPoint(CGRectMake(left,4+i*18,width,18),p)){best=i;break;}
+        }
+    } else for(unsigned i=0;i<5;i++)if(self.points.mask&(1u<<i)) {
         CGFloat d=fabs(p.x-[self xFor:self.points.ms[i]]);
         if(d<distance || (d==distance && self.selected==(NSInteger)i)) {distance=d;best=i;}
     }
@@ -77,18 +102,18 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     PracticePoints _edit;
 }
 @property(nonatomic,strong) PCPRateOverlay *overlay;
-@property(nonatomic,strong) UIView *panel,*editBox;
+@property(nonatomic,strong) UIView *panel,*editBox,*curtain,*keypad;
 @property(nonatomic,strong) UIButton *entry,*apply,*reset,*noteMode,*pitchMode,*loop,*jump,*addT,*removeT,*close;
 @property(nonatomic,strong) NSMutableArray<UIButton *> *chips,*editButtons,*captureButtons;
-@property(nonatomic,strong) UILabel *value,*status,*selection,*rangeLabel,*compLabel;
+@property(nonatomic,strong) UILabel *value,*status,*selection,*rangeLabel,*compLabel,*speedHUD,*accHUD,*noteSpeeds;
 @property(nonatomic,strong) UISlider *slider;
-@property(nonatomic,strong) UITextField *milliseconds;
+@property(nonatomic,strong) UILabel *milliseconds;
 @property(nonatomic,strong) PTTimeline *axis;
 @property(nonatomic,strong) NSTimer *timer;
 @property(nonatomic) NSInteger draft,selected;
 @property(nonatomic) uint64_t epoch,lastOpenSeq,pointEpoch;
 @property(nonatomic) NSTimeInterval messageUntil;
-@property(nonatomic) CGFloat keyboardHeight;
+@property(nonatomic) BOOL replaceDigits;
 @end
 @implementation PCPRatePanel
 - (UILabel *)label:(CGFloat)size frame:(CGRect)frame text:(NSString *)text {
@@ -105,10 +130,13 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
 - (void)message:(NSString *)s {self.status.text=s;self.messageUntil=CFAbsoluteTimeGetCurrent()+3;}
 - (void)build {
     self.selected=-1;self.overlay=[PCPRateOverlay new];
-    self.panel=[UIView new];self.panel.hidden=YES;
-    self.panel.backgroundColor=[UIColor colorWithRed:0.13 green:0.10 blue:0.25 alpha:0.97];
-    self.panel.layer.borderColor=[UIColor colorWithWhite:1 alpha:0.6].CGColor;self.panel.layer.borderWidth=1;
+    self.curtain=[PTBackdrop new];self.curtain.hidden=YES;[self.overlay addSubview:self.curtain];
+    self.panel=[UIView new];self.panel.hidden=YES;self.panel.backgroundColor=UIColor.clearColor;
     [self.overlay addSubview:self.panel];
+    for(NSNumber *n in @[@66,@211,@388,@508,@624]) {
+        UIView *line=[[UIView alloc] initWithFrame:CGRectMake(20,n.doubleValue,960,0.7)];
+        line.backgroundColor=[UIColor colorWithWhite:1 alpha:0.35];[self.panel addSubview:line];
+    }
     [self label:26 frame:CGRectMake(32,18,200,40) text:@"练习设置"];
     self.close=[self button:@"关闭 ×" frame:CGRectMake(850,18,118,40) action:@selector(toggle)];
     self.value=[self label:30 frame:CGRectMake(32,78,150,42) text:@"1.00x"];
@@ -122,7 +150,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     for(int i=0;i<4;i++){UIButton *b=[self button:names[i] frame:CGRectMake(32+i*99,134,91,40) action:@selector(step:)];b.tag=deltas[i];}
     self.noteMode=[self button:@"Note 同步变速" frame:CGRectMake(446,134,254,40) action:@selector(noteTap)];
     self.pitchMode=[self button:@"音高 随速" frame:CGRectMake(716,134,252,40) action:@selector(pitchTap)];
-    [self label:13 frame:CGRectMake(32,179,500,25) text:@"倍率 0.50–2.00x · Note 模式重试后生效"];
+    self.noteSpeeds=[self label:13 frame:CGRectMake(32,179,660,27) text:@"CurrentNoteSpeed --   ·   NoteSpeed --"];
     UIButton *minus=[self button:@"−5ms" frame:CGRectMake(706,179,74,28) action:@selector(comp:)];minus.tag=-5;
     self.compLabel=[self label:12 frame:CGRectMake(782,179,110,28) text:@"补偿 0ms"];
     UIButton *plus=[self button:@"+5ms" frame:CGRectMake(894,179,74,28) action:@selector(comp:)];plus.tag=5;
@@ -131,19 +159,19 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     __weak PCPRatePanel *weakSelf=self;self.axis.choose=^(NSUInteger i){[weakSelf choose:i];};[self.panel addSubview:self.axis];
     self.chips=[NSMutableArray array];
     for(int i=0;i<5;i++){UIButton *b=[self button:PTName(i) frame:CGRectMake(32+i*190,395,176,48) action:@selector(chip:)];b.tag=i;[self.chips addObject:b];}
-    UIButton *a=[self button:@"C → 设 A" frame:CGRectMake(32,458,142,42) action:@selector(capture:)];a.tag=0;
-    UIButton *b=[self button:@"C → 设 B" frame:CGRectMake(186,458,142,42) action:@selector(capture:)];b.tag=1;
+    UIButton *a=[self button:@"设置 A" frame:CGRectMake(32,458,172,42) action:@selector(capture:)];a.tag=0;
+    UIButton *b=[self button:@"设置 B" frame:CGRectMake(220,458,172,42) action:@selector(capture:)];b.tag=1;
     self.captureButtons=[NSMutableArray arrayWithObjects:a,b,nil];
-    self.addT=[self button:@"C → 新增 T" frame:CGRectMake(340,458,154,42) action:@selector(addBookmark)];
-    self.removeT=[self button:@"删除选中 T" frame:CGRectMake(506,458,154,42) action:@selector(deletePoint)];
-    self.loop=[self button:@"循环 关" frame:CGRectMake(676,458,292,42) action:@selector(loopTap)];
+    self.addT=[self button:@"新增 T" frame:CGRectMake(408,458,172,42) action:@selector(addBookmark)];
+    self.loop=[self button:@"A/B 循环-关" frame:CGRectMake(612,458,356,42) action:@selector(loopTap)];
     self.selection=[self label:18 frame:CGRectMake(32,518,936,32) text:@"点击 A / B / T 选中，再次点击编辑"];
     self.jump=[self button:@"选中点位后跳转" frame:CGRectMake(250,562,500,48) action:@selector(jumpTap)];
     self.editBox=[[UIView alloc] initWithFrame:CGRectMake(32,512,936,108)];self.editBox.hidden=YES;[self.panel addSubview:self.editBox];
-    self.milliseconds=[[UITextField alloc] initWithFrame:CGRectMake(0,0,230,44)];
+    self.milliseconds=[[UILabel alloc] initWithFrame:CGRectMake(0,0,230,44)];
     self.milliseconds.textColor=UIColor.whiteColor;self.milliseconds.backgroundColor=[UIColor colorWithWhite:1 alpha:0.1];
     self.milliseconds.font=[UIFont monospacedDigitSystemFontOfSize:24 weight:UIFontWeightMedium];
-    self.milliseconds.textAlignment=NSTextAlignmentCenter;self.milliseconds.keyboardType=UIKeyboardTypeNumberPad;
+    self.milliseconds.textAlignment=NSTextAlignmentCenter;self.milliseconds.userInteractionEnabled=YES;
+    [self.milliseconds addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(openDigits)]];
     [self.editBox addSubview:self.milliseconds];
     UILabel *unit=[[UILabel alloc] initWithFrame:CGRectMake(235,0,60,44)];unit.text=@"ms";unit.textColor=UIColor.whiteColor;[self.editBox addSubview:unit];
     int steps[]={-1000,-100,100,1000};self.editButtons=[NSMutableArray array];
@@ -155,20 +183,36 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     [confirm removeFromSuperview];[self.editBox addSubview:confirm];
     UIButton *cancel=[self button:@"取消" frame:CGRectMake(536,58,220,44) action:@selector(cancelEdit)];
     [cancel removeFromSuperview];[self.editBox addSubview:cancel];
-    UIToolbar *toolbar=[[UIToolbar alloc] initWithFrame:CGRectMake(0,0,500,44)];
-    toolbar.items=@[[[UIBarButtonItem alloc] initWithTitle:@"取消" style:UIBarButtonItemStylePlain target:self action:@selector(cancelEdit)],
-        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace target:nil action:nil],
-        [[UIBarButtonItem alloc] initWithTitle:@"确认时间" style:UIBarButtonItemStyleDone target:self action:@selector(confirmEdit)]];
-    self.milliseconds.inputAccessoryView=toolbar;
+    self.removeT=[self button:@"删除 T" frame:CGRectMake(0,58,220,44) action:@selector(deletePoint)];
+    [self.removeT removeFromSuperview];[self.editBox addSubview:self.removeT];
+    self.keypad=[[PTBackdrop alloc] initWithFrame:CGRectMake(256,244,488,256)];self.keypad.hidden=YES;
+    [self.panel addSubview:self.keypad];
+    NSArray *keys=@[@"1",@"2",@"3",@"4",@"5",@"6",@"7",@"8",@"9",@"清空",@"0",@"退格"];
+    for(int i=0;i<12;i++) {
+        UIButton *key=[self button:keys[i] frame:CGRectMake(12+(i%3)*158,8+(i/3)*61,148,53) action:@selector(digit:)];
+        key.tag=i;[key removeFromSuperview];[self.keypad addSubview:key];
+    }
     self.status=[self label:14 frame:CGRectMake(32,632,936,28) text:@"先选择点位，再跳转；跳转会重试并开始练习"];
     self.entry=[self button:@"倍率 1.00x" frame:CGRectZero action:@selector(toggle)];[self.entry removeFromSuperview];[self.overlay addSubview:self.entry];
-    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(keyboard:) name:UIKeyboardWillChangeFrameNotification object:nil];
+    self.speedHUD=[self label:20 frame:CGRectZero text:@"SPEED 1.00x"];
+    self.accHUD=[self label:20 frame:CGRectZero text:@"ACC --"];
+    for(UILabel *l in @[self.speedHUD,self.accHUD]) {
+        [l removeFromSuperview];[self.overlay addSubview:l];l.textAlignment=NSTextAlignmentRight;
+        l.layer.shadowColor=UIColor.blackColor.CGColor;l.layer.shadowOpacity=0.65;l.layer.shadowRadius=3;l.layer.shadowOffset=CGSizeMake(0,1);
+    }
     self.draft=pcp_rate_ui_stored_percent();[self updateDraft];
 }
-- (void)keyboard:(NSNotification *)n {
-    UIWindow *w=self.overlay.window;
-    CGRect rect=[w convertRect:[n.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue] fromWindow:nil];
-    self.keyboardHeight=CGRectIntersectsRect(w.bounds,rect)?CGRectGetMaxY(w.bounds)-CGRectGetMinY(rect):0;
+- (void)openDigits {self.keypad.hidden=!self.keypad.hidden;self.replaceDigits=YES;}
+- (void)digit:(UIButton *)b {
+    NSString *s=self.milliseconds.text?:@"0";
+    if(b.tag==9)s=@"0";
+    else if(b.tag==11)s=s.length>1?[s substringToIndex:s.length-1]:@"0";
+    else {
+        NSString *digit=b.tag==10?@"0":[NSString stringWithFormat:@"%ld",(long)b.tag+1];
+        s=(self.replaceDigits || [s isEqualToString:@"0"])?digit:[s stringByAppendingString:digit];
+        if(s.length>10){[self message:@"最多输入 10 位毫秒数"];return;}
+    }
+    self.replaceDigits=NO;self.milliseconds.text=s;
 }
 - (void)updateDraft {self.draft=MAX(50,MIN(200,self.draft));self.value.text=[NSString stringWithFormat:@"%.2fx",self.draft/100.0];self.slider.value=self.draft;}
 - (void)slide:(UISlider *)s {self.draft=lroundf(s.value);[self updateDraft];}
@@ -187,7 +231,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     for(unsigned i=2;i<5;i++)if(!(p.mask&(1u<<i))){if(pcp_point_capture(i)){self.selected=i;[self message:[NSString stringWithFormat:@"已添加 %@",PTName(i)]];}return;}
     [self message:@"三个 T 点已满，可编辑或删除已有点"];
 }
-- (void)deletePoint {if(self.selected>=2 && pcp_point_delete((unsigned)self.selected)){self.selected=-1;[self message:@"已删除书签，其他编号保留"];}}
+- (void)deletePoint {if(self.selected>=2 && pcp_point_delete((unsigned)self.selected)){[self cancelEdit];self.selected=-1;[self message:@"已删除书签，其他编号保留"];}}
 - (void)choose:(NSUInteger)i {
     if(!self.editBox.hidden || (pcp_seek_phase()>=1 && pcp_seek_phase()<=4))return;
     PracticePoints p=pcp_points_snapshot();if(!(p.mask&(1u<<i)))return;
@@ -196,7 +240,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     _edit.duration=p.duration?p.duration-1:pcp_points_extent();
     if(pp_select(&_edit,(unsigned)i)!=2)return;
     self.milliseconds.text=[NSString stringWithFormat:@"%u",_edit.draft];
-    self.editBox.hidden=NO;self.jump.hidden=self.selection.hidden=YES;
+    self.editBox.hidden=NO;self.jump.hidden=self.selection.hidden=YES;self.removeT.hidden=i<2;self.keypad.hidden=YES;
 }
 - (void)chip:(UIButton *)b {[self choose:(NSUInteger)b.tag];}
 - (BOOL)readInput {
@@ -213,7 +257,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     if(![self readInput] || !pcp_point_update((unsigned)self.selected,_edit.draft)){[self message:@"时间超出范围或会话已变化，尚未保存"];return;}
     [self cancelEdit];[self message:@"时间已更新"];
 }
-- (void)cancelEdit {[_milliseconds resignFirstResponder];_edit.editing=0;self.editBox.hidden=YES;self.jump.hidden=self.selection.hidden=NO;}
+- (void)cancelEdit {self.keypad.hidden=YES;_edit.editing=0;self.editBox.hidden=YES;self.jump.hidden=self.selection.hidden=NO;}
 - (void)jumpTap {
     if(self.selected>=0 && pcp_point_jump((unsigned)self.selected)){[self message:@"正在重试并定位…"];[self.panel endEditing:YES];}
     else [self message:@"无法提交跳转，请保持暂停并选中点位"];
@@ -228,27 +272,36 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
 }
 - (void)tick {
     PracticeRateUIState s=pcp_rate_ui_state();UIWindow *w=[self gameWindow];
-    if(!w || UIApplication.sharedApplication.applicationState!=UIApplicationStateActive){[self cancelEdit];self.overlay.hidden=YES;return;}
+    if(!w || UIApplication.sharedApplication.applicationState!=UIApplicationStateActive){[self cancelEdit];self.overlay.hidden=YES;self.curtain.hidden=YES;return;}
     if(self.overlay.superview!=w){[self.overlay removeFromSuperview];[w addSubview:self.overlay];}
     self.overlay.frame=w.bounds;[w bringSubviewToFront:self.overlay];self.overlay.hidden=NO;
-    self.entry.hidden=!s.visible; // existing in-game badge remains pause-scoped
+    PracticeHUDState hud=pcp_hud_state();
+    self.speedHUD.hidden=self.accHUD.hidden=!hud.visible || !self.panel.hidden;
+    CGFloat hudW=MIN(240,w.bounds.size.width*0.23),hudX=w.bounds.size.width-w.safeAreaInsets.right-hudW-20;
+    self.speedHUD.frame=CGRectMake(hudX,w.bounds.size.height*0.31,hudW,34);
+    self.accHUD.frame=CGRectMake(hudX,w.bounds.size.height*0.58,hudW,34);
+    self.speedHUD.text=[NSString stringWithFormat:@"SPEED %.2fx",hud.percent/100.0];
+    self.accHUD.text=hud.score_valid?[NSString stringWithFormat:@"ACC %.2f%%",hud.accuracy]:@"ACC --";
+    self.entry.hidden=!s.visible;
     self.entry.frame=CGRectMake(w.bounds.size.width-w.safeAreaInsets.right-162,w.safeAreaInsets.top+12,150,40);
     [self.entry setTitle:[NSString stringWithFormat:@"倍率 %.2fx",s.applied/100.0] forState:UIControlStateNormal];
-    if(!s.visible){self.panel.hidden=YES;[self cancelEdit];return;}
+    if(!s.visible){self.panel.hidden=YES;self.curtain.hidden=YES;self.speedHUD.hidden=self.accHUD.hidden=!hud.visible;[self cancelEdit];return;}
     if(self.epoch!=s.epoch){self.panel.hidden=YES;[self cancelEdit];}self.epoch=s.epoch;
     if(s.open_seq!=self.lastOpenSeq){self.lastOpenSeq=s.open_seq;self.panel.hidden=NO;self.draft=pcp_rate_ui_stored_percent();[self updateDraft];}
     if(self.pointEpoch!=pcp_points_epoch()){self.pointEpoch=pcp_points_epoch();self.selected=-1;[self cancelEdit];}
-    CGFloat h=w.bounds.size.height-w.safeAreaInsets.top-MAX(w.safeAreaInsets.bottom,self.keyboardHeight)-24;
+    CGFloat h=w.bounds.size.height-w.safeAreaInsets.top-w.safeAreaInsets.bottom-24;
     CGFloat width=w.bounds.size.width-w.safeAreaInsets.left-w.safeAreaInsets.right-24;
     CGFloat scale=MAX(0.3,MIN(1,MIN(width/1000,h/680)));
     self.panel.transform=CGAffineTransformIdentity;self.panel.bounds=CGRectMake(0,0,1000,680);
     self.panel.transform=CGAffineTransformMakeScale(scale,scale);
     self.panel.center=CGPointMake(w.bounds.size.width/2,w.safeAreaInsets.top+12+h/2);
+    self.curtain.frame=w.bounds;self.curtain.hidden=self.panel.hidden;
     unsigned phase=pcp_seek_phase();BOOL busy=phase>=1 && phase<=4,editing=!self.editBox.hidden;
     self.apply.enabled=self.reset.enabled=s.ready&&!s.pending&&!busy&&!editing;self.slider.enabled=!s.pending&&!busy&&!editing;
     self.noteMode.enabled=self.pitchMode.enabled=!busy&&!editing;
     [self.noteMode setTitle:pcp_note_mode_get()?@"Note 流速不变":@"Note 同步变速" forState:UIControlStateNormal];
-    [self.pitchMode setTitle:pcp_pitch_mode_get()?@"音高 保持":@"音高 随速" forState:UIControlStateNormal];
+    [self.pitchMode setTitle:pcp_pitch_mode_get()?(hud.pitch_attached || hud.percent==100?@"音高 保持":@"音高 保持 · 待挂接"):@"音高 随速" forState:UIControlStateNormal];
+    self.noteSpeeds.text=hud.scroll_valid?[NSString stringWithFormat:@"CurrentNoteSpeed %.2f × SPEED %.2f = NoteSpeed %.2f",hud.current_note_speed,hud.percent/100.0,hud.note_speed]:@"CurrentNoteSpeed --   ·   NoteSpeed --";
     self.compLabel.text=[NSString stringWithFormat:@"补偿 %ums",pcp_pitch_comp_get()];
     PracticePoints p=pcp_points_snapshot();unsigned extent=MAX(1u,pcp_points_extent()),current=pcp_points_current();
     self.axis.points=p;self.axis.extent=extent;self.axis.current=current;self.axis.selected=self.selected;self.axis.userInteractionEnabled=!busy&&!editing;[self.axis setNeedsDisplay];
@@ -261,14 +314,16 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     self.selection.text=has?[NSString stringWithFormat:@"选中 %@ · %@ · %u ms   再次点击可编辑",PTName(self.selected),PTTime(p.ms[self.selected]),p.ms[self.selected]]:@"点击轴上或下方的 A / B / T 选中，再次点击编辑";
     [self.jump setTitle:has?[NSString stringWithFormat:@"跳转到 %@ · %@",PTName(self.selected),PTTime(p.ms[self.selected])]:@"选中点位后跳转" forState:UIControlStateNormal];
     self.jump.enabled=has&&!busy&&!editing;self.jump.alpha=self.jump.enabled?1:0.45;
-    self.removeT.enabled=has&&self.selected>=2&&!busy&&!editing;
+    self.removeT.enabled=has&&self.selected>=2&&!busy&&editing;
     self.addT.enabled=!busy&&!editing&&((p.mask&28)!=28);
     for(UIButton *b in self.captureButtons)b.enabled=!busy&&!editing;
     self.loop.enabled=!busy&&!editing;
-    NSString *loopTitle=!pcp_ab_loop_get()?@"循环 关":pcp_loop_suspended()?@"循环 暂挂 · 点击恢复":(p.mask&3)!=3?@"循环 待设 A/B":p.ms[1]<=p.ms[0]?@"循环 待命 · B 须在 A 后":@"循环 开（重试）";
+    NSString *loopTitle=pcp_ab_loop_get()?@"A/B 循环-开":@"A/B 循环-关";
+    if(pcp_loop_suspended())loopTitle=@"A/B 循环-开 · 已暂挂";
+    else if(pcp_ab_loop_get() && ((p.mask&3)!=3 || p.ms[1]<=p.ms[0]))loopTitle=@"A/B 循环-开 · 请设置 A < B";
     [self.loop setTitle:loopTitle forState:UIControlStateNormal];
-    if(busy)self.status.text=phase==1?@"等待跳转条件…":phase==2?@"正在重试，等待新会话…":phase==3?@"等待预备段结束并定位…":@"验证音频与谱面位置…";
+    if(busy)self.status.text=phase==1?@"等待跳转条件…":phase==2?@"正在重试，等待新会话…":phase==3?@"等待预备段结束并定位…":(s.visible?@"已暂停，恢复播放后继续确认":@"正在确认跳转位置…");
     else if(CFAbsoluteTimeGetCurrent()>self.messageUntil)
-        self.status.text=phase==6?[NSString stringWithFormat:@"跳转未通过验证 (%u)，循环已停止",pcp_seek_error()]:phase==5?@"跳转读回验证通过 · 段落是否可打仍以实际游玩为准":@"选点 → 再点编辑 · 跳转会重试并开始练习";
+        self.status.text=phase==6?[NSString stringWithFormat:@"跳转未通过验证 (%u)，循环已停止",pcp_seek_error()]:phase==5?@"已跳转 · 可继续练习":@"选点 → 再点编辑 · 跳转会重试并开始练习";
 }
 @end

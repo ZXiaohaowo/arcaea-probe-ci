@@ -15,6 +15,13 @@ typedef struct {
 } PracticeRateUIState;
 /* Main-thread only. The C adapter revalidates every request before writing. */
 PracticeRateUIState pcp_rate_ui_state(void);
+typedef struct {
+    int visible, score_valid, scroll_valid, pitch_attached;
+    unsigned percent, pure, far, lost;
+    double accuracy, current_note_speed, note_speed;
+} PracticeHUDState;
+/* Main-thread read-only snapshot. Unknown fields must render as --. */
+PracticeHUDState pcp_hud_state(void);
 int pcp_rate_ui_request(unsigned percent,uint64_t epoch);
 /* Persistent setting (NSUserDefaults); 100 when absent or invalid. */
 unsigned pcp_rate_ui_stored_percent(void);
