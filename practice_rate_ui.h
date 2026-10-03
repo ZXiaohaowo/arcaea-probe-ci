@@ -25,6 +25,12 @@ void pcp_rate_ui_save_percent(unsigned percent);
 #define PCP_NOTE_MODE_FIXED 1u
 unsigned pcp_note_mode_get(void);
 void pcp_note_mode_set(unsigned mode);
+/* v29: pitch preservation mode. 0 = tape effect (pitch follows rate, default),
+ * 1 = keep pitch (attach the built-in pitch DSP with ratio 1/rate). */
+#define PCP_PITCH_TAPE 0u
+#define PCP_PITCH_KEEP 1u
+unsigned pcp_pitch_mode_get(void);
+void pcp_pitch_mode_set(unsigned mode);
 /* v28: capture the current paused audio position as a bookmark (first step of
  * the A/B work; no seek yet). Returns the total bookmark count. */
 unsigned pcp_bookmark_add(void);
