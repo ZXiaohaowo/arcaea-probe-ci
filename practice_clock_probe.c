@@ -144,7 +144,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v31-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v32-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -836,6 +836,64 @@ static void pd_restore(void)
 static uint32_t g_bm_pos[PCP_BM_MAX];
 static volatile uint64_t g_bm_count;
 static volatile int g_last_pos_ms, g_last_pos_ok;
+
+/* ds4f v32 stage A/B-1: A/B points (source ms + chart ms) and the seek
+ * experiment. A jump moves the audio channel and rebases the W1 clock bias so
+ * the consumer chart time lands on the captured chart value; note/judgement
+ * state is NOT rebuilt yet (that is the S5 research item), so this is a
+ * candidate experiment with rollback. */
+static volatile uint32_t g_ab_pos[2];
+static volatile int32_t g_ab_chart[2];
+static volatile int g_ab_have[2];
+static volatile int g_ab_loop;
+static volatile int g_sk_pending;
+static volatile uint64_t g_sk_events, g_sk_loop_events, g_sk_skips;
+static volatile int g_sk_rc_getpos, g_sk_rc_setpos, g_sk_rc_clock;
+static volatile uint32_t g_sk_pos_before, g_sk_pos_after;
+static volatile int32_t g_sk_chart_before, g_sk_chart_after;
+static volatile int g_last_chart_ms;
+
+unsigned pcp_ab_set(unsigned which)
+{
+    char line[96];
+    int n;
+    if (which>1 || !g_last_pos_ok) return 0;
+    g_ab_pos[which]=(uint32_t)g_last_pos_ms;
+    g_ab_chart[which]=(int32_t)g_last_chart_ms;
+    g_ab_have[which]=1;
+    n=snprintf(line,sizeof(line),"ab set=%c pos_ms=%d chart_ms=%d\n",
+               which?'B':'A', g_last_pos_ms, g_last_chart_ms);
+    if (n>0 && (size_t)n<sizeof(line)) padd(line,(size_t)n);
+    return 1;
+}
+
+unsigned pcp_ab_have(unsigned which) { return which>1?0u:(unsigned)g_ab_have[which]; }
+unsigned pcp_ab_get(unsigned which) { return which>1?0u:(unsigned)g_ab_pos[which]; }
+unsigned pcp_ab_loop_get(void) { return (unsigned)g_ab_loop; }
+void pcp_ab_loop_set(unsigned on) { g_ab_loop=on?1:0; }
+void pcp_ab_jump(void) { g_sk_pending=1; }
+
+static void ab_jump(void *chan, unsigned which, int automatic)
+{
+    typedef int32_t (*GetPosFn)(void *, uint32_t *, uint32_t);
+    typedef int32_t (*SetPosFn)(void *, uint32_t, uint32_t);
+    uint32_t pos=0;
+    int64_t before;
+    if (!chan || which>1 || !g_ab_have[which] || !g_rate.phase) { g_sk_skips++; return; }
+    g_sk_rc_getpos=((GetPosFn)(uintptr_t)(g_base+OFF_CC_GETPOS))(chan,&pos,1);
+    if (g_sk_rc_getpos!=0) { g_sk_skips++; return; }
+    before=(int64_t)g_rate_last_native + g_rate.clock.bias_us/1000;
+    g_sk_pos_before=pos; g_sk_chart_before=(int32_t)before;
+    g_sk_rc_setpos=((SetPosFn)(uintptr_t)(g_base+OFF_CC_SETPOS))(chan,g_ab_pos[which],1);
+    if (g_sk_rc_setpos!=0) { g_sk_skips++; return; }
+    g_sk_pos_after=g_ab_pos[which];
+    g_rate.clock.bias_us=((int64_t)g_ab_chart[which]-(int64_t)g_rate_last_native)*1000;
+    g_rate.clock.fraction=0;
+    g_sk_rc_clock=0;
+    g_sk_chart_after=g_ab_chart[which];
+    if (automatic) g_sk_loop_events++; else g_sk_events++;
+}
+
 unsigned pcp_bookmark_add(void)
 {
     char line[96];
@@ -1729,6 +1787,34 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                 }
             }
         }
+        /* ds4f v32: A/B jump experiment. Manual jump runs while paused; the
+         * loop jump runs while playing once the position reaches B. */
+        {
+            int did=0, automatic=0;
+            if (g_sk_pending) {
+                g_sk_pending=0;
+                if (g_ui.visible && cs.chan0) { ab_jump((void *)(uintptr_t)cs.chan0,0,0); did=1; }
+                else g_sk_skips++;
+            } else if (g_ab_loop && g_ab_have[0] && g_ab_have[1] &&
+                       g_ab_pos[1]>g_ab_pos[0] && !g_ui.visible && cs.chan0 &&
+                       g_rate.phase && g_last_pos_ok &&
+                       (uint32_t)g_last_pos_ms>=g_ab_pos[1]) {
+                ab_jump((void *)(uintptr_t)cs.chan0,0,1);
+                did=1; automatic=1;
+            }
+            if (did) {
+                char sl[240];
+                int sn=snprintf(sl,sizeof(sl),
+                    "sk seq=%llu act=%s rc=%d/%d/%d pos=%u->%u chart=%d->%d bias_us=%lld sk=%llu lk=%llu skip=%llu\n",
+                    (unsigned long long)task->q_seq, automatic?"loop":"manual",
+                    g_sk_rc_getpos,g_sk_rc_setpos,g_sk_rc_clock,
+                    (unsigned)g_sk_pos_before,(unsigned)g_sk_pos_after,
+                    g_sk_chart_before,g_sk_chart_after,(long long)g_rate.clock.bias_us,
+                    (unsigned long long)g_sk_events,(unsigned long long)g_sk_loop_events,
+                    (unsigned long long)g_sk_skips);
+                if (sn>0 && (size_t)sn<sizeof(sl)) padd(sl,(size_t)sn);
+            }
+        }
         sr_reads = g_sr_reads;
         sr_filt = g_sr_filtered;
         sr_fail = g_sr_failed;
@@ -1816,6 +1902,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     pitch_readback = g_pd_readback;
     g_last_pos_ms = pos;
     g_last_pos_ok = (ok && pos>=0);
+    g_last_chart_ms = t20;
     {
         uint64_t calls = g_scroll_calls;
         scroll_delta = calls - g_scroll_prev_calls;
@@ -1903,6 +1990,12 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                       (unsigned long long)scroll_relayout_fail,
                       pitch_mode, pitch_attached, (double)pitch_ratio,
                       (double)pitch_readback, pitch_comp);
+    }
+    if (n > 0 && (size_t)n < sizeof(line) - 64) {
+        n += snprintf(line + n, sizeof(line) - (size_t)n,
+                      " ab=%d/%d/%d skc=%llu",
+                      g_ab_have[0], g_ab_have[1], g_ab_loop,
+                      (unsigned long long)(g_sk_events+g_sk_loop_events));
     }
     if (n > 0 && (size_t)n < sizeof(line) - 2) {
         line[n++] = '\n';

@@ -38,6 +38,14 @@ void pcp_pitch_comp_set(unsigned ms);
 /* v28: capture the current paused audio position as a bookmark (first step of
  * the A/B work; no seek yet). Returns the total bookmark count. */
 unsigned pcp_bookmark_add(void);
+/* v32: A/B practice points (source time + chart time captured while paused)
+ * and the manual/loop jump request. which: 0 = A, 1 = B. */
+unsigned pcp_ab_set(unsigned which);
+unsigned pcp_ab_have(unsigned which);
+unsigned pcp_ab_get(unsigned which);
+void pcp_ab_jump(void);
+unsigned pcp_ab_loop_get(void);
+void pcp_ab_loop_set(unsigned on);
 /* Native entry callback: request that the rate panel is shown. */
 void pcp_rate_ui_open(void);
 void practice_rate_ui_start(void);

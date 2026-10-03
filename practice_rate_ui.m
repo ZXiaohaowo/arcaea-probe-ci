@@ -19,6 +19,7 @@
 @property(nonatomic,strong) UIButton *noteMode;
 @property(nonatomic,strong) UIButton *pitchMode;
 @property(nonatomic,strong) UIButton *compDown,*compValue,*compUp;
+@property(nonatomic,strong) UIButton *abA,*abB,*abJump,*abLoop;
 @property(nonatomic,strong) UIButton *bookmark;
 @property(nonatomic,strong) UILabel *value,*status;
 @property(nonatomic,strong) UISlider *slider;
@@ -84,15 +85,23 @@
     self.compUp.frame=CGRectMake(248,256,96,36);[self.panel addSubview:self.compUp];
     self.status=[self label:13];self.status.numberOfLines=2;
     self.status.frame=CGRectMake(16,296,328,34);[self.panel addSubview:self.status];
+    self.abA=[self button:@"设A" action:@selector(abSetA)];
+    self.abA.frame=CGRectMake(16,334,76,36);[self.panel addSubview:self.abA];
+    self.abB=[self button:@"设B" action:@selector(abSetB)];
+    self.abB.frame=CGRectMake(96,334,76,36);[self.panel addSubview:self.abB];
+    self.abJump=[self button:@"跳A" action:@selector(abJumpTap)];
+    self.abJump.frame=CGRectMake(176,334,76,36);[self.panel addSubview:self.abJump];
+    self.abLoop=[self button:@"循环 关" action:@selector(abLoopTap)];
+    self.abLoop.frame=CGRectMake(256,334,76,36);[self.panel addSubview:self.abLoop];
     self.bookmark=[self button:@"添加书签 n=0" action:@selector(addBookmark)];
-    self.bookmark.frame=CGRectMake(16,334,328,36);[self.panel addSubview:self.bookmark];
+    self.bookmark.frame=CGRectMake(16,376,328,36);[self.panel addSubview:self.bookmark];
     self.reset=[self button:@"恢复 1.00x" action:@selector(resetRate)];
-    self.reset.frame=CGRectMake(16,376,158,44);[self.panel addSubview:self.reset];
+    self.reset.frame=CGRectMake(16,416,158,44);[self.panel addSubview:self.reset];
     self.apply=[self button:@"应用" action:@selector(applyRate)];
     self.apply.backgroundColor=[UIColor colorWithRed:0.48 green:0.36 blue:0.82 alpha:1];
-    self.apply.frame=CGRectMake(186,376,158,44);[self.panel addSubview:self.apply];
+    self.apply.frame=CGRectMake(186,416,158,44);[self.panel addSubview:self.apply];
     UIButton *close=[self button:@"收起" action:@selector(toggle)];
-    close.frame=CGRectMake(130,426,100,34);[self.panel addSubview:close];
+    close.frame=CGRectMake(130,466,100,34);[self.panel addSubview:close];
     self.draft=(NSInteger)pcp_rate_ui_stored_percent();[self updateDraft];
 }
 - (void)updateDraft {
@@ -151,6 +160,15 @@
     pcp_pitch_comp_set(pcp_pitch_comp_get()+5);
     [self refreshPitchComp];
 }
+- (void)refreshAB {
+    [self.abA setTitle:(pcp_ab_have(0)?[NSString stringWithFormat:@"A %us",pcp_ab_get(0)/1000]:@"设A") forState:UIControlStateNormal];
+    [self.abB setTitle:(pcp_ab_have(1)?[NSString stringWithFormat:@"B %us",pcp_ab_get(1)/1000]:@"设B") forState:UIControlStateNormal];
+    [self.abLoop setTitle:(pcp_ab_loop_get()?@"循环 开":@"循环 关") forState:UIControlStateNormal];
+}
+- (void)abSetA { pcp_ab_set(0); [self refreshAB]; }
+- (void)abSetB { pcp_ab_set(1); [self refreshAB]; }
+- (void)abJumpTap { pcp_ab_jump(); }
+- (void)abLoopTap { pcp_ab_loop_set(pcp_ab_loop_get()?0:1); [self refreshAB]; }
 - (UIWindow *)gameWindow {
     UIApplication *app=UIApplication.sharedApplication;
     for(UIScene *scene in app.connectedScenes) {
@@ -176,8 +194,8 @@
     UIEdgeInsets safe=window.safeAreaInsets;CGSize size=window.bounds.size;
     self.entry.frame=CGRectMake(size.width-safe.right-150,safe.top+16,134,46);
     self.panel.transform=CGAffineTransformIdentity;
-    self.panel.bounds=CGRectMake(0,0,360,468);
-    CGFloat scale=MIN(1,MIN((size.width-safe.left-safe.right-24)/360,(size.height-safe.top-safe.bottom-24)/468));
+    self.panel.bounds=CGRectMake(0,0,360,508);
+    CGFloat scale=MIN(1,MIN((size.width-safe.left-safe.right-24)/360,(size.height-safe.top-safe.bottom-24)/508));
     self.panel.transform=CGAffineTransformMakeScale(MAX(0.5,scale),MAX(0.5,scale));
     self.panel.center=CGPointMake(size.width/2,size.height/2);
     [self.entry setTitle:[NSString stringWithFormat:@"倍率 %.2fx",state.applied/100.0] forState:UIControlStateNormal];
@@ -187,6 +205,7 @@
     [self refreshNoteMode];
     [self refreshPitchMode];
     [self refreshPitchComp];
+    [self refreshAB];
     self.status.text=state.pending?@"正在应用…":state.result==-3?@"控制已停止，请退出并重新启动":state.result==-2?@"未能应用，请重新暂停后重试":
         state.prep&&state.ready?[NSString stringWithFormat:@"已设定 %.2fx\n开始播放后生效",state.applied/100.0]:
         !state.ready?@"等待暂停状态就绪…":
