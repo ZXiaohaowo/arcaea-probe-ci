@@ -1798,7 +1798,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
             if (playing && !g_song_started && g_song_attempts<3 &&
                 g_setting_percent>=PCP_RATE_MIN_PERCENT && g_setting_percent<=PCP_RATE_MAX_PERCENT) {
                 if (g_setting_percent==100 && !g_rate.phase) {
-                    if (g_ab_have[0] || g_ab_have[1] || g_ab_loop) {
+                    if (g_ab_have[0] || g_ab_have[1] || g_ab_loop || psk_busy(&g_seek)) {
                         /* v35: A/B needs a clock session even at exactly 1x so a
                          * jump can rebase the chart clock; create one on demand. */
                         int applied=0;
@@ -1833,7 +1833,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
             /* v36: when A/B is armed, keep a 1x clock session alive so jumps are
              * never skipped for lack of a session (created while natively paused). */
             if (!g_rate.phase && paused && scene_ok && cs.chan0 && pok &&
-                (g_ab_have[0] || g_ab_have[1] || g_ab_loop)) {
+                (g_ab_have[0] || g_ab_have[1] || g_ab_loop || psk_busy(&g_seek))) {
                 PracticePitchOps ops={&g_rate_owner,rate_get,rate_set};
                 g_rate_owner=(rate_owner_t){cs.am,cs.pv,cs.chan0,scene_addr,tl};
                 g_rate_requested=100;
