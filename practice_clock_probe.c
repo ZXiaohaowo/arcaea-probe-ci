@@ -144,7 +144,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v27d-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v27e-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -584,6 +584,23 @@ static _Atomic unsigned g_note_mode;
 static _Atomic uint32_t g_note_scale_bits;
 static volatile uint64_t g_scroll_calls, g_scroll_prev_calls, g_scroll_chart;
 static volatile uint32_t g_scroll_raw_bits, g_scroll_out_bits;
+/* v27e: the game stores the scroll scalar only when the chart is (re)built
+ * (log 22: 4 store events in 947 s, all at pos=0). The rate/mode correction
+ * therefore has to be written by us; the tag8 bridge remains the observer and
+ * keeps the identity return. */
+static volatile int g_scroll_chart_valid;
+static volatile uint32_t g_scroll_field_bits;   /* last value seen in chart+0xf4 */
+static volatile uint64_t g_scroll_writes, g_scroll_write_fail;
+static volatile uint64_t g_scroll_gen, g_scroll_gen_at_hook;
+static volatile uint64_t g_scroll_vptr;        /* chart vptr captured at hook time */
+static void scroll_cache_clear(void)
+{
+    g_scroll_chart_valid = 0;
+    g_scroll_chart = 0;
+    g_scroll_raw_bits = 0;
+    g_scroll_field_bits = 0;
+    g_scroll_vptr = 0;
+}
 void pcp_rate_ui_open(void)
 {
     g_ui_open_seq++;
@@ -653,8 +670,10 @@ uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
     uint32_t validbits = 0;
     int on_main=pthread_main_np();
     if (tag==8) {
-        /* ds4f v27d: note scroll scalar bridge. a = chart object (diagnostic),
-         * lr = raw float bits, return = scaled float bits for chart+0xf4. */
+        /* ds4f v27d/v27e: note scroll scalar bridge. a = chart object, lr = the
+         * game's own value in float bits. The value is cached so the control
+         * cycle can keep chart+0xf4 corrected; the store itself receives the
+         * scaled value when a rate is active, otherwise the raw value. */
         uint32_t in=(uint32_t)lr, out=in;
         unsigned mode=atomic_load_explicit(&g_note_mode,memory_order_relaxed);
         uint32_t sb=atomic_load_explicit(&g_note_scale_bits,memory_order_relaxed);
@@ -665,8 +684,15 @@ uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
         }
         g_scroll_calls++;
         g_scroll_chart=a;
+        g_scroll_chart_valid=1;
+        g_scroll_gen_at_hook=g_scroll_gen;
+        {
+            uint64_t vptr=0;
+            if (safe_read(a,&vptr,8)) g_scroll_vptr=vptr;
+        }
         g_scroll_raw_bits=in;
         g_scroll_out_bits=out;
+        g_scroll_field_bits=out;
         return out;
     }
     if (tag==6) {
@@ -678,6 +704,9 @@ uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
     if (tag==4 || tag==5) {
         if (!on_main) {atomic_store_explicit(&g_rate_badthread,1,memory_order_relaxed);return 0;}
         g_ui.epoch++;g_ui.visible=g_ui.ready=0;
+        /* Scene destructor (tag4): the cached chart scalar belongs to the old
+         * chart. tag5 also fires mid-song for BGM events, so it must not clear. */
+        if (tag==4) { g_scroll_gen++; scroll_cache_clear(); }
         if (tag==4) g_rate_dtor_events++; else g_rate_play_events++;
         if ((g_rate.phase || g_rate.audio_owned) &&
             ((tag==4 && a==g_rate_owner.scene) || (tag==5 && a==g_rate_owner.pv)))
@@ -1216,7 +1245,9 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     unsigned int ust = 0;
     unsigned int note_mode = 0;
     uint64_t scroll_delta = 0;
+    uint64_t scroll_writes = 0, scroll_fail = 0;
     float sc_raw = 0.0f, sc_out = 0.0f;
+    float sc_field = 0.0f;
     int uh[6] = {0, 0, 0, 0, 0, 0};
     uint64_t sess_addr = 0, scene_addr = 0;
     uint64_t mach_now = 0;
@@ -1398,6 +1429,42 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
             memcpy(&bits,&scale,4);
             atomic_store_explicit(&g_note_mode,mode,memory_order_relaxed);
             atomic_store_explicit(&g_note_scale_bits,bits,memory_order_relaxed);
+            /* v27e: the game stores chart+0xf4 only when the chart is rebuilt,
+             * so a rate or mode change has to be written by us. The field is
+             * re-read through the checked interface and only overwritten while
+             * it still holds the game's raw value or our own previous value.
+             * Only runs while a rate session is active for the current chart;
+             * the tag4 scene destructor clears the cache (generation check). */
+            if (g_scroll_chart_valid && g_scroll_chart && g_rate.phase &&
+                g_scroll_gen_at_hook==g_scroll_gen) {
+                uint32_t raw_bits = g_scroll_raw_bits;
+                float raw, want;
+                uint32_t want_bits, field = 0;
+                uint64_t vptr = 0;
+                memcpy(&raw,&raw_bits,4);
+                want = raw*scale;
+                memcpy(&want_bits,&want,4);
+                if (g_scroll_vptr && safe_read((uint64_t)g_scroll_chart,&vptr,8) &&
+                    vptr==g_scroll_vptr &&
+                    raw>0.01f && raw<100.0f && scale>=0.4f && scale<=2.5f &&
+                    safe_read((uint64_t)g_scroll_chart+0xf4ull,&field,4)) {
+                    if (field != want_bits) {
+                        if (field == raw_bits || field == g_scroll_field_bits) {
+                            *(volatile uint32_t *)(uintptr_t)((uint64_t)g_scroll_chart+0xf4ull)=want_bits;
+                            g_scroll_writes++;
+                            field=want_bits;
+                        } else {
+                            /* the game rebuilt the chart: adopt the new raw value */
+                            g_scroll_raw_bits=field;
+                        }
+                    }
+                    g_scroll_field_bits=field;
+                } else {
+                    g_scroll_chart_valid=0;
+                    g_scroll_chart=0;
+                    g_scroll_write_fail++;
+                }
+            }
         }
         sr_reads = g_sr_reads;
         sr_filt = g_sr_filtered;
@@ -1484,8 +1551,12 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
         scroll_delta = calls - g_scroll_prev_calls;
         g_scroll_prev_calls = calls;
         uint32_t rb = g_scroll_raw_bits, ob = g_scroll_out_bits;
+        uint32_t fb = g_scroll_field_bits;
         memcpy(&sc_raw, &rb, 4);
         memcpy(&sc_out, &ob, 4);
+        memcpy(&sc_field, &fb, 4);
+        scroll_writes = g_scroll_writes;
+        scroll_fail = g_scroll_write_fail;
     }
     n = snprintf(line, sizeof(line),
                  "p seq=%llu t_ms=%llu t_q=%llu lag_ms=%llu tid=%llu main=%d am=%llx handle=%llx ok=%d pos_ms=%d"
@@ -1540,9 +1611,11 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
     }
     if (n > 0 && (size_t)n < sizeof(line) - 96) {
         n += snprintf(line + n, sizeof(line) - (size_t)n,
-                      " scm=%u scc=%llu scr=%.3f sco=%.3f",
+                      " scm=%u scc=%llu scr=%.3f sco=%.3f scf=%.3f scw=%llu scx=%llu",
                       note_mode, (unsigned long long)scroll_delta,
-                      (double)sc_raw, (double)sc_out);
+                      (double)sc_raw, (double)sc_out, (double)sc_field,
+                      (unsigned long long)scroll_writes,
+                      (unsigned long long)scroll_fail);
     }
     if (n > 0 && (size_t)n < sizeof(line) - 2) {
         line[n++] = '\n';
