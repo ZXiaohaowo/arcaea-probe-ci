@@ -164,6 +164,9 @@
 - (void)refreshAB {
     [self.abA setTitle:(pcp_ab_have(0)?[NSString stringWithFormat:@"A %us",pcp_ab_get(0)/1000]:@"设A") forState:UIControlStateNormal];
     [self.abB setTitle:(pcp_ab_have(1)?[NSString stringWithFormat:@"B %us",pcp_ab_get(1)/1000]:@"设B") forState:UIControlStateNormal];
+    unsigned phase=pcp_seek_phase();
+    self.abJump.enabled=pcp_ab_have(0) && !(phase>=1 && phase<=4);
+    self.abJump.alpha=self.abJump.enabled?1:0.45;
     unsigned n=pcp_ab_jumps();
     [self.abJump setTitle:(n?[NSString stringWithFormat:@"跳A(%u)",n]:@"跳A") forState:UIControlStateNormal];
     [self.abLoop setTitle:(pcp_ab_loop_get()?@"循环 开(重试)":@"循环 关") forState:UIControlStateNormal];

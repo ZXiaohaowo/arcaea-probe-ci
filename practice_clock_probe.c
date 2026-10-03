@@ -862,6 +862,7 @@ static volatile int g_last_chart_ms;
 static volatile uint64_t g_retry_obj, g_retry_vptr, g_retry_calls, g_retry_fail;
 static volatile int g_retry_valid;
 static volatile uint64_t g_scene_gen;
+static uint64_t g_song_bound_gen;
 /* v35: the (chart - audio) offset is a property of the song; sample it while
  * actually playing and use it to derive the chart target at jump time, instead
  * of trusting a chart value captured while paused (t20 can keep running then). */
@@ -1649,7 +1650,8 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
             playing = main_ok && scene_ok && !paused && f2c==0 && f2e==1 &&
                 (int64_t)t20-t28>0 && fresh_playing && patched;
 
-            if (scene_ok && scene_addr!=g_song_scene) {
+            if (scene_ok && (scene_addr!=g_song_scene || g_song_bound_gen!=g_scene_gen)) {
+                g_song_bound_gen=g_scene_gen;
                 if (g_rate.phase || g_rate.audio_owned) prs_close(&g_rate,2);
                 memset(&g_rate,0,sizeof(g_rate));
                 g_live_offset_valid=0;
