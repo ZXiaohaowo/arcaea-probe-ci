@@ -145,7 +145,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "v47-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "v48-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -912,10 +912,11 @@ void pcp_ab_loop_set(unsigned on) { g_ab_loop=on?1:0; g_loop_suspended=0; atomic
 unsigned pcp_ab_jumps(void) { return (unsigned)g_sk_events; }
 unsigned pcp_seek_phase(void) { return (unsigned)g_seek.phase; }
 unsigned pcp_seek_error(void) { return (unsigned)g_seek.error; }
-static int point_read_position(uint32_t *position) {
+static int position_read(uint32_t *position,int paused_only) {
     typedef int32_t (*GetPosFn)(void *,uint32_t *,uint32_t);
     uint64_t gg=0,am=0,pv=0,begin=0,handle=0;
-    if(!pthread_main_np() || !pcp_rate_ui_state().visible ||
+    if(!pthread_main_np() || !g_ident_ok || g_ui_transition || g_song_bound_gen!=g_scene_gen ||
+       (paused_only && !pcp_rate_ui_state().visible) ||
        !rate_read64(g_base+OFF_SLOT,&gg) || !rate_read64(gg+OFF_GG_AM,&am) ||
        !rate_read64(am+OFF_AM_PROVIDER,&pv) || !rate_read64(pv+OFF_PV_VEC_BEGIN,&begin) ||
        !rate_read64(begin+8,&handle))return 0;
@@ -923,6 +924,8 @@ static int point_read_position(uint32_t *position) {
     if(!rate_current(&owner))return 0;
     return !((GetPosFn)(uintptr_t)(g_base+OFF_CC_GETPOS))((void *)(uintptr_t)handle,position,1);
 }
+static int point_read_position(uint32_t *position){return position_read(position,1);}
+int pcp_playback_position(unsigned *position){return position && position_read(position,0);}
 PracticePoints pcp_points_snapshot(void) { return g_points; }
 unsigned pcp_points_current(void) {uint32_t ms=0;return point_read_position(&ms)?ms:(g_last_pos_ok?(unsigned)g_last_pos_ms:0);}
 unsigned pcp_points_extent(void) {return g_points.duration?g_points.duration:g_point_extent;}
@@ -997,16 +1000,19 @@ int pcp_point_delete(unsigned id) {
     if(!pthread_main_np() || !pcp_rate_ui_state().visible || psk_busy(&g_seek))return 0;
     return pp_delete_t(&g_points,id);
 }
-int pcp_point_jump(unsigned id) {
+int pcp_jump_time(unsigned ms) {
     uint64_t now=0;
-    if(!pthread_main_np() || !pcp_rate_ui_state().visible || id>=PP_COUNT ||
-       !(g_points.mask&(1u<<id)))return 0;
+    if(!pthread_main_np() || !pcp_rate_ui_state().visible || ms>=INT32_MAX ||
+       (g_points.duration && ms>=g_points.duration) || (!g_points.duration && ms>g_point_extent))return 0;
     if(!ps_mach_us(mach_absolute_time(),g_tb_numer,g_tb_denom,&now) ||
-       !psk_practice_request(&g_seek,g_points.ms[id],0,g_scene_gen,now))return 0;
+       !psk_practice_request(&g_seek,ms,0,g_scene_gen,now))return 0;
     atomic_store(&g_fast_control,1);
-    if(g_ab_loop && (!g_ab_have[0] || !g_ab_have[1] ||
-       g_points.ms[id]<g_ab_pos[0] || g_points.ms[id]>=g_ab_pos[1]))g_loop_suspended=1;
+    if(g_ab_loop && (!g_ab_have[0] || !g_ab_have[1] || ms<g_ab_pos[0] || ms>=g_ab_pos[1]))g_loop_suspended=1;
     return 1;
+}
+int pcp_point_jump(unsigned id) {
+    if(!pthread_main_np() || id>=PP_COUNT || !(g_points.mask&(1u<<id)))return 0;
+    return pcp_jump_time(g_points.ms[id]);
 }
 void pcp_ab_jump(void) { (void)pcp_point_jump(0); }
 

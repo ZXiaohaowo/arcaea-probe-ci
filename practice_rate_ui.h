@@ -64,6 +64,8 @@ unsigned pcp_seek_phase(void);
 unsigned pcp_seek_error(void);
 PracticePoints pcp_points_snapshot(void);
 unsigned pcp_points_current(void);
+int pcp_playback_position(unsigned *position);
+int pcp_jump_time(unsigned ms);
 unsigned pcp_points_extent(void);
 uint64_t pcp_points_epoch(void);
 unsigned pcp_loop_suspended(void);
