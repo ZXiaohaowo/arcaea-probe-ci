@@ -24,6 +24,7 @@ typedef struct {
 PracticeHUDState pcp_hud_state(void);
 typedef struct {int active,paused;unsigned remaining_ms;} PracticeCountdownState;
 PracticeCountdownState pcp_countdown_state(void);
+int pcp_paused_fast(void);
 int pcp_native_continue(void);
 int pcp_cancel_jump(void);
 /* Main-thread synchronous dismissal before native scene transitions. */
