@@ -145,7 +145,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "v41-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "ds4f-v46-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -1071,6 +1071,22 @@ PracticeCountdownState pcp_countdown_state(void) {
         if(now-g_countdown_zero_ms>180){g_countdown_active=0;return c;}
     }
     c.active=1;c.paused=pcp_rate_ui_state().visible;return c;
+}
+
+/* v43: pause state from the per-frame tag3 sample (state bytes 0x0101) with a
+ * 300 ms freshness bound; lets UI-side hiding/dimming follow the pause screen
+ * immediately instead of waiting for the 1 Hz control cycle. */
+int pcp_paused_fast(void)
+{
+    uint64_t now=0,last=0;
+    uint32_t st;
+    if(!pthread_main_np()) return 0;
+    st=g_rate_last_state;
+    if((st&0xffffu)!=0x0101u) return 0;
+    if(!ps_mach_us(mach_absolute_time(),g_tb_numer,g_tb_denom,&now)) return 0;
+    if(!ps_mach_us(g_rate_last_mach,g_tb_numer,g_tb_denom,&last) || now<last ||
+       now-last>300000) return 0;
+    return 1;
 }
 
 /* Called by the original retry button's replacement touch callback. */

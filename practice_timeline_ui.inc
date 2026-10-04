@@ -10,6 +10,19 @@ static UIFont *PTFont(CGFloat size,BOOL latin) {
     UIFont *font=[UIFont fontWithName:latin?@"Exo-Light":@"NotoSansCJKsc-Light" size:size];
     return font?:[UIFont systemFontOfSize:size weight:UIFontWeightLight];
 }
+/* v45: reuse the game's own UI textures from the app bundle (read-only). */
+static UIImage *PTGameImage(NSString *rel) {
+    static NSMutableDictionary *cache;
+    if(!cache) cache=[NSMutableDictionary dictionary];
+    UIImage *img=cache[rel];
+    if(img) return img;
+    NSString *path=[NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:rel];
+    if([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        img=[UIImage imageWithContentsOfFile:path];
+        if(img) cache[rel]=img;
+    }
+    return img;
+}
 static NSString *PTTime(unsigned ms) {
     char text[32],detail[32];pp_format(ms,text,sizeof(text),detail,sizeof(detail));
     return [NSString stringWithUTF8String:text];
@@ -47,7 +60,20 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
 @end
 @interface PTHexButton : UIButton @end
 @implementation PTHexButton
+- (void)setHighlighted:(BOOL)h {[super setHighlighted:h];[self setNeedsDisplay];}
 - (void)drawRect:(CGRect)rect {
+    /* v45: prefer the game's own pause button texture; drawn shape is fallback. */
+    UIImage *img=PTGameImage(@"layouts/1080/pause/button.png");
+    CGSize sz=self.bounds.size;
+    /* v46: caps must cover the whole slanted ends (46px) and the border (14px);
+     * buttons too narrow/short for the caps keep the drawn shape. */
+    if(img && sz.width>=104 && sz.height>=34) {
+        UIImage *pressed=PTGameImage(@"layouts/1080/pause/button_pressed.png");
+        UIImage *use=((self.highlighted||self.selected)&&pressed)?pressed:img;
+        UIEdgeInsets caps=UIEdgeInsetsMake(14,48,14,48);
+        [[use resizableImageWithCapInsets:caps] drawInRect:self.bounds];
+        return;
+    }
     CGRect r=CGRectInset(self.bounds,1,1);CGFloat k=12;
     UIBezierPath *p=[UIBezierPath bezierPath];
     [p moveToPoint:CGPointMake(r.origin.x+k,r.origin.y)];
@@ -152,6 +178,24 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     self.curtain=[PTBackdrop new];self.curtain.hidden=YES;[self.overlay addSubview:self.curtain];
     self.panel=[UIView new];self.panel.hidden=YES;self.panel.backgroundColor=UIColor.clearColor;
     [self.overlay addSubview:self.panel];
+    /* v46: background texture layers from the game's own art (read-only). */
+    {
+        UIImage *band=PTGameImage(@"img/bgshape-pause.png");
+        if(band) {
+            UIImageView *v=[[UIImageView alloc] initWithImage:band];
+            v.contentMode=UIViewContentModeScaleToFill;v.userInteractionEnabled=NO;
+            v.frame=CGRectMake(0,150,1000,300);v.alpha=0.5;[self.panel addSubview:v];
+        }
+        UIImage *backing=PTGameImage(@"layouts/1080/pause/pause_backing.png");
+        if(backing) {
+            UIImageView *top=[[UIImageView alloc] initWithImage:backing];
+            top.contentMode=UIViewContentModeScaleToFill;top.userInteractionEnabled=NO;
+            top.frame=CGRectMake(0,40,1000,186);top.alpha=0.42;[self.panel addSubview:top];
+            UIImageView *bottom=[[UIImageView alloc] initWithImage:backing];
+            bottom.contentMode=UIViewContentModeScaleToFill;bottom.userInteractionEnabled=NO;
+            bottom.frame=CGRectMake(0,545,1000,130);bottom.alpha=0.38;[self.panel addSubview:bottom];
+        }
+    }
     for(NSNumber *n in @[@66,@211,@388,@508,@624]) {
         UIView *line=[[UIView alloc] initWithFrame:CGRectMake(20,n.doubleValue,960,0.7)];
         line.backgroundColor=[UIColor colorWithWhite:1 alpha:0.35];[self.panel addSubview:line];
@@ -166,8 +210,8 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     self.apply=[self button:@"应用倍率" frame:CGRectMake(620,76,166,44) action:@selector(applyRate)];
     self.reset=[self button:@"恢复 1.00x" frame:CGRectMake(802,76,166,44) action:@selector(resetRate)];
     int deltas[]={-5,-1,1,5};NSArray *names=@[@"− 0.05",@"− 0.01",@"+ 0.01",@"+ 0.05"];
-    for(int i=0;i<4;i++){UIButton *b=[self button:names[i] frame:CGRectMake(32+i*99,134,91,40) action:@selector(step:)];b.tag=deltas[i];}
-    self.noteMode=[self button:@"Note 同步变速" frame:CGRectMake(446,134,254,40) action:@selector(noteTap)];
+    for(int i=0;i<4;i++){UIButton *b=[self button:names[i] frame:CGRectMake(32+i*112,134,106,40) action:@selector(step:)];b.tag=deltas[i];}
+    self.noteMode=[self button:@"Note 同步变速" frame:CGRectMake(482,134,218,40) action:@selector(noteTap)];
     self.pitchMode=[self button:@"音高 随速" frame:CGRectMake(716,134,252,40) action:@selector(pitchTap)];
     self.noteSpeeds=[self label:13 frame:CGRectMake(32,179,660,27) text:@"CurrentNoteSpeed --   ·   NoteSpeed --"];
     UIButton *minus=[self button:@"−5ms" frame:CGRectMake(706,179,74,28) action:@selector(comp:)];minus.tag=-5;
@@ -238,8 +282,11 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
 - (void)cancelWaiting {if(pcp_cancel_jump())[self message:@"已取消待执行跳转，可重新设置"];}
 - (void)countdownTick {
     if(UIApplication.sharedApplication.applicationState!=UIApplicationStateActive || !self.panel.hidden) {self.countdown.hidden=YES;return;}
-    PracticeCountdownState c=pcp_countdown_state();self.countdown.hidden=!c.active;
-    if(!c.active)return;
+    BOOL pausedNow=pcp_paused_fast()!=0;
+    self.speedHUD.alpha=self.accHUD.alpha=pausedNow?0.35:1.0;   /* v43: 30Hz 快速跟随暂停 */
+    PracticeCountdownState c=pcp_countdown_state();
+    self.countdown.hidden=!c.active || c.paused || pausedNow;   /* v43: 暂停立即隐藏 */
+    if(self.countdown.hidden)return;
     self.countdown.frame=CGRectMake(self.overlay.bounds.size.width/2-180,self.overlay.bounds.size.height/2-70,360,120);
     self.countdown.text=[NSString stringWithFormat:@"%u:%03u",c.remaining_ms/1000,c.remaining_ms%1000];
 }
@@ -318,6 +365,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     self.overlay.frame=w.bounds;[w bringSubviewToFront:self.overlay];self.overlay.hidden=NO;
     PracticeHUDState hud=pcp_hud_state();
     self.speedHUD.hidden=self.accHUD.hidden=!hud.visible || !self.panel.hidden;
+    self.speedHUD.alpha=self.accHUD.alpha=(s.visible||pcp_paused_fast())?0.35:1.0; /* v43 */
     CGFloat hudW=MIN(240,w.bounds.size.width*0.23),hudX=w.bounds.size.width-w.safeAreaInsets.right-hudW-20;
     self.speedHUD.frame=CGRectMake(hudX,w.bounds.size.height*0.465,hudW,34);
     self.accHUD.frame=CGRectMake(hudX,w.bounds.size.height*0.465+36,hudW,34);
@@ -376,6 +424,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     else if(CFAbsoluteTimeGetCurrent()>self.messageUntil)
         self.status.text=phase==6?[NSString stringWithFormat:@"跳转未通过验证 (%u)，循环已停止",pcp_seek_error()]:phase==5?@"已跳转 · 可继续练习":@"选点 → 再点编辑 · 跳转会重试并开始练习";
     self.speedHUD.hidden=self.accHUD.hidden=!hud.visible || !self.panel.hidden;
+    self.speedHUD.alpha=self.accHUD.alpha=(s.visible||pcp_paused_fast())?0.35:1.0; /* v43 */
     self.entry.hidden=!s.visible || !self.panel.hidden;
 }
 @end
