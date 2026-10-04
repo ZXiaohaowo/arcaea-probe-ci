@@ -226,6 +226,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     if(pp_select(&_edit,(unsigned)i)!=2)return;
     self.milliseconds.text=[NSString stringWithFormat:@"%u",_edit.draft];
     self.editBox.hidden=NO;self.keypad.hidden=YES;self.replaceDigits=YES;
+    self.axis.drafting=YES;self.axis.draftID=self.selected;self.axis.draftMs=_edit.draft;self.axis.draftLimit=_edit.duration;
 }
 - (void)cyclePoint:(UIButton *)button {
     NSInteger next=self.selected<0?(button.tag<0?4:0):(self.selected+button.tag+5)%5;
@@ -237,6 +238,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     PracticePoints p=pcp_points_snapshot();pp_init(&_edit,p.duration?p.duration-1:pcp_points_extent());
     _edit.editing=1;_edit.draft=MIN(pcp_points_current(),_edit.duration);
     self.milliseconds.text=[NSString stringWithFormat:@"%u",_edit.draft];self.editBox.hidden=NO;self.replaceDigits=YES;
+    self.axis.drafting=YES;self.axis.draftID=5;self.axis.draftMs=_edit.draft;self.axis.draftLimit=_edit.duration;
 }
 - (void)dragTime:(unsigned)ms {
     if(self.editBox.hidden || !pp_input(&_edit,ms))return;
@@ -303,7 +305,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     [self layoutDesignHUD];
     self.speedHUD.text=[NSString stringWithFormat:@"SPEED %.2fx",hud.percent/100.0];
     self.accHUD.text=hud.score_valid?[NSString stringWithFormat:@"ACC %.2f%%",hud.accuracy]:@"ACC --";
-    unsigned currentPosition=0;self.currentHUD.text=pcp_playback_position(&currentPosition)?PTTime(currentPosition):@"--:--.---";
+    unsigned currentPosition=0;self.currentHUD.text=(hud.visible && pcp_playback_position(&currentPosition))?PTTime(currentPosition):@"--:--.---";
     PracticePoints hudPoints=pcp_points_snapshot();self.durationHUD.text=hudPoints.duration?PTTime(hudPoints.duration):@"--:--.---";
     for(UILabel *l in @[self.speedHUD,self.accHUD,self.currentHUD,self.durationHUD])l.alpha=(s.visible||pcp_paused_fast())?0.35:1;
     self.entry.hidden=YES; /* Native pause row owns the entry. */
@@ -333,7 +335,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     self.axis.points=p;self.axis.extent=extent;self.axis.current=current;self.axis.selected=self.selected;self.axis.userInteractionEnabled=!busy;self.axis.drafting=editing;self.axis.draftID=self.freeEditing?5:self.selected;self.axis.draftMs=(unsigned)self.milliseconds.text.longLongValue;self.axis.draftLimit=_edit.duration;[self.axis setNeedsDisplay];
     self.rangeLabel.text=[NSString stringWithFormat:@"Current - %@",PTTime(current)];
     BOOL has=self.selected>=0 && (p.mask&(1u<<self.selected));
-    self.selection.text=self.freeEditing?@"自由定位 C · 确认后跳转":has?[NSString stringWithFormat:@"%@  %@",PTName(self.selected),PTTime(p.ms[self.selected])]:@"点击时间轴或左右箭头选点";
+    self.selection.text=self.freeEditing?@"自由定位 C · 确认后跳转":has?[NSString stringWithFormat:@"%@  %@",PTName(self.selected),PTTime(p.ms[self.selected])]:self.selected>=0?[NSString stringWithFormat:@"%@ · 未设置",PTName(self.selected)]:@"点击时间轴或左右箭头选点";
     [self.jump setTitle:has?[NSString stringWithFormat:@"跳转到 %@ 点",PTName(self.selected)]:@"选中点位后跳转" forState:UIControlStateNormal];
     self.jump.enabled=has&&!busy&&!editing;self.jump.alpha=self.jump.enabled?1:0.45;
     self.removeT.enabled=has&&self.selected>=2&&!busy&&editing;
