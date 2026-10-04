@@ -927,7 +927,7 @@ PracticePoints pcp_points_snapshot(void) { return g_points; }
 unsigned pcp_points_current(void) {uint32_t ms=0;return point_read_position(&ms)?ms:(g_last_pos_ok?(unsigned)g_last_pos_ms:0);}
 unsigned pcp_points_extent(void) {return g_points.duration?g_points.duration:g_point_extent;}
 uint64_t pcp_points_epoch(void) {return g_point_epoch;}
-unsigned pcp_loop_suspended(void) {return g_loop_suspended;}
+unsigned pcp_loop_suspended(void) {return g_ab_loop && g_loop_suspended;}
 PracticeHUDState pcp_hud_state(void) {
     PracticeHUDState h={.percent=100};
     uint64_t root=0,session=0,vt=0,scene=0,tl=0,score=0,chart=0,counts0=0,counts1=0,setting=0;
@@ -1052,7 +1052,7 @@ int pcp_native_continue(void) {
 }
 int pcp_cancel_jump(void) {
     if(!pthread_main_np() || !pcp_rate_ui_state().visible || g_seek.phase!=PSK_READY)return 0;
-    psk_cancel(&g_seek);g_ab_loop=0;g_countdown_active=0;return 1;
+    psk_cancel(&g_seek);g_ab_loop=0;g_loop_suspended=0;g_countdown_active=0;return 1;
 }
 PracticeCountdownState pcp_countdown_state(void) {
     PracticeCountdownState c={0};uint32_t pos=0;
