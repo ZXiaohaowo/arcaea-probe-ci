@@ -303,7 +303,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     [self layoutDesignHUD];
     self.speedHUD.text=[NSString stringWithFormat:@"SPEED %.2fx",hud.percent/100.0];
     self.accHUD.text=hud.score_valid?[NSString stringWithFormat:@"ACC %.2f%%",hud.accuracy]:@"ACC --";
-    self.currentHUD.text=PTTime(pcp_points_current());
+    unsigned currentPosition=0;self.currentHUD.text=pcp_playback_position(&currentPosition)?PTTime(currentPosition):@"--:--.---";
     PracticePoints hudPoints=pcp_points_snapshot();self.durationHUD.text=hudPoints.duration?PTTime(hudPoints.duration):@"--:--.---";
     for(UILabel *l in @[self.speedHUD,self.accHUD,self.currentHUD,self.durationHUD])l.alpha=(s.visible||pcp_paused_fast())?0.35:1;
     self.entry.hidden=YES; /* Native pause row owns the entry. */
@@ -332,11 +332,6 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     PracticePoints p=pcp_points_snapshot();unsigned extent=MAX(1u,pcp_points_extent()),current=pcp_points_current();
     self.axis.points=p;self.axis.extent=extent;self.axis.current=current;self.axis.selected=self.selected;self.axis.userInteractionEnabled=!busy;self.axis.drafting=editing;self.axis.draftID=self.freeEditing?5:self.selected;self.axis.draftMs=(unsigned)self.milliseconds.text.longLongValue;self.axis.draftLimit=_edit.duration;[self.axis setNeedsDisplay];
     self.rangeLabel.text=[NSString stringWithFormat:@"Current - %@",PTTime(current)];
-    for(unsigned i=0;i<5;i++) {
-        PTTextureButton *b=(PTTextureButton *)self.chips[i];[b setTitle:PTName(i) forState:UIControlStateNormal];
-        b.enabled=!busy&&!editing;b.unset=!(p.mask&(1u<<i));b.selected=self.selected==(NSInteger)i;
-        b.accessibilityLabel=[NSString stringWithFormat:@"%@ %@",PTName(i),(p.mask&(1u<<i))?PTTime(p.ms[i]):@"未设置"];
-    }
     BOOL has=self.selected>=0 && (p.mask&(1u<<self.selected));
     self.selection.text=self.freeEditing?@"自由定位 C · 确认后跳转":has?[NSString stringWithFormat:@"%@  %@",PTName(self.selected),PTTime(p.ms[self.selected])]:@"点击时间轴或左右箭头选点";
     [self.jump setTitle:has?[NSString stringWithFormat:@"跳转到 %@ 点",PTName(self.selected)]:@"选中点位后跳转" forState:UIControlStateNormal];
