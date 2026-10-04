@@ -24,6 +24,10 @@ typedef struct {
 PracticeHUDState pcp_hud_state(void);
 typedef struct {int active,paused;unsigned remaining_ms;} PracticeCountdownState;
 PracticeCountdownState pcp_countdown_state(void);
+/* v43: fast pause snapshot straight from the per-frame tag3 state (freshness
+ * bounded). Used by the UI so countdown hiding and HUD dimming follow the
+ * pause screen without waiting for the 1 Hz control cycle. */
+int pcp_paused_fast(void);
 int pcp_native_continue(void);
 int pcp_cancel_jump(void);
 /* Main-thread synchronous dismissal before native scene transitions. */
