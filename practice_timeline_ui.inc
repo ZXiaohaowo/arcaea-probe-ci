@@ -21,7 +21,9 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     UIView *hit=[super hitTest:p withEvent:e];return hit==self?nil:hit;
 }
 @end
-@interface PTBackdrop : UIView @end
+@interface PTBackdrop : UIView
+@property(nonatomic) BOOL framed;
+@end
 @implementation PTBackdrop
 - (instancetype)initWithFrame:(CGRect)frame {
     if((self=[super initWithFrame:frame])) {
@@ -32,32 +34,123 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
 - (void)layoutSubviews {[super layoutSubviews];[self setNeedsDisplay];}
 - (void)drawRect:(CGRect)rect {
     CGContextRef c=UIGraphicsGetCurrentContext();
+    CGFloat W=rect.size.width,H=rect.size.height;
     CGColorSpaceRef space=CGColorSpaceCreateDeviceRGB();
-    CGFloat colors[]={0.14,0.10,0.31,1, 0.25,0.18,0.46,1, 0.13,0.10,0.29,1};
-    CGFloat stops[]={0,0.5,1};CGGradientRef g=CGGradientCreateWithColorComponents(space,colors,stops,3);
-    CGContextDrawLinearGradient(c,g,CGPointZero,CGPointMake(0,rect.size.height),0);CGGradientRelease(g);CGColorSpaceRelease(space);
-    CGContextSetStrokeColorWithColor(c,[UIColor colorWithRed:0.77 green:0.67 blue:1 alpha:0.12].CGColor);
-    CGContextSetLineWidth(c,1);
-    for(int i=0;i<9;i++) {
-        CGFloat x=rect.size.width/2+(i-4)*32,y=rect.size.height*0.48,h=42+(i%3)*24;
-        CGContextMoveToPoint(c,x,y-h);CGContextAddLineToPoint(c,x+25,y);
-        CGContextAddLineToPoint(c,x,y+h);CGContextAddLineToPoint(c,x-25,y);CGContextClosePath(c);CGContextStrokePath(c);
+    /* base vertical gradient */
+    CGFloat colors[]={0.13,0.10,0.29,1, 0.26,0.19,0.48,1, 0.11,0.08,0.26,1};
+    CGFloat stops[]={0,0.46,1};
+    CGGradientRef g=CGGradientCreateWithColorComponents(space,colors,stops,3);
+    CGContextDrawLinearGradient(c,g,CGPointZero,CGPointMake(0,H),0);CGGradientRelease(g);
+    /* central glow behind the content */
+    CGFloat glowColors[]={0.42,0.33,0.72,0.55, 0.20,0.15,0.40,0.0};
+    CGFloat glowStops[]={0,1};
+    CGGradientRef glow=CGGradientCreateWithColorComponents(space,glowColors,glowStops,2);
+    CGPoint gc=CGPointMake(W/2,H*0.44);
+    CGContextDrawRadialGradient(c,glow,gc,0,gc,MAX(W,H)*0.52,0);CGGradientRelease(glow);
+    /* layered horizontal bands */
+    CGContextSetFillColorWithColor(c,[UIColor colorWithWhite:0 alpha:0.18].CGColor);
+    CGContextFillRect(c,CGRectMake(0,0,W,H*0.06));
+    CGContextSetFillColorWithColor(c,[UIColor colorWithWhite:0 alpha:0.12].CGColor);
+    CGContextFillRect(c,CGRectMake(0,H*0.94,W,H*0.06));
+    CGContextSetFillColorWithColor(c,[UIColor colorWithWhite:1 alpha:0.035].CGColor);
+    CGContextFillRect(c,CGRectMake(0,H*0.30,W,H*0.40));
+    /* geometric lattice: three rows of diamonds, brighter in the middle */
+    for(int row=0;row<3;row++) {
+        CGFloat y=H*(0.24+row*0.15),scale=1.0-row*0.22;
+        CGFloat alpha=row==1?0.20:0.12;
+        CGContextSetStrokeColorWithColor(c,[UIColor colorWithRed:0.80 green:0.72 blue:1 alpha:alpha].CGColor);
+        CGContextSetLineWidth(c,1);
+        CGFloat step=W/13.0;
+        for(int i=-6;i<=6;i++) {
+            CGFloat x=W/2+i*step,h=52*scale,w2=26*scale;
+            CGContextMoveToPoint(c,x,y-h);CGContextAddLineToPoint(c,x+w2,y);
+            CGContextAddLineToPoint(c,x,y+h);CGContextAddLineToPoint(c,x-w2,y);
+            CGContextClosePath(c);CGContextStrokePath(c);
+        }
     }
+    /* vignette */
+    CGFloat vColors[]={0,0,0,0.30, 0,0,0,0.0};
+    CGGradientRef top=CGGradientCreateWithColorComponents(space,vColors,NULL,2);
+    CGContextDrawLinearGradient(c,top,CGPointZero,CGPointMake(0,H*0.14),0);CGGradientRelease(top);
+    CGGradientRef bot=CGGradientCreateWithColorComponents(space,vColors,NULL,2);
+    CGContextDrawLinearGradient(c,bot,CGPointMake(0,H),CGPointMake(0,H*0.86),0);CGGradientRelease(bot);
+    CGColorSpaceRelease(space);
+    /* optional frame for the full-screen page */
+    if(self.framed) {
+        UIBezierPath *frame=[UIBezierPath bezierPathWithRect:CGRectInset(rect,14,14)];
+        [[UIColor colorWithWhite:1 alpha:0.10] setStroke];frame.lineWidth=1;[frame stroke];
+        UIBezierPath *frame2=[UIBezierPath bezierPathWithRect:CGRectInset(rect,19,19)];
+        [[UIColor colorWithWhite:1 alpha:0.05] setStroke];frame2.lineWidth=1;[frame2 stroke];
+    }
+}
+@end
+@interface PTSeparator : UIView
+@property(nonatomic) BOOL strong;
+@end
+@implementation PTSeparator
+- (instancetype)initWithFrame:(CGRect)frame {
+    if((self=[super initWithFrame:frame])){self.backgroundColor=UIColor.clearColor;self.opaque=NO;}
+    return self;
+}
+- (void)drawRect:(CGRect)rect {
+    CGFloat W=rect.size.width,y=rect.size.height/2,h=self.strong?2.0:1.0;
+    [[UIColor colorWithWhite:1 alpha:self.strong?0.62:0.22] setFill];
+    UIRectFill(CGRectMake(0,y-h/2,W,h));
+    [[UIColor colorWithWhite:1 alpha:self.strong?0.95:0.5] setFill];
+    UIRectFill(CGRectMake(W*0.34,y-h/2,W*0.32,h));
+    UIBezierPath *left=[UIBezierPath bezierPath];
+    [left moveToPoint:CGPointMake(6,y-6)];[left addLineToPoint:CGPointMake(12,y)];
+    [left addLineToPoint:CGPointMake(6,y+6)];[left addLineToPoint:CGPointMake(0,y)];
+    [left closePath];
+    [[UIColor colorWithWhite:1 alpha:self.strong?0.75:0.35] setFill];[left fill];
+    UIBezierPath *right=[UIBezierPath bezierPath];
+    [right moveToPoint:CGPointMake(W-6,y-6)];[right addLineToPoint:CGPointMake(W-12,y)];
+    [right addLineToPoint:CGPointMake(W-6,y+6)];[right addLineToPoint:CGPointMake(W,y)];
+    [right closePath];
+    [[UIColor colorWithWhite:1 alpha:self.strong?0.75:0.35] setFill];[right fill];
 }
 @end
 @interface PTHexButton : UIButton @end
 @implementation PTHexButton
-- (void)drawRect:(CGRect)rect {
-    CGRect r=CGRectInset(self.bounds,1,1);CGFloat k=12;
+- (UIBezierPath *)shapePath:(CGRect)r {
+    CGFloat k=18;
     UIBezierPath *p=[UIBezierPath bezierPath];
     [p moveToPoint:CGPointMake(r.origin.x+k,r.origin.y)];
     [p addLineToPoint:CGPointMake(CGRectGetMaxX(r)-k,r.origin.y)];
     [p addLineToPoint:CGPointMake(CGRectGetMaxX(r),CGRectGetMidY(r))];
     [p addLineToPoint:CGPointMake(CGRectGetMaxX(r)-k,CGRectGetMaxY(r))];
     [p addLineToPoint:CGPointMake(r.origin.x+k,CGRectGetMaxY(r))];
-    [p addLineToPoint:CGPointMake(r.origin.x,CGRectGetMidY(r))];[p closePath];
-    [[UIColor colorWithRed:0.38 green:0.30 blue:0.59 alpha:self.selected?0.8:0.35] setFill];[p fill];
-    [[UIColor colorWithWhite:1 alpha:self.selected?1:0.65] setStroke];p.lineWidth=self.selected?2:1;[p stroke];
+    [p addLineToPoint:CGPointMake(r.origin.x,CGRectGetMidY(r))];
+    [p closePath];
+    return p;
+}
+- (void)drawRect:(CGRect)rect {
+    CGRect r=CGRectInset(self.bounds,1,1);
+    UIBezierPath *outer=[self shapePath:r];
+    UIBezierPath *inner=[self shapePath:CGRectInset(r,4,3)];
+    CGContextRef c=UIGraphicsGetCurrentContext();
+    /* layered fill */
+    [[UIColor colorWithRed:0.32 green:0.25 blue:0.55 alpha:self.selected?0.85:0.42] setFill];[outer fill];
+    CGContextSaveGState(c);[outer addClip];
+    CGFloat top[]={0.42,0.34,0.68,self.selected?0.45:0.22, 0.22,0.17,0.42,0.0};
+    CGColorSpaceRef sp=CGColorSpaceCreateDeviceRGB();
+    CGGradientRef gr=CGGradientCreateWithColorComponents(sp,top,NULL,2);
+    CGContextDrawLinearGradient(c,gr,CGPointMake(0,CGRectGetMinY(r)),CGPointMake(0,CGRectGetMaxY(r)),0);
+    CGGradientRelease(gr);CGColorSpaceRelease(sp);
+    /* diagonal texture */
+    CGContextSetStrokeColorWithColor(c,[UIColor colorWithWhite:1 alpha:self.selected?0.09:0.06].CGColor);
+    CGContextSetLineWidth(c,1);
+    for(CGFloat x=-r.size.height;x<r.size.width;x+=13) {
+        CGContextMoveToPoint(c,x,CGRectGetMinY(r));
+        CGContextAddLineToPoint(c,x+r.size.height,CGRectGetMaxY(r));
+        CGContextStrokePath(c);
+    }
+    CGContextRestoreGState(c);
+    /* double border like the Paused row */
+    [[UIColor colorWithWhite:1 alpha:self.selected?0.95:0.78] setStroke];
+    outer.lineWidth=self.selected?2.0:1.4;[outer stroke];
+    [[UIColor colorWithWhite:1 alpha:self.selected?0.55:0.30] setStroke];
+    inner.lineWidth=1.0;[inner stroke];
 }
 - (void)setEnabled:(BOOL)v {[super setEnabled:v];self.alpha=v?1:0.32;[self setNeedsDisplay];}
 - (void)setSelected:(BOOL)s {[super setSelected:s];[self setNeedsDisplay];}
@@ -150,11 +243,13 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     self.selected=-1;self.overlay=[PCPRateOverlay new];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(hideForTransition) name:@"PCPTransitionBegin" object:nil];
     self.curtain=[PTBackdrop new];self.curtain.hidden=YES;[self.overlay addSubview:self.curtain];
+    ((PTBackdrop *)self.curtain).framed=YES;
     self.panel=[UIView new];self.panel.hidden=YES;self.panel.backgroundColor=UIColor.clearColor;
     [self.overlay addSubview:self.panel];
     for(NSNumber *n in @[@66,@211,@388,@508,@624]) {
-        UIView *line=[[UIView alloc] initWithFrame:CGRectMake(20,n.doubleValue,960,0.7)];
-        line.backgroundColor=[UIColor colorWithWhite:1 alpha:0.35];[self.panel addSubview:line];
+        PTSeparator *line=[[PTSeparator alloc] initWithFrame:CGRectMake(20,n.doubleValue,960,3)];
+        line.strong=[n isEqual:@66];
+        [self.panel addSubview:line];
     }
     [self label:26 frame:CGRectMake(32,18,200,40) text:@"练习设置"];
     self.close=[self button:@"关闭 ×" frame:CGRectMake(850,18,118,40) action:@selector(toggle)];
@@ -238,8 +333,9 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
 - (void)cancelWaiting {if(pcp_cancel_jump())[self message:@"已取消待执行跳转，可重新设置"];}
 - (void)countdownTick {
     if(UIApplication.sharedApplication.applicationState!=UIApplicationStateActive || !self.panel.hidden) {self.countdown.hidden=YES;return;}
-    PracticeCountdownState c=pcp_countdown_state();self.countdown.hidden=!c.active;
-    if(!c.active)return;
+    PracticeCountdownState c=pcp_countdown_state();
+    self.countdown.hidden=!c.active || c.paused;   /* v42: 暂停时隐藏倒计时 */
+    if(self.countdown.hidden)return;
     self.countdown.frame=CGRectMake(self.overlay.bounds.size.width/2-180,self.overlay.bounds.size.height/2-70,360,120);
     self.countdown.text=[NSString stringWithFormat:@"%u:%03u",c.remaining_ms/1000,c.remaining_ms%1000];
 }
@@ -318,6 +414,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     self.overlay.frame=w.bounds;[w bringSubviewToFront:self.overlay];self.overlay.hidden=NO;
     PracticeHUDState hud=pcp_hud_state();
     self.speedHUD.hidden=self.accHUD.hidden=!hud.visible || !self.panel.hidden;
+    self.speedHUD.alpha=self.accHUD.alpha=s.visible?0.35:1.0; /* v42: 暂停时模拟位于暂停蒙层之下 */
     CGFloat hudW=MIN(240,w.bounds.size.width*0.23),hudX=w.bounds.size.width-w.safeAreaInsets.right-hudW-20;
     self.speedHUD.frame=CGRectMake(hudX,w.bounds.size.height*0.465,hudW,34);
     self.accHUD.frame=CGRectMake(hudX,w.bounds.size.height*0.465+36,hudW,34);
@@ -376,6 +473,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     else if(CFAbsoluteTimeGetCurrent()>self.messageUntil)
         self.status.text=phase==6?[NSString stringWithFormat:@"跳转未通过验证 (%u)，循环已停止",pcp_seek_error()]:phase==5?@"已跳转 · 可继续练习":@"选点 → 再点编辑 · 跳转会重试并开始练习";
     self.speedHUD.hidden=self.accHUD.hidden=!hud.visible || !self.panel.hidden;
+    self.speedHUD.alpha=self.accHUD.alpha=s.visible?0.35:1.0; /* v42: 暂停时模拟位于暂停蒙层之下 */
     self.entry.hidden=!s.visible || !self.panel.hidden;
 }
 @end
