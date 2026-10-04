@@ -868,6 +868,7 @@ static volatile int g_last_chart_ms;
  * "重试" mode calls its vtable slot 2 (retry) while playing, then jumps to A
  * on the fresh chart. Slot 0 = resume (verified from the button lambdas). */
 static volatile uint64_t g_retry_obj, g_retry_vptr, g_retry_calls, g_retry_fail;
+static uint64_t g_pause_layer,g_pause_vptr;
 static volatile int g_retry_valid;
 static volatile uint64_t g_scene_gen;
 static uint64_t g_song_bound_gen;
@@ -1031,13 +1032,22 @@ static int retry_call(void)
 }
 
 int pcp_native_continue(void) {
-    uint64_t vt=0,fn=0;
+    uint64_t vt=0,fn=0,flags=0,target=0,gg=0,am=0,pv=0,fp=0;
     PracticeRateUIState ui=pcp_rate_ui_state();
     if(!pthread_main_np() || !ui.visible || !g_retry_valid || g_retry_generation!=g_scene_gen ||
        !rate_read64(g_retry_obj,&vt) || vt!=g_retry_vptr || !rate_read64(vt,&fn) ||
-       fn<g_base || fn>=g_base+0x1400000)return 0;
+       fn<g_base || fn>=g_base+0x1400000 ||
+       !rate_read64(g_pause_layer,&vt) || vt!=g_pause_vptr ||
+       !rate_read64(g_pause_layer+0x298,&flags) || (flags&255)!=1 ||
+       !rate_read64(g_pause_layer+0x2a0,&target) || target!=g_retry_obj ||
+       !rate_read64(g_base+OFF_SLOT,&gg) || !rate_read64(gg+OFF_GG_AM,&am) ||
+       !rate_read64(am,&vt) || vt!=g_base+OFF_AM_VT ||
+       !rate_read64(am+OFF_AM_PROVIDER,&pv) || !rate_read64(pv,&vt) || vt!=g_base+OFF_PV_VT ||
+       !rate_read64(vt+0xc8,&fp) || fp!=g_base+0x8e5380 ||
+       !((int (*)(void *))(uintptr_t)fp)((void *)(uintptr_t)pv))return 0;
     practice_rate_ui_transition_begin();g_ui.visible=g_ui.ready=0;g_ui.epoch++;
-    ((void (*)(void *,uint64_t))(uintptr_t)fn)((void *)(uintptr_t)g_retry_obj,0);
+    /* Original resume lambda 0x94a6d8..0x94a6f4 sets BOTH w1 and w2 to zero. */
+    ((void (*)(void *,uint64_t,uint64_t))(uintptr_t)fn)((void *)(uintptr_t)g_retry_obj,0,0);
     atomic_store(&g_fast_control,1);return 1;
 }
 int pcp_cancel_jump(void) {
@@ -1141,6 +1151,7 @@ uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
                     char pl[96];
                     int pn;
                     g_retry_obj=obj; g_retry_vptr=vt; g_retry_valid=1; g_retry_generation=g_scene_gen;
+                    g_pause_layer=lr;g_pause_vptr=*(volatile uint64_t *)(uintptr_t)lr;
                     pn=snprintf(pl,sizeof(pl),"pc obj=%llx vt=%llx\n",
                                 (unsigned long long)obj,(unsigned long long)vt);
                     if (pn>0 && (size_t)pn<sizeof(pl)) padd(pl,(size_t)pn);
