@@ -10,6 +10,19 @@ static UIFont *PTFont(CGFloat size,BOOL latin) {
     UIFont *font=[UIFont fontWithName:latin?@"Exo-Light":@"NotoSansCJKsc-Light" size:size];
     return font?:[UIFont systemFontOfSize:size weight:UIFontWeightLight];
 }
+/* v45: reuse the game's own UI textures from the app bundle (read-only). */
+static UIImage *PTGameImage(NSString *rel) {
+    static NSMutableDictionary *cache;
+    if(!cache) cache=[NSMutableDictionary dictionary];
+    UIImage *img=cache[rel];
+    if(img) return img;
+    NSString *path=[NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:rel];
+    if([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        img=[UIImage imageWithContentsOfFile:path];
+        if(img) cache[rel]=img;
+    }
+    return img;
+}
 static NSString *PTTime(unsigned ms) {
     char text[32],detail[32];pp_format(ms,text,sizeof(text),detail,sizeof(detail));
     return [NSString stringWithUTF8String:text];
@@ -47,7 +60,17 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
 @end
 @interface PTHexButton : UIButton @end
 @implementation PTHexButton
+- (void)setHighlighted:(BOOL)h {[super setHighlighted:h];[self setNeedsDisplay];}
 - (void)drawRect:(CGRect)rect {
+    /* v45: prefer the game's own pause button texture; drawn shape is fallback. */
+    UIImage *img=PTGameImage(@"layouts/1080/pause/button.png");
+    if(img) {
+        UIImage *pressed=PTGameImage(@"layouts/1080/pause/button_pressed.png");
+        UIImage *use=((self.highlighted||self.selected)&&pressed)?pressed:img;
+        UIEdgeInsets caps=UIEdgeInsetsMake(12,30,12,30);
+        [[use resizableImageWithCapInsets:caps] drawInRect:self.bounds];
+        return;
+    }
     CGRect r=CGRectInset(self.bounds,1,1);CGFloat k=12;
     UIBezierPath *p=[UIBezierPath bezierPath];
     [p moveToPoint:CGPointMake(r.origin.x+k,r.origin.y)];
@@ -238,8 +261,11 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
 - (void)cancelWaiting {if(pcp_cancel_jump())[self message:@"已取消待执行跳转，可重新设置"];}
 - (void)countdownTick {
     if(UIApplication.sharedApplication.applicationState!=UIApplicationStateActive || !self.panel.hidden) {self.countdown.hidden=YES;return;}
-    PracticeCountdownState c=pcp_countdown_state();self.countdown.hidden=!c.active;
-    if(!c.active)return;
+    BOOL pausedNow=pcp_paused_fast()!=0;
+    self.speedHUD.alpha=self.accHUD.alpha=pausedNow?0.35:1.0;   /* v43: 30Hz 快速跟随暂停 */
+    PracticeCountdownState c=pcp_countdown_state();
+    self.countdown.hidden=!c.active || c.paused || pausedNow;   /* v43: 暂停立即隐藏 */
+    if(self.countdown.hidden)return;
     self.countdown.frame=CGRectMake(self.overlay.bounds.size.width/2-180,self.overlay.bounds.size.height/2-70,360,120);
     self.countdown.text=[NSString stringWithFormat:@"%u:%03u",c.remaining_ms/1000,c.remaining_ms%1000];
 }
@@ -318,6 +344,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     self.overlay.frame=w.bounds;[w bringSubviewToFront:self.overlay];self.overlay.hidden=NO;
     PracticeHUDState hud=pcp_hud_state();
     self.speedHUD.hidden=self.accHUD.hidden=!hud.visible || !self.panel.hidden;
+    self.speedHUD.alpha=self.accHUD.alpha=(s.visible||pcp_paused_fast())?0.35:1.0; /* v43 */
     CGFloat hudW=MIN(240,w.bounds.size.width*0.23),hudX=w.bounds.size.width-w.safeAreaInsets.right-hudW-20;
     self.speedHUD.frame=CGRectMake(hudX,w.bounds.size.height*0.465,hudW,34);
     self.accHUD.frame=CGRectMake(hudX,w.bounds.size.height*0.465+36,hudW,34);
@@ -376,6 +403,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     else if(CFAbsoluteTimeGetCurrent()>self.messageUntil)
         self.status.text=phase==6?[NSString stringWithFormat:@"跳转未通过验证 (%u)，循环已停止",pcp_seek_error()]:phase==5?@"已跳转 · 可继续练习":@"选点 → 再点编辑 · 跳转会重试并开始练习";
     self.speedHUD.hidden=self.accHUD.hidden=!hud.visible || !self.panel.hidden;
+    self.speedHUD.alpha=self.accHUD.alpha=(s.visible||pcp_paused_fast())?0.35:1.0; /* v43 */
     self.entry.hidden=!s.visible || !self.panel.hidden;
 }
 @end
