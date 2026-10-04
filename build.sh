@@ -51,7 +51,7 @@ xcrun --sdk iphoneos clang++ \
   -mios-version-min=15.0 \
   -dynamiclib -O2 \
   -framework CoreFoundation \
-  -framework UIKit -framework Foundation -framework CoreGraphics \
+  -framework UIKit -framework Foundation -framework CoreGraphics -framework CoreText \
   -install_name @executable_path/Frameworks/practice_clock_probe.framework/practice_clock_probe \
   -o out/practice_clock_probe.framework/practice_clock_probe \
   out/practice_clock_probe.o out/practice_obs_queue.o out/practice_time.o out/practice_shadow.o \

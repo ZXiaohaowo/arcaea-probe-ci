@@ -1,4 +1,15 @@
 /* Shared panel implementation. Compiled inside practice_rate_ui.m. */
+static void PTRegisterFonts(void) {
+    for(NSString *name in @[@"Exo-Light.ttf",@"Exo-Regular.ttf",@"NotoSansCJKsc-Light.otf"]) {
+        NSString *path=[NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:[@"Fonts/" stringByAppendingString:name]];
+        if([NSFileManager.defaultManager fileExistsAtPath:path])
+            CTFontManagerRegisterFontsForURL((__bridge CFURLRef)[NSURL fileURLWithPath:path],kCTFontManagerScopeProcess,NULL);
+    }
+}
+static UIFont *PTFont(CGFloat size,BOOL latin) {
+    UIFont *font=[UIFont fontWithName:latin?@"Exo-Light":@"NotoSansCJKsc-Light" size:size];
+    return font?:[UIFont systemFontOfSize:size weight:UIFontWeightLight];
+}
 static NSString *PTTime(unsigned ms) {
     char text[32],detail[32];pp_format(ms,text,sizeof(text),detail,sizeof(detail));
     return [NSString stringWithUTF8String:text];
@@ -12,10 +23,17 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
 @end
 @interface PTBackdrop : UIView @end
 @implementation PTBackdrop
+- (instancetype)initWithFrame:(CGRect)frame {
+    if((self=[super initWithFrame:frame])) {
+        self.backgroundColor=[UIColor colorWithRed:0.13 green:0.10 blue:0.29 alpha:1];
+        self.opaque=YES;self.contentMode=UIViewContentModeRedraw;
+    }return self;
+}
+- (void)layoutSubviews {[super layoutSubviews];[self setNeedsDisplay];}
 - (void)drawRect:(CGRect)rect {
     CGContextRef c=UIGraphicsGetCurrentContext();
     CGColorSpaceRef space=CGColorSpaceCreateDeviceRGB();
-    CGFloat colors[]={0.12,0.08,0.28,0.92, 0.24,0.16,0.43,0.88, 0.10,0.07,0.23,0.94};
+    CGFloat colors[]={0.14,0.10,0.31,1, 0.25,0.18,0.46,1, 0.13,0.10,0.29,1};
     CGFloat stops[]={0,0.5,1};CGGradientRef g=CGGradientCreateWithColorComponents(space,colors,stops,3);
     CGContextDrawLinearGradient(c,g,CGPointZero,CGPointMake(0,rect.size.height),0);CGGradientRelease(g);CGColorSpaceRelease(space);
     CGContextSetStrokeColorWithColor(c,[UIColor colorWithRed:0.77 green:0.67 blue:1 alpha:0.12].CGColor);
@@ -103,13 +121,13 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
 }
 @property(nonatomic,strong) PCPRateOverlay *overlay;
 @property(nonatomic,strong) UIView *panel,*editBox,*curtain,*keypad;
-@property(nonatomic,strong) UIButton *entry,*apply,*reset,*noteMode,*pitchMode,*loop,*jump,*addT,*removeT,*close;
+@property(nonatomic,strong) UIButton *entry,*apply,*reset,*noteMode,*pitchMode,*loop,*jump,*addT,*removeT,*close,*continueButton,*cancelJump;
 @property(nonatomic,strong) NSMutableArray<UIButton *> *chips,*editButtons,*captureButtons;
-@property(nonatomic,strong) UILabel *value,*status,*selection,*rangeLabel,*compLabel,*speedHUD,*accHUD,*noteSpeeds;
+@property(nonatomic,strong) UILabel *value,*status,*selection,*rangeLabel,*compLabel,*speedHUD,*accHUD,*noteSpeeds,*countdown,*keyboardTitle;
 @property(nonatomic,strong) UISlider *slider;
 @property(nonatomic,strong) UILabel *milliseconds;
 @property(nonatomic,strong) PTTimeline *axis;
-@property(nonatomic,strong) NSTimer *timer;
+@property(nonatomic,strong) NSTimer *timer,*countdownTimer;
 @property(nonatomic) NSInteger draft,selected;
 @property(nonatomic) uint64_t epoch,lastOpenSeq,pointEpoch;
 @property(nonatomic) NSTimeInterval messageUntil;
@@ -118,18 +136,19 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
 @implementation PCPRatePanel
 - (UILabel *)label:(CGFloat)size frame:(CGRect)frame text:(NSString *)text {
     UILabel *v=[[UILabel alloc] initWithFrame:frame];v.textColor=UIColor.whiteColor;
-    v.font=[UIFont monospacedDigitSystemFontOfSize:size weight:UIFontWeightMedium];v.text=text;v.textAlignment=NSTextAlignmentCenter;
+    v.font=PTFont(size,NO);v.text=text;v.textAlignment=NSTextAlignmentCenter;
     [self.panel addSubview:v];return v;
 }
 - (UIButton *)button:(NSString *)title frame:(CGRect)frame action:(SEL)action {
     PTHexButton *v=[[PTHexButton alloc] initWithFrame:frame];v.backgroundColor=UIColor.clearColor;
     [v setTitle:title forState:UIControlStateNormal];[v setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    v.titleLabel.font=[UIFont systemFontOfSize:17 weight:UIFontWeightMedium];v.titleLabel.numberOfLines=2;v.titleLabel.textAlignment=NSTextAlignmentCenter;
+    v.titleLabel.font=PTFont(17,NO);v.titleLabel.numberOfLines=2;v.titleLabel.textAlignment=NSTextAlignmentCenter;
     [v addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];[self.panel addSubview:v];return v;
 }
 - (void)message:(NSString *)s {self.status.text=s;self.messageUntil=CFAbsoluteTimeGetCurrent()+3;}
 - (void)build {
     self.selected=-1;self.overlay=[PCPRateOverlay new];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(hideForTransition) name:@"PCPTransitionBegin" object:nil];
     self.curtain=[PTBackdrop new];self.curtain.hidden=YES;[self.overlay addSubview:self.curtain];
     self.panel=[UIView new];self.panel.hidden=YES;self.panel.backgroundColor=UIColor.clearColor;
     [self.overlay addSubview:self.panel];
@@ -166,10 +185,12 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     self.loop=[self button:@"A/B 循环-关" frame:CGRectMake(612,458,356,42) action:@selector(loopTap)];
     self.selection=[self label:18 frame:CGRectMake(32,518,936,32) text:@"点击 A / B / T 选中，再次点击编辑"];
     self.jump=[self button:@"选中点位后跳转" frame:CGRectMake(250,562,500,48) action:@selector(jumpTap)];
+    self.cancelJump=[self button:@"取消待执行跳转" frame:CGRectMake(32,562,200,48) action:@selector(cancelWaiting)];
+    self.continueButton=[self button:@"继续准备" frame:CGRectMake(772,562,196,48) action:@selector(continuePlaying)];
     self.editBox=[[UIView alloc] initWithFrame:CGRectMake(32,512,936,108)];self.editBox.hidden=YES;[self.panel addSubview:self.editBox];
     self.milliseconds=[[UILabel alloc] initWithFrame:CGRectMake(0,0,230,44)];
     self.milliseconds.textColor=UIColor.whiteColor;self.milliseconds.backgroundColor=[UIColor colorWithWhite:1 alpha:0.1];
-    self.milliseconds.font=[UIFont monospacedDigitSystemFontOfSize:24 weight:UIFontWeightMedium];
+    self.milliseconds.font=PTFont(28,YES);
     self.milliseconds.textAlignment=NSTextAlignmentCenter;self.milliseconds.userInteractionEnabled=YES;
     [self.milliseconds addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(openDigits)]];
     [self.editBox addSubview:self.milliseconds];
@@ -185,22 +206,42 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     [cancel removeFromSuperview];[self.editBox addSubview:cancel];
     self.removeT=[self button:@"删除 T" frame:CGRectMake(0,58,220,44) action:@selector(deletePoint)];
     [self.removeT removeFromSuperview];[self.editBox addSubview:self.removeT];
-    self.keypad=[[PTBackdrop alloc] initWithFrame:CGRectMake(256,244,488,256)];self.keypad.hidden=YES;
+    self.keypad=[[PTBackdrop alloc] initWithFrame:CGRectMake(264,248,472,254)];self.keypad.hidden=YES;
     [self.panel addSubview:self.keypad];
     NSArray *keys=@[@"1",@"2",@"3",@"4",@"5",@"6",@"7",@"8",@"9",@"清空",@"0",@"退格"];
     for(int i=0;i<12;i++) {
-        UIButton *key=[self button:keys[i] frame:CGRectMake(12+(i%3)*158,8+(i/3)*61,148,53) action:@selector(digit:)];
-        key.tag=i;[key removeFromSuperview];[self.keypad addSubview:key];
+        UIButton *key=[self button:keys[i] frame:CGRectMake(12+(i%3)*152,8+(i/3)*60,144,52) action:@selector(digit:)];
+        key.titleLabel.font=PTFont(i==9||i==11?18:28,i!=9&&i!=11);key.tag=i;[key removeFromSuperview];[self.keypad addSubview:key];
     }
+    self.keyboardTitle=[self label:20 frame:CGRectMake(32,214,936,30) text:@"输入时间 · 毫秒"];self.keyboardTitle.hidden=YES;
     self.status=[self label:14 frame:CGRectMake(32,632,936,28) text:@"先选择点位，再跳转；跳转会重试并开始练习"];
     self.entry=[self button:@"倍率 1.00x" frame:CGRectZero action:@selector(toggle)];[self.entry removeFromSuperview];[self.overlay addSubview:self.entry];
     self.speedHUD=[self label:20 frame:CGRectZero text:@"SPEED 1.00x"];
     self.accHUD=[self label:20 frame:CGRectZero text:@"ACC --"];
     for(UILabel *l in @[self.speedHUD,self.accHUD]) {
         [l removeFromSuperview];[self.overlay addSubview:l];l.textAlignment=NSTextAlignmentRight;
+        l.font=PTFont(24,YES);
         l.layer.shadowColor=UIColor.blackColor.CGColor;l.layer.shadowOpacity=0.65;l.layer.shadowRadius=3;l.layer.shadowOffset=CGSizeMake(0,1);
     }
+    self.countdown=[self label:68 frame:CGRectZero text:@"3:000"];
+    [self.countdown removeFromSuperview];[self.overlay addSubview:self.countdown];self.countdown.font=PTFont(68,YES);
+    self.countdown.hidden=YES;self.countdown.layer.shadowColor=UIColor.blackColor.CGColor;
+    self.countdown.layer.shadowOpacity=0.75;self.countdown.layer.shadowRadius=5;self.countdown.layer.shadowOffset=CGSizeMake(0,2);
     self.draft=pcp_rate_ui_stored_percent();[self updateDraft];
+}
+- (void)hideForTransition {
+    [self cancelEdit];self.panel.hidden=self.curtain.hidden=self.entry.hidden=YES;
+    self.speedHUD.hidden=self.accHUD.hidden=self.countdown.hidden=YES;
+    self.lastOpenSeq=pcp_rate_ui_state().open_seq;
+}
+- (void)continuePlaying {if(!pcp_native_continue())[self message:@"请返回暂停菜单后继续播放"];}
+- (void)cancelWaiting {if(pcp_cancel_jump())[self message:@"已取消待执行跳转，可重新设置"];}
+- (void)countdownTick {
+    if(UIApplication.sharedApplication.applicationState!=UIApplicationStateActive || !self.panel.hidden) {self.countdown.hidden=YES;return;}
+    PracticeCountdownState c=pcp_countdown_state();self.countdown.hidden=!c.active;
+    if(!c.active)return;
+    self.countdown.frame=CGRectMake(self.overlay.bounds.size.width/2-180,self.overlay.bounds.size.height/2-70,360,120);
+    self.countdown.text=[NSString stringWithFormat:@"%u:%03u",c.remaining_ms/1000,c.remaining_ms%1000];
 }
 - (void)openDigits {self.keypad.hidden=!self.keypad.hidden;self.replaceDigits=YES;}
 - (void)digit:(UIButton *)b {
@@ -219,7 +260,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
 - (void)step:(UIButton *)s {self.draft+=s.tag;[self updateDraft];}
 - (void)toggle { [self cancelEdit];self.panel.hidden=!self.panel.hidden;if(!self.panel.hidden){self.draft=pcp_rate_ui_stored_percent();[self updateDraft];} }
 - (void)applyRate {
-    if(pcp_rate_ui_request((unsigned)self.draft,self.epoch)){pcp_rate_ui_save_percent((unsigned)self.draft);[self message:@"倍率请求已提交"];}else [self message:@"暂停状态尚未就绪"];
+    if(pcp_rate_ui_request((unsigned)self.draft,self.epoch)){pcp_rate_ui_save_percent((unsigned)self.draft);[self message:(pcp_rate_ui_state().prep?@"倍率已保存，将在开始播放时应用":@"倍率请求已提交")];}else [self message:@"暂停状态尚未就绪"];
 }
 - (void)resetRate {self.draft=100;[self updateDraft];[self applyRate];}
 - (void)noteTap {pcp_note_mode_set(!pcp_note_mode_get());[self message:@"Note 模式将在重试或重新进歌后生效"];} 
@@ -257,9 +298,9 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     if(![self readInput] || !pcp_point_update((unsigned)self.selected,_edit.draft)){[self message:@"时间超出范围或会话已变化，尚未保存"];return;}
     [self cancelEdit];[self message:@"时间已更新"];
 }
-- (void)cancelEdit {self.keypad.hidden=YES;_edit.editing=0;self.editBox.hidden=YES;self.jump.hidden=self.selection.hidden=NO;}
+- (void)cancelEdit {self.keypad.hidden=YES;self.keyboardTitle.hidden=YES;_edit.editing=0;self.editBox.hidden=YES;self.jump.hidden=self.selection.hidden=NO;}
 - (void)jumpTap {
-    if(self.selected>=0 && pcp_point_jump((unsigned)self.selected)){[self message:@"正在重试并定位…"];[self.panel endEditing:YES];}
+    if(self.selected>=0 && pcp_point_jump((unsigned)self.selected)){[self hideForTransition];}
     else [self message:@"无法提交跳转，请保持暂停并选中点位"];
 }
 - (void)loopTap {pcp_ab_loop_set(pcp_loop_suspended()?1:!pcp_ab_loop_get());}
@@ -272,14 +313,14 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
 }
 - (void)tick {
     PracticeRateUIState s=pcp_rate_ui_state();UIWindow *w=[self gameWindow];
-    if(!w || UIApplication.sharedApplication.applicationState!=UIApplicationStateActive){[self cancelEdit];self.overlay.hidden=YES;self.curtain.hidden=YES;return;}
+    if(!w || UIApplication.sharedApplication.applicationState!=UIApplicationStateActive || s.transitioning){[self hideForTransition];self.overlay.hidden=YES;return;}
     if(self.overlay.superview!=w){[self.overlay removeFromSuperview];[w addSubview:self.overlay];}
     self.overlay.frame=w.bounds;[w bringSubviewToFront:self.overlay];self.overlay.hidden=NO;
     PracticeHUDState hud=pcp_hud_state();
     self.speedHUD.hidden=self.accHUD.hidden=!hud.visible || !self.panel.hidden;
     CGFloat hudW=MIN(240,w.bounds.size.width*0.23),hudX=w.bounds.size.width-w.safeAreaInsets.right-hudW-20;
-    self.speedHUD.frame=CGRectMake(hudX,w.bounds.size.height*0.31,hudW,34);
-    self.accHUD.frame=CGRectMake(hudX,w.bounds.size.height*0.58,hudW,34);
+    self.speedHUD.frame=CGRectMake(hudX,w.bounds.size.height*0.465,hudW,34);
+    self.accHUD.frame=CGRectMake(hudX,w.bounds.size.height*0.465+36,hudW,34);
     self.speedHUD.text=[NSString stringWithFormat:@"SPEED %.2fx",hud.percent/100.0];
     self.accHUD.text=hud.score_valid?[NSString stringWithFormat:@"ACC %.2f%%",hud.accuracy]:@"ACC --";
     self.entry.hidden=!s.visible;
@@ -297,8 +338,8 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     self.panel.center=CGPointMake(w.bounds.size.width/2,w.safeAreaInsets.top+12+h/2);
     self.curtain.frame=w.bounds;self.curtain.hidden=self.panel.hidden;
     unsigned phase=pcp_seek_phase();BOOL busy=phase>=1 && phase<=4,editing=!self.editBox.hidden;
-    self.apply.enabled=self.reset.enabled=s.ready&&!s.pending&&!busy&&!editing;self.slider.enabled=!s.pending&&!busy&&!editing;
-    self.noteMode.enabled=self.pitchMode.enabled=!busy&&!editing;
+    self.apply.enabled=self.reset.enabled=s.ready&&!s.pending&&(!busy||s.prep)&&!editing;self.slider.enabled=!s.pending&&(!busy||s.prep)&&!editing;
+    self.noteMode.enabled=self.pitchMode.enabled=(!busy||s.prep)&&!editing;
     [self.noteMode setTitle:pcp_note_mode_get()?@"Note 流速不变":@"Note 同步变速" forState:UIControlStateNormal];
     [self.pitchMode setTitle:pcp_pitch_mode_get()?(hud.pitch_attached || hud.percent==100?@"音高 保持":@"音高 保持 · 待挂接"):@"音高 随速" forState:UIControlStateNormal];
     self.noteSpeeds.text=hud.scroll_valid?[NSString stringWithFormat:@"CurrentNoteSpeed %.2f × SPEED %.2f = NoteSpeed %.2f",hud.current_note_speed,hud.percent/100.0,hud.note_speed]:@"CurrentNoteSpeed --   ·   NoteSpeed --";
@@ -318,12 +359,23 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     self.addT.enabled=!busy&&!editing&&((p.mask&28)!=28);
     for(UIButton *b in self.captureButtons)b.enabled=!busy&&!editing;
     self.loop.enabled=!busy&&!editing;
+    self.cancelJump.hidden=!(phase==3 && s.visible && !editing);
+    self.continueButton.hidden=!(s.visible && !editing && (s.prep || busy));
+    [self.continueButton setTitle:s.prep?@"继续准备":@"继续播放" forState:UIControlStateNormal];
+    BOOL digits=!self.keypad.hidden;
+    self.axis.hidden=digits;self.rangeLabel.hidden=digits;self.keyboardTitle.hidden=!digits;
+    self.keyboardTitle.text=[NSString stringWithFormat:@"编辑 %@ · 输入毫秒",has?PTName(self.selected):@"时间"];
+    for(UIButton *b in self.chips)b.hidden=digits;
+    for(UIButton *b in self.captureButtons)b.hidden=digits;
+    self.addT.hidden=self.loop.hidden=digits;
     NSString *loopTitle=pcp_ab_loop_get()?@"A/B 循环-开":@"A/B 循环-关";
     if(pcp_loop_suspended())loopTitle=@"A/B 循环-开 · 已暂挂";
     else if(pcp_ab_loop_get() && ((p.mask&3)!=3 || p.ms[1]<=p.ms[0]))loopTitle=@"A/B 循环-开 · 请设置 A < B";
     [self.loop setTitle:loopTitle forState:UIControlStateNormal];
-    if(busy)self.status.text=phase==1?@"等待跳转条件…":phase==2?@"正在重试，等待新会话…":phase==3?@"等待预备段结束并定位…":(s.visible?@"已暂停，恢复播放后继续确认":@"正在确认跳转位置…");
+    if(busy)self.status.text=phase==1?@"等待跳转条件…":phase==2?@"正在重试，等待新会话…":phase==3?(s.prep?@"预备段已暂停 · 可保存倍率，或继续准备完成跳转":@"等待预备段结束并定位…"):(s.visible?@"已暂停，恢复播放后继续确认":@"正在确认跳转位置…");
     else if(CFAbsoluteTimeGetCurrent()>self.messageUntil)
         self.status.text=phase==6?[NSString stringWithFormat:@"跳转未通过验证 (%u)，循环已停止",pcp_seek_error()]:phase==5?@"已跳转 · 可继续练习":@"选点 → 再点编辑 · 跳转会重试并开始练习";
+    self.speedHUD.hidden=self.accHUD.hidden=!hud.visible || !self.panel.hidden;
+    self.entry.hidden=!s.visible || !self.panel.hidden;
 }
 @end

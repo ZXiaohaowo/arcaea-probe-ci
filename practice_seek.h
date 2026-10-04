@@ -5,7 +5,7 @@ enum { PSK_IDLE, PSK_QUEUED, PSK_NEW, PSK_READY, PSK_VERIFY, PSK_DONE, PSK_FAILE
 enum { PSK_NONE, PSK_RESTART, PSK_LOCATE, PSK_SUCCESS, PSK_ERROR };
 typedef struct {
     int phase, automatic, error, stable, verified;
-    uint32_t target, previous_pos, percent, verify_origin, pause_pos;
+    uint32_t target, point, previous_pos, percent, verify_origin, pause_pos;
     int32_t offset;
     uint64_t id, generation, origin, deadline, located_us, pause_us, last_us;
 } PracticeSeek;
@@ -17,6 +17,9 @@ typedef struct {
 } PracticeSeekSample;
 int psk_busy(const PracticeSeek *s);
 int psk_request(PracticeSeek *s,uint32_t target,int automatic,uint64_t gen,uint64_t now);
+uint32_t psk_lead_in_target(uint32_t point);
+uint32_t psk_remaining(uint32_t point,uint32_t position);
+int psk_practice_request(PracticeSeek *,uint32_t point,int automatic,uint64_t gen,uint64_t now);
 /* An explicit native retry replaces the old operation and supplies its restart. */
 void psk_cancel(PracticeSeek *s);
 int psk_follow_retry(PracticeSeek *s,uint32_t target,uint64_t gen,uint64_t now);

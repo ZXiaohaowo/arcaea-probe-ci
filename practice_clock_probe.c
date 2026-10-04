@@ -145,7 +145,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "v40-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "v41-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -616,6 +616,8 @@ void pcp_rate_ui_open(void)
     g_ui_open_seq++;
 }
 static uint64_t g_ui_seen_mach,g_ui_request_epoch;
+static int g_ui_transition;
+static uint64_t g_ui_transition_gen;
 static unsigned g_ui_request_percent;
 PracticeRateUIState pcp_rate_ui_state(void)
 {
@@ -623,17 +625,22 @@ PracticeRateUIState pcp_rate_ui_state(void)
     uint64_t now=0,last=0;
     if (!pthread_main_np()) return s;
     s=g_ui;s.applied=g_rate.phase?g_rate.clock.percent:g_setting_percent;
-    s.open_seq=g_ui_open_seq;
+    s.open_seq=g_ui_open_seq;s.transitioning=g_ui_transition;
     if (atomic_load_explicit(&g_rate_badthread,memory_order_relaxed)) {s.ready=0;s.result=-3;}
     if (!ps_mach_us(mach_absolute_time(),g_tb_numer,g_tb_denom,&now) ||
         !ps_mach_us(g_ui_seen_mach,g_tb_numer,g_tb_denom,&last) || now<last || now-last>1500000 ||
-        (g_rate_last_state & 0xffffu)!=0x101u) s.visible=s.ready=0;
+        (!s.prep && (g_rate_last_state & 0xffffu)!=0x101u) || s.transitioning) s.visible=s.ready=0;
     return s;
 }
 int pcp_rate_ui_request(unsigned percent,uint64_t epoch)
 {
     PracticeRateUIState s=pcp_rate_ui_state();
     if (!pthread_main_np() || !s.visible || !s.ready || s.pending || epoch!=s.epoch || percent<PCP_RATE_MIN_PERCENT || percent>PCP_RATE_MAX_PERCENT) return 0;
+    if(s.prep) {
+        /* A frozen pre-start timeline need not have fresh W1 callbacks. Save
+         * the requested rate; the existing first-play path applies it. */
+        g_setting_percent=percent;g_ui.result=2;return 1;
+    }
     g_ui_request_percent=percent;g_ui_request_epoch=epoch;
     g_ui.pending=1;g_ui.result=0;
     return 1;
@@ -871,6 +878,10 @@ static uint64_t g_point_epoch;
 static int g_loop_suspended;
 static uint64_t g_duration_gen;
 static unsigned g_duration_attempts;
+static int g_countdown_active;
+static uint32_t g_countdown_point;
+static uint64_t g_countdown_gen,g_countdown_zero_ms;
+
 /* v35: the (chart - audio) offset is a property of the song; sample it while
  * actually playing and use it to derive the chart target at jump time, instead
  * of trusting a chart value captured while paused (t20 can keep running then). */
@@ -930,6 +941,7 @@ PracticeHUDState pcp_hud_state(void) {
        !rate_read64(scene,&vt) || vt!=g_base+SCENE_MARKER_OFF ||
        !rate_read64(scene+OFF_SCENE_TL,&tl) || !rate_read64(tl,&vt) || vt!=g_base+TL_MARKER_OFF ||
        scene!=g_song_scene || tl!=g_song_timeline || g_song_bound_gen!=g_scene_gen)return h;
+    if(g_ui_transition)return h;
     h.visible=1;
     if(g_rate.phase && g_rate_owner.scene==scene && g_rate_owner.timeline==tl && rate_current(&g_rate_owner))
         h.percent=g_rate.clock.percent;
@@ -989,7 +1001,7 @@ int pcp_point_jump(unsigned id) {
     if(!pthread_main_np() || !pcp_rate_ui_state().visible || id>=PP_COUNT ||
        !(g_points.mask&(1u<<id)))return 0;
     if(!ps_mach_us(mach_absolute_time(),g_tb_numer,g_tb_denom,&now) ||
-       !psk_request(&g_seek,g_points.ms[id],0,g_scene_gen,now))return 0;
+       !psk_practice_request(&g_seek,g_points.ms[id],0,g_scene_gen,now))return 0;
     atomic_store(&g_fast_control,1);
     if(g_ab_loop && (!g_ab_have[0] || !g_ab_have[1] ||
        g_points.ms[id]<g_ab_pos[0] || g_points.ms[id]>=g_ab_pos[1]))g_loop_suspended=1;
@@ -1010,10 +1022,45 @@ static int retry_call(void)
     if (!safe_read(vt+0x10,&fn,8) || fn<0x100000000ull || fn>=0x200000000ull) {
         g_retry_fail++; return -1;
     }
+    g_countdown_active=0;g_ui_transition=1;g_ui_transition_gen=g_scene_gen;
+    practice_rate_ui_transition_begin();
     g_restart_preserve=1;
     ((RetryFn)(uintptr_t)fn)((void *)(uintptr_t)g_retry_obj,0);
     g_retry_calls++;
     return 0;
+}
+
+int pcp_native_continue(void) {
+    uint64_t vt=0,fn=0;
+    PracticeRateUIState ui=pcp_rate_ui_state();
+    if(!pthread_main_np() || !ui.visible || !g_retry_valid || g_retry_generation!=g_scene_gen ||
+       !rate_read64(g_retry_obj,&vt) || vt!=g_retry_vptr || !rate_read64(vt,&fn) ||
+       fn<g_base || fn>=g_base+0x1400000)return 0;
+    practice_rate_ui_transition_begin();g_ui.visible=g_ui.ready=0;g_ui.epoch++;
+    ((void (*)(void *,uint64_t))(uintptr_t)fn)((void *)(uintptr_t)g_retry_obj,0);
+    atomic_store(&g_fast_control,1);return 1;
+}
+int pcp_cancel_jump(void) {
+    if(!pthread_main_np() || !pcp_rate_ui_state().visible || g_seek.phase!=PSK_READY)return 0;
+    psk_cancel(&g_seek);g_ab_loop=0;g_countdown_active=0;return 1;
+}
+PracticeCountdownState pcp_countdown_state(void) {
+    PracticeCountdownState c={0};uint32_t pos=0;
+    if(!pthread_main_np() || !g_countdown_active)return c;
+    if(g_ui_transition || g_countdown_gen!=g_scene_gen || g_seek.phase==PSK_FAILED ||
+       !g_rate.phase || g_rate_owner.scene!=g_song_scene || !rate_current(&g_rate_owner)) {
+        g_countdown_active=0;return c;
+    }
+    typedef int32_t (*GetPosFn)(void *,uint32_t *,uint32_t);
+    if(((GetPosFn)(uintptr_t)(g_base+OFF_CC_GETPOS))((void *)(uintptr_t)g_rate_owner.handle,&pos,1))return c;
+    c.remaining_ms=psk_remaining(g_countdown_point,pos);
+    if(c.remaining_ms>3000){g_countdown_active=0;return (PracticeCountdownState){0};}
+    if(!c.remaining_ms) {
+        uint64_t now=monotonic_ms();
+        if(!g_countdown_zero_ms)g_countdown_zero_ms=now;
+        if(now-g_countdown_zero_ms>180){g_countdown_active=0;return c;}
+    }
+    c.active=1;c.paused=pcp_rate_ui_state().visible;return c;
 }
 
 /* Called by the original retry button's replacement touch callback. */
@@ -1112,6 +1159,8 @@ uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
         /* Scene destructor (tag4): the cached chart scalar belongs to the old
          * chart. tag5 also fires mid-song for BGM events, so it must not clear. */
         if (tag==4) {
+            g_countdown_active=0;g_ui_transition=1;g_ui_transition_gen=g_scene_gen;
+            practice_rate_ui_transition_begin();
             atomic_store(&g_fast_control,1);
             g_scroll_gen++; scroll_cache_clear();
             g_scene_gen++; g_retry_valid=0; g_live_offset_valid=0;
@@ -1762,7 +1811,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
             patched = safe_read(g_base+OFF_SETPITCH,&marker,8) && marker==0x6d1223e9d10583ffULL &&
                 safe_read(g_base+0x9237fc,&dtor_word,4) && dtor_word==0x17db8461u &&
                 safe_read(g_base+0x8e3900,&play_word,4) && play_word==0x17dc8480u;
-            prep = main_ok && scene_ok && paused && f2e==0 && fresh_paused && patched;
+            prep = main_ok && scene_ok && paused && f2e==0 && patched;
             /* ds4f v27c: t30/t34/t38 are per-song boundary/sync metadata, not error
              * or readiness signals. Log (20) shows a legitimate song with t30=-1371,
              * t38=1371 for the whole session; the old "all zero" live gate excluded
@@ -1795,12 +1844,13 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                 prs_close(&g_rate,6);
                 g_song_started=0;g_song_attempts=0;g_rate_stable=0;
             }
+            if(g_ui_transition && g_scene_gen!=g_ui_transition_gen && scene_ok && (playing || paused))g_ui_transition=0;
             g_ui_seen_mach=mach_absolute_time();
             g_ui.visible = ctCd && ctA && paused;
             /* v38: sample the actual consumer, excluding paused/preroll samples. */
             g_seek_sample=(PracticeSeekSample){.now_us=now_us,.generation=g_scene_gen,
-                .valid=main_ok && scene_ok && patched && time_ok,
-                .playing=playing && pos>0,.paused=paused && f2e==1,.pos=pos>=0?(uint32_t)pos:0,
+                .valid=main_ok && scene_ok && patched && (time_ok || paused),
+                .playing=playing && pos>0,.paused=paused,.pos=pos>=0?(uint32_t)pos:0,
                 .consumer=(int64_t)t20-t28,.percent=g_setting_percent};
             if (playing && pos>0) {
                 int64_t off=(int64_t)t20-t28-pos;
@@ -2022,7 +2072,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
             x.percent=g_rate.clock.percent;
             if (!psk_busy(&g_seek) && g_ab_loop && !g_loop_suspended && g_ab_have[0] && g_ab_have[1] &&
                 g_ab_pos[1]>g_ab_pos[0] && x.valid && x.playing && x.pos>=g_ab_pos[1])
-                (void)psk_request(&g_seek,g_ab_pos[0],1,g_scene_gen,x.now_us);
+                (void)psk_practice_request(&g_seek,g_ab_pos[0],1,g_scene_gen,x.now_us);
             int old_phase=g_seek.phase;
             int action=psk_poll(&g_seek,x);
             if (action==PSK_RESTART) {
@@ -2046,6 +2096,13 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                     }
                 }
                 if (rc || rb || llabs((int64_t)actual-g_seek.target)>150) psk_fail(&g_seek,11);
+                else {
+                    g_countdown_active=1;g_countdown_point=g_seek.point;
+                    g_countdown_gen=g_scene_gen;g_countdown_zero_ms=0;
+                    char cd[112];int cn=snprintf(cd,sizeof(cd),"countdown point=%u landing=%u lead_ms=%u gen=%llu\n",
+                        g_seek.point,g_seek.target,g_seek.point-g_seek.target,(unsigned long long)g_scene_gen);
+                    if(cn>0 && cn<(int)sizeof(cd))padd(cd,(size_t)cn);
+                }
                 n=snprintf(line,sizeof(line),"seek id=%llu act=locate target=%u actual=%u consumer_target=%lld anchor=%d offset=%d rc=%d/%d gen=%llu\n",
                     (unsigned long long)g_seek.id,g_seek.target,actual,(long long)target_consumer,
                     anchor,g_seek.offset,rc,rb,(unsigned long long)g_scene_gen);
@@ -2060,7 +2117,7 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                 if (n>0 && (size_t)n<sizeof(line)) padd(line,(size_t)n);
             }
             if (g_seek.phase==PSK_FAILED && old_phase!=PSK_FAILED) {
-                g_ab_loop=0;g_sk_skips++;
+                g_countdown_active=0;g_ab_loop=0;g_sk_skips++;
                 /* A partial locate must not keep running with mismatched clocks.
                  * Reset through the native retry path once, with looping disabled. */
                 if ((old_phase==PSK_VERIFY || action==PSK_LOCATE) &&

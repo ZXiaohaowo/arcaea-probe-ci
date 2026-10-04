@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 typedef struct {
-    int visible,ready,pending,result,prep;
+    int visible,ready,pending,result,prep,transitioning;
     unsigned applied;
     uint64_t epoch;
     uint64_t open_seq;
@@ -22,6 +22,12 @@ typedef struct {
 } PracticeHUDState;
 /* Main-thread read-only snapshot. Unknown fields must render as --. */
 PracticeHUDState pcp_hud_state(void);
+typedef struct {int active,paused;unsigned remaining_ms;} PracticeCountdownState;
+PracticeCountdownState pcp_countdown_state(void);
+int pcp_native_continue(void);
+int pcp_cancel_jump(void);
+/* Main-thread synchronous dismissal before native scene transitions. */
+void practice_rate_ui_transition_begin(void);
 int pcp_rate_ui_request(unsigned percent,uint64_t epoch);
 /* Persistent setting (NSUserDefaults); 100 when absent or invalid. */
 unsigned pcp_rate_ui_stored_percent(void);

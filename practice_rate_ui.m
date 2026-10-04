@@ -1,9 +1,13 @@
 #import <UIKit/UIKit.h>
+#import <CoreText/CoreText.h>
 #include "practice_rate_ui.h"
 #include <math.h>
 #include <stdlib.h>
 #include "practice_timeline_ui.inc"
 
+void practice_rate_ui_transition_begin(void) {
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"PCPTransitionBegin" object:nil];
+}
 unsigned pcp_rate_ui_stored_percent(void)
 {
     NSInteger saved=[[NSUserDefaults standardUserDefaults] integerForKey:@"PCPPracticeRatePercent"];
@@ -56,8 +60,11 @@ void practice_rate_ui_start(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         static PCPRatePanel *controller;
         if(controller) return;
+        PTRegisterFonts();
         controller=[PCPRatePanel new];[controller build];
         controller.timer=[NSTimer timerWithTimeInterval:0.2 target:controller selector:@selector(tick) userInfo:nil repeats:YES];
         [[NSRunLoop mainRunLoop] addTimer:controller.timer forMode:NSRunLoopCommonModes];
+        controller.countdownTimer=[NSTimer timerWithTimeInterval:1.0/30 target:controller selector:@selector(countdownTick) userInfo:nil repeats:YES];
+        [[NSRunLoop mainRunLoop] addTimer:controller.countdownTimer forMode:NSRunLoopCommonModes];
     });
 }

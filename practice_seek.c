@@ -3,20 +3,29 @@
 int psk_busy(const PracticeSeek *s) { return s->phase>=PSK_QUEUED && s->phase<=PSK_VERIFY; }
 void psk_fail(PracticeSeek *s,int error) { s->phase=PSK_FAILED;s->error=error; }
 void psk_cancel(PracticeSeek *s) {uint64_t id=s->id;*s=(PracticeSeek){.id=id};}
+uint32_t psk_lead_in_target(uint32_t point) {return point>3000?point-3000:0;}
+uint32_t psk_remaining(uint32_t point,uint32_t position) {return position<point?point-position:0;}
+int psk_practice_request(PracticeSeek *s,uint32_t point,int automatic,uint64_t gen,uint64_t now) {
+    if(point>INT32_MAX || !psk_request(s,psk_lead_in_target(point),automatic,gen,now))return 0;
+    s->point=point;return 1;
+}
 int psk_follow_retry(PracticeSeek *s,uint32_t target,uint64_t gen,uint64_t now) {
     psk_cancel(s);
-    if(!psk_request(s,target,1,gen,now))return 0;
+    if(!psk_practice_request(s,target,1,gen,now))return 0;
     s->phase=PSK_NEW;return 1;
 }
 int psk_request(PracticeSeek *s,uint32_t target,int automatic,uint64_t gen,uint64_t now) {
     if(psk_busy(s) || !now || target>INT32_MAX) return 0;
     uint64_t id=s->id+1;
-    *s=(PracticeSeek){.phase=PSK_QUEUED,.automatic=automatic,.target=target,
+    *s=(PracticeSeek){.phase=PSK_QUEUED,.automatic=automatic,.target=target,.point=target,
         .id=id,.origin=gen,.generation=gen,.deadline=now+30000000};
     return 1;
 }
 int psk_poll(PracticeSeek *s,PracticeSeekSample x) {
     if(!psk_busy(s)) return PSK_NONE;
+    if(s->phase==PSK_NEW && x.valid && x.generation!=s->origin) {
+        s->generation=x.generation;s->phase=PSK_READY;s->stable=0;
+    }
     /* Only a confirmed pause in the bound scene suspends the transaction.
      * Missing reads and destroyed/replaced scenes still fail normally. */
     if(s->phase>=PSK_READY && x.generation!=s->generation) {psk_fail(s,2);return PSK_ERROR;}
