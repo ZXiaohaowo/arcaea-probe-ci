@@ -48,7 +48,7 @@
     UILabel *hint=[[UILabel alloc] initWithFrame:CGRectMake(840,336,400,32)];
     hint.font=PTFont(16,NO);hint.textColor=UIColor.whiteColor;hint.textAlignment=NSTextAlignmentCenter;
     hint.text=@"CNS ±0.50 / 0.10 · 长按数值恢复";[self.outsidePanel addSubview:hint];
-    UILabel *number=self.outsideViews[@"el_745197c4"];number.userInteractionEnabled=YES;
+    UILabel *number=(UILabel *)self.outsideViews[@"el_745197c4"];number.userInteractionEnabled=YES;
     [number addGestureRecognizer:[[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(outsideNative:)]];
 }
 - (void)outsideClose {self.outsidePanel.hidden=YES;}
