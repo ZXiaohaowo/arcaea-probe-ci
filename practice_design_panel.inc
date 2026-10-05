@@ -7,7 +7,9 @@
         button.backgroundColor=UIColor.clearColor;
         button.normalTexture=PTDesignImage(e,e[@"asset"]);
         button.pressedTexture=PTDesignImage(e,e[@"pressedAsset"]?:e[@"asset"]);
-        button.selectedTexture=PTDesignImage(e,e[@"selectedAsset"]?:e[@"pressedAsset"]?:e[@"asset"]);
+        NSString *selectionAsset=e[@"selectedAsset"];
+        if(!selectionAsset || [selectionAsset isEqual:e[@"pressedAsset"]])selectionAsset=e[@"asset"];
+        button.selectedTexture=PTDesignImage(e,selectionAsset);
         button.caption=[[UILabel alloc] initWithFrame:button.bounds];PTLabelStyle(button.caption,e);
         button.caption.text=e[@"text"];button.caption.userInteractionEnabled=NO;[button addSubview:button.caption];
         if(action)[button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
@@ -49,10 +51,17 @@
     [self.slider setMinimumTrackImage:track forState:UIControlStateNormal];[self.slider setMaximumTrackImage:track forState:UIControlStateNormal];
     [self.slider setThumbImage:PTDesignImage(PTElement(@"el_cfd16d98"),PTElement(@"el_cfd16d98")[@"asset"]) forState:UIControlStateNormal];
     [self.slider addTarget:self action:@selector(slide:) forControlEvents:UIControlEventValueChanged];[self.panel addSubview:self.slider];
-    for(NSString *key in @[@"el_d23a33e0",@"el_306912e1",@"el_03c97d24",@"el_3a705b55",@"el_f7b1264e"])[self designed:key action:NULL];
+    [self designed:@"el_d23a33e0" action:NULL];
     self.noteControlValue=(UILabel *)[self designed:@"el_40530d2f" action:NULL];
-    for(NSString *key in @[@"el_f712d0cd",@"el_0ac5e522",@"el_55440a69",@"el_23191987"]){UIButton *v=(UIButton *)[self designed:key action:@selector(noteUnavailable)];v.enabled=NO;}
-    UILabel *pending=[self label:17 frame:CGRectMake(816,344,464,32) text:@"即时流速修改待验证"];pending.alpha=0.6;
+    self.noteControlValue.userInteractionEnabled=YES;
+    [self.noteControlValue addGestureRecognizer:[[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(noteNative:)]];
+    self.noteSteps=[NSMutableArray array];NSArray *noteIDs=@[@"el_f712d0cd",@"el_0ac5e522",@"el_55440a69",@"el_23191987"];int noteDelta[]={-50,-10,10,50};
+    for(int i=0;i<4;i++){UIButton *v=(UIButton *)[self designed:noteIDs[i] action:@selector(noteStep:)];v.tag=noteDelta[i];v.accessibilityLabel=[NSString stringWithFormat:@"CNS %+.2f",noteDelta[i]/100.0];[self.noteSteps addObject:v];}
+    self.noteSlider=[[PTDesignSlider alloc] initWithFrame:CGRectMake(816,284,464,48)];self.noteSlider.minimumValue=0.5;self.noteSlider.maximumValue=30;self.noteSlider.continuous=YES;
+    [self.noteSlider setMinimumTrackImage:track forState:UIControlStateNormal];[self.noteSlider setMaximumTrackImage:track forState:UIControlStateNormal];
+    [self.noteSlider setThumbImage:PTDesignImage(PTElement(@"el_cfd16d98"),PTElement(@"el_cfd16d98")[@"asset"]) forState:UIControlStateNormal];
+    [self.noteSlider addTarget:self action:@selector(noteSlide:) forControlEvents:UIControlEventValueChanged];[self.panel addSubview:self.noteSlider];
+    self.notePending=[self label:16 frame:CGRectMake(784,340,528,44) text:@"CNS · 大步 0.50 / 小步 0.10 · 重试生效"];self.notePending.numberOfLines=2;
     self.axis=[[PTTimeline alloc] initWithFrame:PTRect(PTElement(@"el14"))];self.axis.backgroundColor=UIColor.clearColor;
     __weak PCPRatePanel *weakSelf=self;self.axis.choose=^(NSUInteger i){[weakSelf choose:i];};[self.panel addSubview:self.axis];
     self.axis.drag=^(unsigned ms){[weakSelf dragTime:ms];};
@@ -66,6 +75,7 @@
     self.addT=(UIButton *)[self designed:@"el23" action:@selector(addBookmark)];[self caption:self.addT design:@"el_52b9865f"];
     self.jump=(UIButton *)[self designed:@"el26" action:@selector(jumpTap)];[self caption:self.jump design:@"el_03762b62"];
     self.loop=(UIButton *)[self designed:@"el24" action:@selector(loopTap)];self.loop.accessibilityLabel=@"A/B 循环";
+    self.loopState=[self label:16 frame:CGRectMake(568,754,184,24) text:@"A/B 循环-关"];
     self.selection=[self label:20 frame:CGRectMake(400,600,280,32) text:@"选择点位开始编辑"];
     self.status=[self label:17 frame:CGRectMake(400,984,280,40) text:@""];
     self.cancelJump=[self button:@"取消待执行跳转" frame:CGRectMake(400,880,272,44) action:@selector(cancelWaiting)];

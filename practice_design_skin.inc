@@ -53,12 +53,17 @@ static void PTLabelStyle(UILabel *label,NSDictionary *e) {
 - (void)drawRect:(CGRect)rect {
     UIImage *texture=(self.highlighted||self.unset)?self.pressedTexture:self.selected?self.selectedTexture:self.normalTexture;
     [(texture?:self.normalTexture) drawInRect:self.bounds];
-    if(self.selected){UIBezierPath *p=[UIBezierPath bezierPathWithRect:CGRectInset(self.bounds,3,3)];[[UIColor colorWithWhite:1 alpha:0.75] setStroke];p.lineWidth=1;[p stroke];}
+
 }
 - (void)setTitle:(NSString *)title forState:(UIControlState)state {if(state==UIControlStateNormal)self.caption.text=title;}
 - (void)setEnabled:(BOOL)value {[super setEnabled:value];self.alpha=value?1:0.35;}
 - (void)setHighlighted:(BOOL)value {[super setHighlighted:value];[self setNeedsDisplay];}
-- (void)setSelected:(BOOL)value {[super setSelected:value];[self setNeedsDisplay];}
+- (void)setSelected:(BOOL)value {
+    [super setSelected:value];
+    self.layer.shadowColor=[UIColor colorWithRed:0.72 green:0.60 blue:1 alpha:1].CGColor;
+    self.layer.shadowOpacity=value?0.9:0;self.layer.shadowRadius=7;self.layer.shadowOffset=CGSizeZero;
+    [self setNeedsDisplay];
+}
 - (void)setUnset:(BOOL)value {_unset=value;[self setNeedsDisplay];}
 @end
 @interface PTDesignSlider : UISlider @end

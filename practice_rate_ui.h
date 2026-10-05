@@ -18,7 +18,8 @@ PracticeRateUIState pcp_rate_ui_state(void);
 typedef struct {
     int visible, score_valid, scroll_valid, pitch_attached;
     unsigned percent, pure, far, lost;
-    double accuracy, current_note_speed, note_speed;
+    double accuracy, current_note_speed, note_speed, native_note_speed;
+    uint64_t note_config;
 } PracticeHUDState;
 /* Main-thread read-only snapshot. Unknown fields must render as --. */
 PracticeHUDState pcp_hud_state(void);
@@ -38,6 +39,11 @@ void pcp_rate_ui_save_percent(unsigned percent);
  * speed (the scroll scalar is divided by the rate by the tag8 bridge). */
 #define PCP_NOTE_MODE_SYNC  0u
 #define PCP_NOTE_MODE_FIXED 1u
+/* Pending settings are consumed only by a natural chart build. */
+uint64_t pcp_note_settings_snapshot(void);
+unsigned pcp_note_reference_get(void);
+void pcp_note_current_set(double current);
+void pcp_note_native_reset(void);
 unsigned pcp_note_mode_get(void);
 void pcp_note_mode_set(unsigned mode);
 /* v29: pitch preservation mode. 0 = tape effect (pitch follows rate, default),

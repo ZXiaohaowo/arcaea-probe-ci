@@ -1,3 +1,4 @@
+#include "practice_note_plan.h"
 /* practice_clock_probe.c - v25 pause UI and sustained rate control.
  * Current behavior: W1 applies virtual-time bias; guarded setPitch controls BGM.
  * Scene destruction / BGM replacement restore audio before native teardown.
@@ -576,19 +577,11 @@ static uint64_t g_uip_logged;
 static uint32_t g_tb_numer, g_tb_denom; /* zero means unavailable */
 static PracticeRateUIState g_ui={0,0,0,0,0,100,1,0};
 static uint64_t g_ui_open_seq;
-/* ds4f v27d: note scroll-speed mode + tag8 bridge state. The main-thread cycle
- * publishes the multiplier (100/rate, or 1.0 when sync/unpublished); the store
- * hook in LogicChart::update reads it through pcp_obs_entry(tag 8) and writes
- * the scaled value back to chart+0xf4. 0 scale bits means "not published yet"
- * and the hook is an identity then. */
+/* v49: settings latch at the natural tag8 chart build, never via live field writes. */
 static _Atomic unsigned g_note_mode;
 static _Atomic uint32_t g_note_scale_bits;
 static volatile uint64_t g_scroll_calls, g_scroll_prev_calls, g_scroll_chart;
 static volatile uint32_t g_scroll_raw_bits, g_scroll_out_bits;
-/* v27e: the game stores the scroll scalar only when the chart is (re)built
- * (log 22: 4 store events in 947 s, all at pos=0). The rate/mode correction
- * therefore has to be written by us; the tag8 bridge remains the observer and
- * keeps the identity return. */
 static volatile int g_scroll_chart_valid;
 static volatile uint32_t g_scroll_field_bits;   /* last value seen in chart+0xf4 */
 static volatile uint64_t g_scroll_writes, g_scroll_write_fail;
@@ -596,6 +589,7 @@ static volatile uint64_t g_scroll_gen, g_scroll_gen_at_hook;
 static volatile uint64_t g_scroll_vptr;        /* chart vptr captured at hook time */
 /* v27f: call-site context for the chart's note-geometry rebuild (0x910CE0). */
 static volatile uint64_t g_scroll_build_x1, g_scroll_build_x2;
+static uint64_t g_scroll_config_word;
 static volatile uint32_t g_scroll_baked_scale_bits;  /* scale used at last build/relayout */
 static volatile uint64_t g_scroll_relayouts, g_scroll_relayout_fail;
 static volatile int g_scroll_relayout_blocked;
@@ -609,6 +603,7 @@ static void scroll_cache_clear(void)
     g_scroll_build_x1 = 0;
     g_scroll_build_x2 = 0;
     g_scroll_baked_scale_bits = 0;
+    g_scroll_config_word = 0;
     g_scroll_relayout_blocked = 0;
 }
 void pcp_rate_ui_open(void)
@@ -966,17 +961,18 @@ PracticeHUDState pcp_hud_state(void) {
        rate_read64(chart,&vt) && vt==g_base+0x14c0b08 && rate_read64(chart+0xf0,&setting)) {
         uint32_t bits=(uint32_t)setting,baked=g_scroll_baked_scale_bits;float base=0,scale=0;
         memcpy(&base,&bits,4);memcpy(&scale,&baked,4);
-        if(isfinite(base) && base>0 && base<=30 && isfinite(scale) && scale>=0.49f && scale<=2.01f) {
-            h.scroll_valid=1;h.current_note_speed=base*scale;h.note_speed=h.current_note_speed*h.percent/100.0;
+        if(isfinite(base) && base>0 && base<=30 && isfinite(scale) && scale>0 && scale<=1200.0f) {
+            h.scroll_valid=1;h.native_note_speed=base;h.note_config=g_scroll_config_word;h.current_note_speed=base*scale;h.note_speed=h.current_note_speed*h.percent/100.0;
         }
     }
     static uint64_t last_log_ms;
     uint64_t log_ms=monotonic_ms();
     if(log_ms-last_log_ms>=1000) {
-        char line[240];last_log_ms=log_ms;
-        int n=snprintf(line,sizeof(line),"hud gen=%llu score=%d pure=%u far=%u lost=%u acc=%.4f speed=%u scroll=%d current_note=%.4f note=%.4f pitch_attached=%d\n",
+        char line[400];last_log_ms=log_ms;
+        int n=snprintf(line,sizeof(line),"hud gen=%llu score=%d pure=%u far=%u lost=%u acc=%.4f speed=%u scroll=%d current_note=%.4f note=%.4f pitch_attached=%d note_cfg=%llx note_pending=%llx native_note=%.4f\n",
             (unsigned long long)g_scene_gen,h.score_valid,h.pure,h.far,h.lost,h.accuracy,h.percent,
-            h.scroll_valid,h.current_note_speed,h.note_speed,h.pitch_attached);
+            h.scroll_valid,h.current_note_speed,h.note_speed,h.pitch_attached,
+            (unsigned long long)h.note_config,(unsigned long long)pcp_note_settings_snapshot(),h.native_note_speed);
         if(n>0 && n<(int)sizeof(line))padd(line,(size_t)n);
     }
     return h;
@@ -1130,24 +1126,26 @@ uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
     uint32_t validbits = 0;
     int on_main=pthread_main_np();
     if (tag==8) {
-        /* ds4f v27d/v27e: note scroll scalar bridge. a = chart object, lr = the
-         * game's own value in float bits. The value is cached so the control
-         * cycle can keep chart+0xf4 corrected; the store itself receives the
-         * scaled value when a rate is active, otherwise the raw value. */
+        /* The native store and following geometry build consume ONE latched
+         * setting. A retry must use the persisted rate, not g_rate.phase which
+         * is deliberately reset while the new scene is being constructed. */
         uint32_t in=(uint32_t)lr, out=in;
-        unsigned mode=atomic_load_explicit(&g_note_mode,memory_order_relaxed);
-        uint32_t sb=atomic_load_explicit(&g_note_scale_bits,memory_order_relaxed);
-        if (mode==PCP_NOTE_MODE_FIXED && sb) {
-            float v,s;
-            memcpy(&v,&in,4); memcpy(&s,&sb,4);
-            v*=s; memcpy(&out,&v,4);
-            g_scroll_baked_scale_bits=sb;
-        } else {
-            g_scroll_baked_scale_bits=0x3F800000u;  /* 1.0f */
-        }
+        uint64_t word=(g_scroll_chart_valid && g_scroll_chart==a &&
+                       g_scroll_gen_at_hook==g_scroll_gen)?g_scroll_config_word:pcp_note_settings_snapshot();
+        float raw=0,base=0,scale=1,value=0;uint32_t sb=0x3f800000u;
+        memcpy(&raw,&in,4);
+        uint64_t vt=0;
+        int accepted=safe_read(a,&vt,8) && vt==g_base+0x14c0b08 &&
+            safe_read(a+0xf0,&base,4) && pnp_plan(word,base,raw,&scale,&value);
+        if(accepted){memcpy(&out,&value,4);memcpy(&sb,&scale,4);}
+        else {g_scroll_write_fail++;word=0;}
+        g_scroll_config_word=word;
+        g_scroll_baked_scale_bits=sb;
+        atomic_store_explicit(&g_note_mode,(unsigned)(word>>40),memory_order_relaxed);
+        atomic_store_explicit(&g_note_scale_bits,sb,memory_order_relaxed);
         g_scroll_calls++;
         g_scroll_chart=a;
-        g_scroll_chart_valid=1;
+        g_scroll_chart_valid=accepted;
         g_scroll_gen_at_hook=g_scroll_gen;
         /* On-site read: the hook runs inside the chart's own update, so the
          * pointer is live here (same pattern as the tag2 on-site fields). */
@@ -1977,68 +1975,8 @@ static void read_trampoline(void *ctx)   /* runs on the main thread (runloop sou
                 g_ui.result=1;
             }
         }
-        /* ds4f v27d/v27e/v27f: publish the note scroll multiplier, keep
-         * chart+0xf4 corrected, and - when the chart's baked note geometry
-         * still uses the old multiplier - repeat the game's own geometry
-         * rebuild (0x910CE0, captured at the call site) while paused.
-         * phase==1 means a non-1x rate is configured for this song; with mode
-         * 同步 (default) or an inactive session the multiplier stays 1.0. */
-        {
-            unsigned mode = pcp_note_mode_get();
-            float scale = 1.0f;
-            if (mode==PCP_NOTE_MODE_FIXED && g_rate.phase==1 && g_rate.clock.percent)
-                scale = 100.0f/(float)g_rate.clock.percent;
-            uint32_t bits;
-            int field_ok = 0;
-            memcpy(&bits,&scale,4);
-            atomic_store_explicit(&g_note_mode,mode,memory_order_relaxed);
-            atomic_store_explicit(&g_note_scale_bits,bits,memory_order_relaxed);
-            /* v27e: the game stores chart+0xf4 only when the chart is rebuilt,
-             * so a rate or mode change has to be written by us. The field is
-             * re-read through the checked interface and only overwritten while
-             * it still holds the game's raw value or our own previous value.
-             * Only runs while a rate session is active for the current chart;
-             * the tag4 scene destructor clears the cache (generation check). */
-            if (g_scroll_chart_valid && g_scroll_chart && g_rate.phase &&
-                g_scroll_gen_at_hook==g_scroll_gen) {
-                uint32_t raw_bits = g_scroll_raw_bits;
-                float raw, want;
-                uint32_t want_bits, field = 0;
-                uint64_t vptr = 0;
-                memcpy(&raw,&raw_bits,4);
-                want = raw*scale;
-                memcpy(&want_bits,&want,4);
-                if (g_scroll_vptr && safe_read((uint64_t)g_scroll_chart,&vptr,8) &&
-                    vptr==g_scroll_vptr &&
-                    raw>0.01f && raw<100.0f && scale>=0.4f && scale<=2.5f &&
-                    safe_read((uint64_t)g_scroll_chart+0xf4ull,&field,4)) {
-                    if (field != want_bits) {
-                        if (field == raw_bits || field == g_scroll_field_bits) {
-                            *(volatile uint32_t *)(uintptr_t)((uint64_t)g_scroll_chart+0xf4ull)=want_bits;
-                            g_scroll_writes++;
-                            field=want_bits;
-                        } else {
-                            /* the game rebuilt the chart: adopt the new raw value */
-                            g_scroll_raw_bits=field;
-                        }
-                    }
-                    g_scroll_field_bits=field;
-                    field_ok = (field==want_bits);
-                } else {
-                    g_scroll_chart_valid=0;
-                    g_scroll_chart=0;
-                    g_scroll_write_fail++;
-                }
-            }
-            /* v27g: the v27f relayout replay crashed (log 24 + two .ips): the
-             * captured call arguments are not valid mid-song, and replaying
-             * 0x910CE0 with them produced a bad virtual call
-             * (KERN_PROTECTION_FAILURE at 0x2000000003). The replay is removed;
-             * the captured context stays as diagnostics only. The note mode is
-             * baked at the next chart build (retry / re-enter), as in v27e. */
-            (void)field_ok;
-            (void)bits;
-        }
+        /* v49: no chart+0xf4 writes here. Mode/speed changes are pending
+         * until the next native tag8 build; cached rebuild arguments are never replayed. */
         /* ds4f v28 stage 1: one-shot pitch DSP lifecycle probe while paused. */
         if (!g_pitch_probe_done && g_rate.phase && cs.chan0 && rate_current(&g_rate_owner)) {
             int hit=pitch_probe_run((void *)(uintptr_t)cs.chan0);
