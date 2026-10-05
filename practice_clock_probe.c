@@ -146,7 +146,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "v50-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "v51-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -241,6 +241,7 @@ extern const void *kCFRunLoopCommonModes;
 
 static char g_log_path[1024];
 static int g_log_path_ok;
+static pthread_mutex_t g_log_mutex=PTHREAD_MUTEX_INITIALIZER;
 
 static void init_log_path(void)
 {
@@ -262,12 +263,10 @@ static void append_raw(const char *text, size_t len)
     if (!g_log_path_ok || text == NULL || len == 0) {
         return;
     }
+    pthread_mutex_lock(&g_log_mutex);
     fp = fopen(g_log_path, "ab");
-    if (fp == NULL) {
-        return;
-    }
-    fwrite(text, 1, len, fp);
-    fclose(fp);
+    if (fp != NULL) {fwrite(text, 1, len, fp);fclose(fp);}
+    pthread_mutex_unlock(&g_log_mutex);
 }
 
 /* --------------------------------------------------------------- clock */
@@ -926,6 +925,43 @@ unsigned pcp_points_current(void) {uint32_t ms=0;return point_read_position(&ms)
 unsigned pcp_points_extent(void) {return g_points.duration?g_points.duration:g_point_extent;}
 uint64_t pcp_points_epoch(void) {return g_point_epoch;}
 unsigned pcp_loop_suspended(void) {return g_ab_loop && g_loop_suspended;}
+uint64_t pcp_outside_context(void) {
+    uint64_t root=0,context=0,obj[2]={0},vt[2]={0};int valid=1;
+    if(!pthread_main_np() || !g_ident_ok || !rate_read64(g_base+OFF_SINGLETON,&root))return 0;
+    for(unsigned i=0;i<2;i++) {
+        if(!rate_read64(root+(i?OFF_SING_OBJ:OFF_SING_H140),&obj[i])){valid=0;continue;}
+        if(!obj[i])continue;
+        if(!rate_read64(obj[i],&vt[i])){valid=0;continue;}
+        if(vt[i]==g_base+0x147dfd8 || vt[i]==g_base+0x1509a88) {
+            if(context && context!=obj[i])valid=0;
+            context=obj[i];
+        } else valid=0; /* Includes GameSession, wrappers and unknown transitions. */
+    }
+    if(!valid)context=0;
+    static uint64_t previous_obj[2],previous_vt[2],previous_context;
+    if(memcmp(previous_obj,obj,sizeof(obj)) || memcmp(previous_vt,vt,sizeof(vt)) || previous_context!=context) {
+        memcpy(previous_obj,obj,sizeof(obj));memcpy(previous_vt,vt,sizeof(vt));previous_context=context;
+        char line[220];int n=snprintf(line,sizeof(line),"menu h140=%llx vt140=%llx h148=%llx vt148=%llx eligible=%d\n",
+            (unsigned long long)obj[0],(unsigned long long)(vt[0]>=g_base?vt[0]-g_base:0),
+            (unsigned long long)obj[1],(unsigned long long)(vt[1]>=g_base?vt[1]-g_base:0),context!=0);
+        if(n>0 && n<(int)sizeof(line))padd(line,(size_t)n);
+    }
+    return context;
+}
+int pcp_log_refresh(void) {
+    if(!pcp_outside_context() || !g_log_path_ok)return 0;
+    pflush();
+    char backup[1200],header[256];
+    snprintf(backup,sizeof(backup),"%s.backup-%llu-%ld",g_log_path,(unsigned long long)monotonic_ms(),(long)getpid());
+    pthread_mutex_lock(&g_log_mutex);
+    if(access(backup,F_OK)==0 || rename(g_log_path,backup)!=0){pthread_mutex_unlock(&g_log_mutex);return 0;}
+    FILE *fp=fopen(g_log_path,"wb");
+    if(!fp){rename(backup,g_log_path);pthread_mutex_unlock(&g_log_mutex);return 0;}
+    int n=snprintf(header,sizeof(header),"# build=%s log_refresh=1 counters_continued=1 buffered_samples_may_precede_refresh=1\n",PRACTICE_CLOCK_PROBE_VERSION);
+    int ok=n>0 && fwrite(header,1,(size_t)n,fp)==(size_t)n;
+    if(fclose(fp)!=0)ok=0;
+    pthread_mutex_unlock(&g_log_mutex);return ok;
+}
 PracticeHUDState pcp_hud_state(void) {
     PracticeHUDState h={.percent=100};
     uint64_t root=0,session=0,vt=0,scene=0,tl=0,score=0,chart=0,counts0=0,counts1=0,setting=0;

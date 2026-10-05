@@ -8,7 +8,7 @@ static void PTRegisterFonts(void) {
     }
 }
 static UIFont *PTFont(CGFloat size,BOOL latin) {
-    UIFont *font=[UIFont fontWithName:latin?@"Exo-Light":@"NotoSansCJKsc-Light" size:size];
+    UIFont *font=[UIFont fontWithName:latin?@"Exo-Light":@"Exo-Regular" size:size];
     return font?:[UIFont systemFontOfSize:size weight:UIFontWeightLight];
 }
 static NSString *PTTime(unsigned ms) {
@@ -134,7 +134,13 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
 @interface PCPRatePanel : NSObject {
     PracticePoints _edit;
 }
-@property(nonatomic,strong) PCPRateOverlay *overlay;
+@property(nonatomic,strong) PCPRateOverlay *overlay,*outsideEntryHost;
+@property(nonatomic,strong) UIView *outsidePanel;
+@property(nonatomic,strong) UIButton *outsideEntry;
+@property(nonatomic,strong) UILabel *outsideStatus;
+@property(nonatomic,strong) NSMutableDictionary<NSString *,UIView *> *outsideViews;
+@property(nonatomic) uint64_t outsideContext;
+@property(nonatomic) NSTimeInterval outsideSince,outsideMessageUntil;
 @property(nonatomic,strong) UIView *panel,*editBox,*curtain,*keypad;
 @property(nonatomic,strong) UIButton *entry,*apply,*reset,*noteMode,*pitchMode,*loop,*jump,*addT,*removeT,*close,*continueButton,*cancelJump;
 @property(nonatomic,strong) NSMutableArray<UIButton *> *chips,*editButtons,*captureButtons;
@@ -167,11 +173,12 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
 - (UIButton *)button:(NSString *)title frame:(CGRect)frame action:(SEL)action {
     PTHexButton *v=[[PTHexButton alloc] initWithFrame:frame];v.backgroundColor=UIColor.clearColor;
     [v setTitle:title forState:UIControlStateNormal];[v setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    v.titleLabel.font=PTFont(17,NO);v.titleLabel.numberOfLines=2;v.titleLabel.textAlignment=NSTextAlignmentCenter;
+    v.titleLabel.font=[UIFont fontWithName:@"Exo-Medium" size:17]?:PTFont(17,NO);v.titleLabel.numberOfLines=2;v.titleLabel.textAlignment=NSTextAlignmentCenter;
     [v addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];[self.panel addSubview:v];return v;
 }
 - (void)message:(NSString *)s {self.status.text=s;self.messageUntil=CFAbsoluteTimeGetCurrent()+3;}
 #include "practice_design_panel.inc"
+#include "practice_outside_ui.inc"
 - (void)hideForTransition {
     self.autoRateQueued=NO;[self cancelEdit];self.panel.hidden=self.curtain.hidden=self.entry.hidden=YES;
     self.speedHUD.hidden=self.accHUD.hidden=self.currentHUD.hidden=self.durationHUD.hidden=self.countdown.hidden=YES;
@@ -327,10 +334,14 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
 }
 - (void)tick {
     [self flushAutoRate];PracticeRateUIState s=pcp_rate_ui_state();UIWindow *w=[self gameWindow];
-    if(!w || UIApplication.sharedApplication.applicationState!=UIApplicationStateActive || s.transitioning){[self hideForTransition];self.overlay.hidden=YES;return;}
+    if(!w || UIApplication.sharedApplication.applicationState!=UIApplicationStateActive){[self hideForTransition];self.outsidePanel.hidden=self.outsideEntryHost.hidden=YES;self.outsideContext=0;self.overlay.hidden=YES;return;}
     if(self.overlay.superview!=w){[self.overlay removeFromSuperview];[w addSubview:self.overlay];}
     self.overlay.frame=w.bounds;[w bringSubviewToFront:self.overlay];self.overlay.hidden=NO;
+    if([self updateOutside:w])return;
+    if(s.transitioning){[self hideForTransition];self.overlay.hidden=YES;return;}
     PracticeHUDState hud=pcp_hud_state();
+    if(hud.scroll_valid && fabs([NSUserDefaults.standardUserDefaults doubleForKey:@"PCPLastNativeNote"]-hud.native_note_speed)>0.0001)
+        [NSUserDefaults.standardUserDefaults setDouble:hud.native_note_speed forKey:@"PCPLastNativeNote"];
     self.speedHUD.hidden=self.accHUD.hidden=self.currentHUD.hidden=self.durationHUD.hidden=!hud.visible || !self.panel.hidden;
     [self layoutDesignHUD];
     self.speedHUD.text=[NSString stringWithFormat:@"SPEED %.2fx",hud.percent/100.0];

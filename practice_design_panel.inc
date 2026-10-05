@@ -1,5 +1,8 @@
 /* Methods included inside PCPRatePanel. Coordinates follow the Studio canvas. */
 - (UIView *)designed:(NSString *)key action:(SEL)action {
+    return [self designed:key action:action parent:self.panel];
+}
+- (UIView *)designed:(NSString *)key action:(SEL)action parent:(UIView *)parent {
     NSDictionary *e=PTElement(key);CGRect frame=PTRect(e);
     if(!e)return nil;
     if(action || [e[@"type"] isEqual:@"button"]) {
@@ -13,13 +16,13 @@
         button.caption=[[UILabel alloc] initWithFrame:button.bounds];PTLabelStyle(button.caption,e);
         button.caption.text=e[@"text"];button.caption.userInteractionEnabled=NO;[button addSubview:button.caption];
         if(action)[button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
-        [self.panel addSubview:button];return button;
+        [parent addSubview:button];return button;
     }
     UIImage *image=PTDesignImage(e,e[@"asset"]);
-    if(image) {UIImageView *background=[[UIImageView alloc] initWithImage:image];background.frame=frame;background.alpha=e[@"opacity"]?[e[@"opacity"] doubleValue]:1;[self.panel addSubview:background];}
+    if(image) {UIImageView *background=[[UIImageView alloc] initWithImage:image];background.frame=frame;background.alpha=e[@"opacity"]?[e[@"opacity"] doubleValue]:1;[parent addSubview:background];}
     if([e[@"type"] isEqual:@"text"]) {
         UILabel *label=[[UILabel alloc] initWithFrame:frame];PTLabelStyle(label,e);label.text=e[@"text"];
-        [self.panel addSubview:label];return label;
+        [parent addSubview:label];return label;
     }
     return nil;
 }
@@ -107,6 +110,7 @@
     self.countdown=(UILabel *)[self designed:@"el35" action:NULL];
     for(UILabel *l in @[self.speedHUD,self.accHUD,self.currentHUD,self.durationHUD,self.countdown]){[self.overlay addSubview:l];l.hidden=YES;l.layer.shadowColor=UIColor.blackColor.CGColor;l.layer.shadowOpacity=0.5;l.layer.shadowRadius=2;l.layer.shadowOffset=CGSizeMake(0,1);}
     self.draft=pcp_rate_ui_stored_percent();[self updateDraft];
+    [self buildOutside];
 }
 - (void)layoutDesignHUD {
     CGFloat scale=MIN(self.overlay.bounds.size.width/1376,self.overlay.bounds.size.height/1032);
