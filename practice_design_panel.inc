@@ -75,7 +75,7 @@
     self.addT=(UIButton *)[self designed:@"el23" action:@selector(addBookmark)];[self caption:self.addT design:@"el_52b9865f"];
     self.jump=(UIButton *)[self designed:@"el26" action:@selector(jumpTap)];[self caption:self.jump design:@"el_03762b62"];
     self.loop=(UIButton *)[self designed:@"el24" action:@selector(loopTap)];self.loop.accessibilityLabel=@"A/B 循环";
-    self.loopState=[self label:16 frame:CGRectMake(568,754,184,24) text:@"A/B 循环-关"];
+    self.loopState=[self label:16 frame:CGRectMake(552,808,136,44) text:@"A/B 循环-关"];
     self.selection=[self label:20 frame:CGRectMake(400,600,280,32) text:@"选择点位开始编辑"];
     self.status=[self label:17 frame:CGRectMake(400,984,280,40) text:@""];
     self.cancelJump=[self button:@"取消待执行跳转" frame:CGRectMake(400,880,272,44) action:@selector(cancelWaiting)];

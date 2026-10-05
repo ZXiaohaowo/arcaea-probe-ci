@@ -1134,9 +1134,12 @@ uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
                        g_scroll_gen_at_hook==g_scroll_gen)?g_scroll_config_word:pcp_note_settings_snapshot();
         float raw=0,base=0,scale=1,value=0;uint32_t sb=0x3f800000u;
         memcpy(&raw,&in,4);
-        uint64_t vt=0;
-        int accepted=safe_read(a,&vt,8) && vt==g_base+0x14c0b08 &&
-            safe_read(a+0xf0,&base,4) && pnp_plan(word,base,raw,&scale,&value);
+        uint64_t vt=0,setting=0;
+        /* Independent checked reads: the discovery scan budget may be exhausted
+         * outside its sampling callback and must not disable the build hook. */
+        int readable=rate_read64(a,&vt) && vt==g_base+0x14c0b08 && rate_read64(a+0xf0,&setting);
+        uint32_t basebits=(uint32_t)setting;memcpy(&base,&basebits,4);
+        int accepted=readable && pnp_plan(word,base,raw,&scale,&value);
         if(accepted){memcpy(&out,&value,4);memcpy(&sb,&scale,4);}
         else {g_scroll_write_fail++;word=0;}
         g_scroll_config_word=word;
@@ -1147,10 +1150,7 @@ uint64_t pcp_obs_entry(uint64_t a, uint64_t lr, uint64_t tag)
         g_scroll_chart=a;
         g_scroll_chart_valid=accepted;
         g_scroll_gen_at_hook=g_scroll_gen;
-        /* On-site read: the hook runs inside the chart's own update, so the
-         * pointer is live here (same pattern as the tag2 on-site fields). */
-        if ((a & 7ull)==0 && (a-0x100000000ull)<0x100000000ull)
-            g_scroll_vptr=*(volatile uint64_t *)(uintptr_t)a;
+        g_scroll_vptr=accepted?vt:0;
         g_scroll_raw_bits=in;
         g_scroll_out_bits=out;
         g_scroll_field_bits=out;
