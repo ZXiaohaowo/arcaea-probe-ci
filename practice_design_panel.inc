@@ -82,9 +82,16 @@
     self.continueButton=[self button:@"继续准备" frame:CGRectMake(400,936,272,44) action:@selector(continuePlaying)];
     self.editBox=[[UIView alloc] initWithFrame:CGRectMake(696,616,440,216)];self.editBox.hidden=YES;[self.panel addSubview:self.editBox];
     UIImageView *inputBackground=[[UIImageView alloc] initWithImage:PTDesignImage(PTElement(@"el_bcefc7e0"),PTElement(@"el_bcefc7e0")[@"asset"])];inputBackground.frame=CGRectMake(8,0,432,56);[self.editBox addSubview:inputBackground];
-    self.milliseconds=[[UILabel alloc] initWithFrame:CGRectMake(8,0,376,56)];PTLabelStyle(self.milliseconds,PTElement(@"el_bcefc7e0"));self.milliseconds.userInteractionEnabled=YES;
+    NSDictionary *numberDesign=PTElement(@"el_5b41cc14");CGRect numberFrame=PTRect(numberDesign);
+    numberFrame.origin.x-=self.editBox.frame.origin.x;numberFrame.origin.y-=self.editBox.frame.origin.y;
+    self.milliseconds=[[UILabel alloc] initWithFrame:numberFrame];PTLabelStyle(self.milliseconds,numberDesign);self.milliseconds.userInteractionEnabled=YES;
     [self.milliseconds addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(openDigits)]];[self.editBox addSubview:self.milliseconds];
-    UILabel *unit=[[UILabel alloc] initWithFrame:CGRectMake(384,0,48,56)];unit.text=@"ms";unit.font=PTFont(22,YES);unit.textColor=UIColor.whiteColor;[self.editBox addSubview:unit];
+    NSDictionary *unitDesign=PTElement(@"el_b2f73a7f");CGRect unitFrame=PTRect(unitDesign);
+    unitFrame.origin.x-=self.editBox.frame.origin.x;unitFrame.origin.y-=self.editBox.frame.origin.y;
+    UILabel *unit=[[UILabel alloc] initWithFrame:unitFrame];PTLabelStyle(unit,unitDesign);unit.text=@"ms";[self.editBox addSubview:unit];
+    /* Keep the full input background tappable despite the narrower authored number label. */
+    inputBackground.userInteractionEnabled=YES;
+    [inputBackground addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(openDigits)]];
     int steps[]={-1000,-100,100,1000};NSArray *stepIDs=@[@"el_fcb25955",@"el_4fe2b11d",@"el_24d119d5",@"el_fdf35a18"];
     self.editButtons=[NSMutableArray array];
     for(int i=0;i<4;i++){UIButton *v=(UIButton *)[self designed:stepIDs[i] action:@selector(timeStep:)];v.tag=steps[i];CGRect r=v.frame;r.origin.x-=696;r.origin.y-=616;v.frame=r;v.accessibilityLabel=[NSString stringWithFormat:@"%+d 毫秒",steps[i]];[self.editBox addSubview:v];[self.editButtons addObject:v];[v addGestureRecognizer:[[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(holdTime:)]];}

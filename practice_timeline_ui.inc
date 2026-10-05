@@ -379,8 +379,11 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     self.jump.enabled=(has||editing)&&!busy;self.jump.alpha=self.jump.enabled?1:0.45;
     self.removeT.enabled=has&&self.selected>=2&&!busy&&editing;
     NSInteger targetT=[self bookmarkTarget];self.addT.enabled=!busy&&targetT>=2;
-    [self.addT setTitle:targetT>=2?[NSString stringWithFormat:@"C 设置 %@",PTName(targetT)]:@"T 点已满" forState:UIControlStateNormal];
-    if(editing)[self.jump setTitle:@"跳转到编辑时间" forState:UIControlStateNormal];
+    [self.addT setTitle:targetT>=2?[NSString stringWithFormat:@"设置 %@ 点",PTName(targetT)]:@"T 点已满" forState:UIControlStateNormal];
+    if(editing) {
+        [self.jump setTitle:self.freeEditing?@"跳转":[NSString stringWithFormat:@"跳转到 %@ 点",PTName(self.selected)] forState:UIControlStateNormal];
+        self.selection.text=[NSString stringWithFormat:@"%@ 草稿 %@",self.freeEditing?@"C":PTName(self.selected),PTTime((unsigned)self.milliseconds.text.longLongValue)];
+    }
     for(UIButton *b in self.captureButtons)b.enabled=!busy;
     self.loop.enabled=!busy&&!editing;
     self.cancelJump.hidden=!(phase==3 && s.visible && !editing);
