@@ -4,7 +4,7 @@
     [self.overlay addSubview:self.outsideEntryHost];self.outsideEntryHost.hidden=YES;
     self.outsideEntry=(UIButton *)[self designed:@"el_2f376855" action:@selector(outsideToggle) parent:self.outsideEntryHost];
     self.outsideEntry.accessibilityLabel=@"局外练习设置";
-    [self designed:@"el_7f3d5827" action:NULL parent:self.outsideEntryHost];
+    [self caption:self.outsideEntry design:@"el_f8d86e4c"];
     self.outsidePanel=[[UIView alloc] initWithFrame:CGRectMake(0,0,1376,1032)];
     self.outsidePanel.backgroundColor=[UIColor colorWithWhite:0 alpha:0.35];
     self.outsidePanel.hidden=YES;[self.overlay addSubview:self.outsidePanel];
@@ -19,7 +19,7 @@
     NSArray *judgeValues=@[@"el_f50a0d7f",@"el_4aecaa0a",@"el_7e571e02",@"el_e1e84d07"];
     for(NSString *key in PTDesign()[@"_outsideOrder"]) {
         NSDictionary *element=PTElement(key);
-        if([key isEqual:@"runtime_outside_dimmer"] || [key isEqual:@"runtime_outside_status"])continue;
+        if([@[@"runtime_outside_dimmer",@"runtime_outside_status",@"el_6cd71203",@"el_067b5fe5"] containsObject:key])continue;
         if([element[@"hidden"] boolValue] || [element[@"visibleWhen"] isEqual:@"editing"])continue;
         SEL action=NULL;NSInteger tag=0;
         NSUInteger i=[rateIDs indexOfObject:key];
@@ -35,13 +35,10 @@
         if([view isKindOfClass:UIButton.class])((UIButton *)view).tag=tag;
         if([unavailable containsObject:key]) {
             UIButton *button=(UIButton *)view;button.enabled=NO;
-            NSString *title=element[@"text"]?:@"";
-            if([title rangeOfString:@"未接入"].location==NSNotFound && [title rangeOfString:@"待验证"].location==NSNotFound)
-                title=[title stringByAppendingString:@" · 未接入"];
-            [button setTitle:title forState:UIControlStateNormal];
+
         }
         if([judgeValues containsObject:key])((UILabel *)view).text=@"--";
-        if([key isEqual:@"el_9a84c332"])((UILabel *)view).text=@"服务器地址 · 未接入";
+
     }
     self.outsideStatus=(UILabel *)[self designed:@"runtime_outside_status" action:NULL parent:self.outsidePanel];
     if(!self.outsideStatus) {
@@ -101,11 +98,11 @@
     ((UILabel *)self.outsideViews[@"el_3943f258"]).text=[NSString stringWithFormat:@"%.2fx",rate/100.0];
     ((UILabel *)self.outsideViews[@"el_96eb867d"]).text=[NSString stringWithFormat:@"SPEED %.2fx",rate/100.0];
     ((UILabel *)self.outsideViews[@"el_745197c4"]).text=reference>0?[NSString stringWithFormat:@"%.3f",current]:@"--";
-    ((UILabel *)self.outsideViews[@"el_e6794a72"]).text=reference>0?[NSString stringWithFormat:@"预设 CNS %.3f",current]:@"CNS 跟随游戏";
-    ((UILabel *)self.outsideViews[@"el_fc9dce22"]).text=reference>0?[NSString stringWithFormat:@"预设 NoteSpeed %.3f",current*rate/100.0]:@"NoteSpeed --";
+    ((UILabel *)self.outsideViews[@"el_e6794a72"]).text=reference>0?[NSString stringWithFormat:@"CurrentNoteSpeed %.3f",current]:@"CNS 跟随游戏";
+    ((UILabel *)self.outsideViews[@"el_fc9dce22"]).text=reference>0?[NSString stringWithFormat:@"NoteSpeed %.3f",current*rate/100.0]:@"NoteSpeed --";
     [(UIButton *)self.outsideViews[@"el_ccb9ac7b"] setTitle:mode?@"流速不变":@"同步变速" forState:UIControlStateNormal];
     [(UIButton *)self.outsideViews[@"el_17314d40"] setTitle:pcp_pitch_mode_get()?@"音高保持":@"音高随速" forState:UIControlStateNormal];
-    ((UIButton *)self.outsideViews[@"el_09e71c48"]).selected=[self hudEnabled];
+    [(UIButton *)self.outsideViews[@"el_09e71c48"] setTitle:[self hudEnabled]?@"HUD显示":@"HUD隐藏" forState:UIControlStateNormal];
     for(NSString *key in @[@"el_129caae6",@"el_400594d7",@"el_e42e438b",@"el_3d713da5"])
         ((UIButton *)self.outsideViews[key]).enabled=!mode&&reference>0;
     if(CFAbsoluteTimeGetCurrent()>self.outsideMessageUntil)

@@ -4,10 +4,16 @@ static NSDictionary *PTElement(NSString *key) { return PTDesign()[key]; }
 static CGRect PTRect(NSDictionary *e) {
     return CGRectMake([e[@"x"] doubleValue],[e[@"y"] doubleValue],[e[@"w"] doubleValue],[e[@"h"] doubleValue]);
 }
+static CGRect PTSliderFrame(NSString *key) {
+    CGRect r=PTRect(PTElement(key));return CGRectMake(r.origin.x-12,CGRectGetMidY(r)-24,r.size.width+24,48);
+}
 static UIFont *PTDesignFont(NSDictionary *e) {
     NSString *name=[[e[@"font"] lastPathComponent] stringByDeletingPathExtension];
     CGFloat size=[e[@"fontSize"] doubleValue];
-    return [UIFont fontWithName:name size:size]?:[UIFont systemFontOfSize:size weight:UIFontWeightLight];
+    CGFloat weight=[name containsString:@"SemiBold"]?UIFontWeightSemibold:[name containsString:@"Bold"]?UIFontWeightBold:[name containsString:@"Medium"]?UIFontWeightMedium:[name containsString:@"Light"]?UIFontWeightLight:UIFontWeightRegular;
+    UIFont *font=[UIFont fontWithName:name size:size]?:[UIFont systemFontOfSize:size weight:weight];
+    UIFontDescriptor *fallback=[UIFont systemFontOfSize:size weight:weight].fontDescriptor;
+    return [UIFont fontWithDescriptor:[font.fontDescriptor fontDescriptorByAddingAttributes:@{UIFontDescriptorCascadeListAttribute:@[fallback]}] size:size];
 }
 static UIImage *PTAsset(NSString *path) {
     if(!path.length)return nil;
@@ -48,6 +54,7 @@ static void PTLabelStyle(UILabel *label,NSDictionary *e) {
 @property(nonatomic,strong) UILabel *caption;
 @property(nonatomic,strong) UIImage *normalTexture,*pressedTexture,*selectedTexture;
 @property(nonatomic) BOOL unset;
+@property(nonatomic) CGFloat designOpacity;
 @end
 @implementation PTTextureButton
 - (void)drawRect:(CGRect)rect {
@@ -56,12 +63,11 @@ static void PTLabelStyle(UILabel *label,NSDictionary *e) {
 
 }
 - (void)setTitle:(NSString *)title forState:(UIControlState)state {if(state==UIControlStateNormal)self.caption.text=title;}
-- (void)setEnabled:(BOOL)value {[super setEnabled:value];self.alpha=value?1:0.35;}
+- (void)setEnabled:(BOOL)value {[super setEnabled:value];self.alpha=value?self.designOpacity:0.32;}
 - (void)setHighlighted:(BOOL)value {[super setHighlighted:value];[self setNeedsDisplay];}
 - (void)setSelected:(BOOL)value {
     [super setSelected:value];
-    self.layer.shadowColor=[UIColor colorWithRed:0.72 green:0.60 blue:1 alpha:1].CGColor;
-    self.layer.shadowOpacity=value?0.9:0;self.layer.shadowRadius=7;self.layer.shadowOffset=CGSizeZero;
+    self.layer.shadowOpacity=0;
     [self setNeedsDisplay];
 }
 - (void)setUnset:(BOOL)value {_unset=value;[self setNeedsDisplay];}
