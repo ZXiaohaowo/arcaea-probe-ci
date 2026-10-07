@@ -298,7 +298,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
 }
 - (void)stopHold {[self.holdTimer invalidate];self.holdTimer=nil;self.heldButton=nil;}
 - (void)repeatTime {
-    if(!_edit.editing || !self.heldButton.enabled || UIApplication.sharedApplication.applicationState!=UIApplicationStateActive){[self stopHold];return;}
+    if(!self.heldButton.enabled || UIApplication.sharedApplication.applicationState!=UIApplicationStateActive){[self stopHold];return;}
     [self timeStep:self.heldButton];
 }
 - (void)holdTime:(UILongPressGestureRecognizer *)gesture {
