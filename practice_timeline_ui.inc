@@ -162,7 +162,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
 @property(nonatomic) NSTimeInterval outsideSince,outsideMessageUntil;
 @property(nonatomic,strong) UIView *panel,*editBox,*curtain;
 @property(nonatomic,strong) UIButton *entry,*apply,*reset,*noteMode,*pitchMode,*hudMode,*loop,*jump,*addT,*removeT,*close,*continueButton,*cancelJump;
-@property(nonatomic,strong) NSMutableArray<UIButton *> *chips,*editButtons,*captureButtons;
+@property(nonatomic,strong) NSMutableArray<UIButton *> *chips,*editButtons,*captureButtons,*editCommitButtons;
 @property(nonatomic,strong) UILabel *value,*status,*selection,*rangeLabel,*compLabel,*speedHUD,*accHUD,*noteSpeeds,*countdown;
 @property(nonatomic,strong) UILabel *noteSpeedValue,*appliedValue,*currentHUD,*durationHUD;
 @property(nonatomic,strong) NSMutableArray<UIView *> *hudProgressViews;
@@ -264,7 +264,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     if(target<0){[self message:@"T 点已满，选中一个 T 点后可用 C 覆盖"];return;}
     if(!pcp_point_capture((unsigned)target)){[self message:@"当前无法读取 C 点设点"];return;}
     /* Capturing another slot must not consume the editor's unsaved draft. */
-    if(self.selected==target || self.editBox.hidden)[self choose:(NSUInteger)target];
+    if(self.selected==target || !_edit.editing)[self choose:(NSUInteger)target];
     [self message:[NSString stringWithFormat:@"已用实际 C 设置 %@",PTName(target)]];
 }
 - (void)deletePoint {if(!self.freeEditing && self.selected>=0 && pcp_point_delete((unsigned)self.selected)){[self cancelEdit];self.selected=-1;[self message:@"已删除选中点"];}}
@@ -293,12 +293,12 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     self.axis.drafting=YES;self.axis.draftID=5;self.axis.draftMs=_edit.draft;self.axis.draftLimit=_edit.duration;
 }
 - (void)dragTime:(unsigned)ms {
-    if(self.editBox.hidden || !pp_input(&_edit,ms))return;
+    if(!_edit.editing || !pp_input(&_edit,ms))return;
     self.milliseconds.text=[NSString stringWithFormat:@"%u",ms];self.axis.draftMs=ms;[self.axis setNeedsDisplay];
 }
 - (void)stopHold {[self.holdTimer invalidate];self.holdTimer=nil;self.heldButton=nil;}
 - (void)repeatTime {
-    if(self.editBox.hidden || !self.heldButton.enabled || UIApplication.sharedApplication.applicationState!=UIApplicationStateActive){[self stopHold];return;}
+    if(!_edit.editing || !self.heldButton.enabled || UIApplication.sharedApplication.applicationState!=UIApplicationStateActive){[self stopHold];return;}
     [self timeStep:self.heldButton];
 }
 - (void)holdTime:(UILongPressGestureRecognizer *)gesture {
@@ -332,7 +332,9 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
 }
 - (void)chip:(UIButton *)b {[self choose:(NSUInteger)b.tag];}
 - (void)timeStep:(UIButton *)b {
-    unsigned phase=pcp_seek_phase();if(self.editBox.hidden || (phase>=1 && phase<=4))return;
+    unsigned phase=pcp_seek_phase();if(phase>=1 && phase<=4)return;
+    if(!_edit.editing && self.selected>=0)[self choose:(NSUInteger)self.selected];
+    if(!_edit.editing)return;
     pp_adjust(&_edit,(int)b.tag);self.milliseconds.text=[NSString stringWithFormat:@"%u",_edit.draft];
     self.axis.draftMs=_edit.draft;[self.axis setNeedsDisplay];
 }
@@ -344,9 +346,9 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     if(!_edit.editing || !pcp_point_update((unsigned)self.selected,_edit.draft)){[self message:@"时间超出范围或会话已变化，尚未保存"];return;}
     [self cancelEdit];[self message:@"时间已更新"];
 }
-- (void)cancelEdit {[self stopHold];self.freeEditing=NO;self.axis.drafting=NO;_edit.editing=0;self.editBox.hidden=YES;self.jump.hidden=self.selection.hidden=NO;}
+- (void)cancelEdit {[self stopHold];self.freeEditing=NO;self.axis.drafting=NO;_edit.editing=0;self.editBox.hidden=NO;self.jump.hidden=self.selection.hidden=NO;}
 - (void)jumpTap {
-    if(!self.editBox.hidden) {
+    if(_edit.editing) {
         if(!_edit.editing || !pcp_jump_time(_edit.draft)){[self message:@"编辑时间无效或暂时不能跳转"];return;}
         /* Preview-jump to the draft; only Confirm writes the saved point. */
         [self hideForTransition];return;
@@ -396,7 +398,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     self.panel.transform=CGAffineTransformMakeScale(scale,scale);
     self.panel.center=CGPointMake(w.bounds.size.width/2,w.bounds.size.height/2);
     self.curtain.frame=w.bounds;self.curtain.hidden=self.panel.hidden;
-    unsigned phase=pcp_seek_phase();BOOL busy=phase>=1 && phase<=4,editing=!self.editBox.hidden;
+    unsigned phase=pcp_seek_phase();BOOL busy=phase>=1 && phase<=4,editing=_edit.editing!=0;
     self.apply.enabled=self.reset.enabled=s.ready&&!s.pending&&(!busy||s.prep);self.slider.enabled=(!busy||s.prep);
     self.noteMode.enabled=self.pitchMode.enabled=(!busy||s.prep);
     [self.noteMode setTitle:pcp_note_mode_get()?@"流速不变":@"同步变速" forState:UIControlStateNormal];
@@ -417,6 +419,10 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     self.rangeLabel.text=[NSString stringWithFormat:@"Current - %@",PTTime(current)];
     BOOL has=self.selected>=0 && (p.mask&(1u<<self.selected));
     unsigned shownMs=editing?_edit.draft:(has?p.ms[self.selected]:current);
+    self.editBox.hidden=NO;
+    if(!editing)self.milliseconds.text=has?[NSString stringWithFormat:@"%u",p.ms[self.selected]]:@"--";
+    for(UIButton *button in self.editButtons)button.enabled=(editing||has)&&!busy;
+    for(UIButton *button in self.editCommitButtons)button.enabled=editing&&!busy;
     self.selection.text=self.freeEditing?[NSString stringWithFormat:@"选中 C · %@",PTTime(shownMs)]:has?[NSString stringWithFormat:@"选中 %@ · %@",PTName(self.selected),PTTime(shownMs)]:self.selected>=0?[NSString stringWithFormat:@"选中 %@ · 未设置",PTName(self.selected)]:@"选择点位开始编辑";
     [self.jump setTitle:@"跳转选中点" forState:UIControlStateNormal];
     self.jump.enabled=(has||editing)&&!busy;self.jump.alpha=self.jump.enabled?1:0.32;
