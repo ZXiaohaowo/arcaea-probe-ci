@@ -11,7 +11,7 @@
         button.normalTexture=PTDesignImage(e,e[@"asset"]);
         button.pressedTexture=PTDesignImage(e,e[@"pressedAsset"]?:e[@"asset"]);
         NSString *selectionAsset=e[@"selectedAsset"];
-        if(!selectionAsset || [selectionAsset isEqual:e[@"pressedAsset"]])selectionAsset=e[@"asset"];
+        if(!selectionAsset)selectionAsset=e[@"asset"];
         button.selectedTexture=PTDesignImage(e,selectionAsset);
         button.caption=[[UILabel alloc] initWithFrame:button.bounds];PTLabelStyle(button.caption,e);
         button.caption.text=e[@"text"];button.caption.userInteractionEnabled=NO;[button addSubview:button.caption];
@@ -81,24 +81,28 @@
     UIButton *b=(UIButton *)[self designed:@"el22" action:@selector(capture:)];b.tag=1;[self caption:b design:@"el_d595675e"];
     self.captureButtons=[NSMutableArray arrayWithObjects:a,b,nil];
     self.addT=(UIButton *)[self designed:@"el23" action:@selector(addBookmark)];[self caption:self.addT design:@"el_52b9865f"];
-    self.jump=(UIButton *)[self designed:@"el26" action:@selector(jumpTap)];[self caption:self.jump design:@"el_03762b62"];
-    self.loop=(UIButton *)[self designed:@"el24" action:@selector(loopTap)];self.loop.accessibilityLabel=@"A/B 循环";
+    self.removeT=(UIButton *)[self designed:@"el26" action:@selector(deletePoint)];[self caption:self.removeT design:@"el_03762b62"];
+    self.jump=(UIButton *)[self designed:@"el_e8b2af72" action:@selector(jumpTap)];[self caption:self.jump design:@"el_2539024f"];
+    self.pitchMode=(UIButton *)[self designed:@"el_3f09d6b9" action:@selector(pitchTap)];[self caption:self.pitchMode design:@"el_c161b7ae"];
+    UIButton *countdownSetting=(UIButton *)[self designed:@"el_e843b58e" action:NULL];[self caption:countdownSetting design:@"el_6db65912"];countdownSetting.enabled=NO;
+    for(NSString *key in @[@"el_f3725514",@"el_3e70b005",@"el_f5711c49",@"el_c09a387f",@"el_206df674",@"el_2a700caf"])[self designed:key action:NULL];
+    self.loop=(UIButton *)[self designed:@"el_63d4d70e" action:@selector(loopTap)];self.loop.accessibilityLabel=@"A/B 循环";
     self.selection=(UILabel *)[self designed:@"runtime_selection" action:NULL];
     self.status=(UILabel *)[self designed:@"runtime_status" action:NULL];self.status.text=@"";
-    self.editBox=[[UIView alloc] initWithFrame:CGRectMake(696,714,440,215)];self.editBox.hidden=YES;[self.panel addSubview:self.editBox];
-    NSDictionary *inputDesign=PTElement(@"el_bcefc7e0");CGRect inputFrame=PTRect(inputDesign);inputFrame.origin.x-=696;inputFrame.origin.y-=714;
+    self.editBox=[[UIView alloc] initWithFrame:CGRectMake(472,736,432,248)];self.editBox.hidden=YES;[self.panel addSubview:self.editBox];
+    NSDictionary *inputDesign=PTElement(@"el_bcefc7e0");CGRect inputFrame=PTRect(inputDesign);inputFrame.origin.x-=472;inputFrame.origin.y-=736;
     UIImageView *inputBackground=[[UIImageView alloc] initWithImage:PTDesignImage(inputDesign,inputDesign[@"asset"])];inputBackground.frame=inputFrame;[self.editBox addSubview:inputBackground];
     NSDictionary *numberDesign=PTElement(@"el_5b41cc14");CGRect numberFrame=PTRect(numberDesign);
-    numberFrame.origin.x-=696;numberFrame.origin.y-=714;
+    numberFrame.origin.x-=472;numberFrame.origin.y-=736;
     self.milliseconds=[[UILabel alloc] initWithFrame:numberFrame];PTLabelStyle(self.milliseconds,numberDesign);self.milliseconds.userInteractionEnabled=NO;
     [self.editBox addSubview:self.milliseconds];
     NSDictionary *unitDesign=PTElement(@"el_b2f73a7f");CGRect unitFrame=PTRect(unitDesign);
-    unitFrame.origin.x-=696;unitFrame.origin.y-=714;
+    unitFrame.origin.x-=472;unitFrame.origin.y-=736;
     UILabel *unit=[[UILabel alloc] initWithFrame:unitFrame];PTLabelStyle(unit,unitDesign);unit.text=@"ms";[self.editBox addSubview:unit];
     int steps[]={-1000,-100,100,1000};NSArray *stepIDs=@[@"el_fcb25955",@"el_4fe2b11d",@"el_24d119d5",@"el_fdf35a18"];
     self.editButtons=[NSMutableArray array];
-    for(int i=0;i<4;i++){UIButton *v=(UIButton *)[self designed:stepIDs[i] action:@selector(timeStep:)];v.tag=steps[i];CGRect r=v.frame;r.origin.x-=696;r.origin.y-=714;v.frame=r;v.accessibilityLabel=[NSString stringWithFormat:@"%+d 毫秒",steps[i]];[self.editBox addSubview:v];[self.editButtons addObject:v];[v addGestureRecognizer:[[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(holdTime:)]];}
-    for(NSString *key in @[@"el_2ebea99a",@"el_c746bf87"]){UIButton *v=(UIButton *)[self designed:key action:[key isEqual:@"el_2ebea99a"]?@selector(confirmEdit):@selector(cancelEdit)];[self caption:v design:[key isEqual:@"el_2ebea99a"]?@"el_52a664bd":@"el_9bbbe20d"];CGRect r=v.frame;r.origin.x-=696;r.origin.y-=714;v.frame=r;[self.editBox addSubview:v];}
+    for(int i=0;i<4;i++){UIButton *v=(UIButton *)[self designed:stepIDs[i] action:@selector(timeStep:)];v.tag=steps[i];CGRect r=v.frame;r.origin.x-=472;r.origin.y-=736;v.frame=r;v.accessibilityLabel=[NSString stringWithFormat:@"%+d 毫秒",steps[i]];[self.editBox addSubview:v];[self.editButtons addObject:v];[v addGestureRecognizer:[[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(holdTime:)]];}
+    for(NSString *key in @[@"el_2ebea99a",@"el_c746bf87"]){UIButton *v=(UIButton *)[self designed:key action:[key isEqual:@"el_2ebea99a"]?@selector(confirmEdit):@selector(cancelEdit)];[self caption:v design:[key isEqual:@"el_2ebea99a"]?@"el_52a664bd":@"el_9bbbe20d"];CGRect r=v.frame;r.origin.x-=472;r.origin.y-=736;v.frame=r;[self.editBox addSubview:v];}
     self.entry=[self button:@"练习" frame:CGRectZero action:@selector(toggle)];[self.overlay addSubview:self.entry];
     self.speedHUD=(UILabel *)[self designed:@"el33" action:NULL];self.accHUD=(UILabel *)[self designed:@"el34" action:NULL];
     self.currentHUD=(UILabel *)[self designed:@"el_024b6d15" action:NULL];self.durationHUD=(UILabel *)[self designed:@"el_fd5065da" action:NULL];

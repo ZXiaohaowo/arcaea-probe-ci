@@ -267,7 +267,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     if(self.selected==target || self.editBox.hidden)[self choose:(NSUInteger)target];
     [self message:[NSString stringWithFormat:@"已用实际 C 设置 %@",PTName(target)]];
 }
-- (void)deletePoint {if(self.selected>=2 && pcp_point_delete((unsigned)self.selected)){[self cancelEdit];self.selected=-1;[self message:@"已删除书签，其他编号保留"];}}
+- (void)deletePoint {if(!self.freeEditing && self.selected>=0 && pcp_point_delete((unsigned)self.selected)){[self cancelEdit];self.selected=-1;[self message:@"已删除选中点"];}}
 - (void)choose:(NSUInteger)i {
     if(i>=5 || (pcp_seek_phase()>=1 && pcp_seek_phase()<=4))return;
     [self cancelEdit];self.selected=(NSInteger)i;
@@ -400,7 +400,7 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     self.apply.enabled=self.reset.enabled=s.ready&&!s.pending&&(!busy||s.prep);self.slider.enabled=(!busy||s.prep);
     self.noteMode.enabled=self.pitchMode.enabled=(!busy||s.prep);
     [self.noteMode setTitle:pcp_note_mode_get()?@"流速不变":@"同步变速" forState:UIControlStateNormal];
-    [self.pitchMode setTitle:pcp_pitch_mode_get()?(hud.pitch_attached || hud.percent==100?@"音高 保持":@"音高 保持 · 待挂接"):@"音高 随速" forState:UIControlStateNormal];
+    [self.pitchMode setTitle:pcp_pitch_mode_get()?@"音高保持":@"音高随速" forState:UIControlStateNormal];
     self.noteSpeeds.text=hud.scroll_valid?[NSString stringWithFormat:@"CurrentNoteSpeed %.3f",hud.current_note_speed]:@"CurrentNoteSpeed --";
     self.noteSpeedValue.text=hud.scroll_valid?[NSString stringWithFormat:@"NoteSpeed %.2f",hud.note_speed]:@"NoteSpeed --";
     double desired=[self noteDesired];BOOL fixed=pcp_note_mode_get()!=0;
@@ -418,12 +418,11 @@ static NSString *PTName(NSUInteger i) {return @[@"A",@"B",@"T1",@"T2",@"T3"][i];
     BOOL has=self.selected>=0 && (p.mask&(1u<<self.selected));
     unsigned shownMs=editing?_edit.draft:(has?p.ms[self.selected]:current);
     self.selection.text=self.freeEditing?[NSString stringWithFormat:@"选中 C · %@",PTTime(shownMs)]:has?[NSString stringWithFormat:@"选中 %@ · %@",PTName(self.selected),PTTime(shownMs)]:self.selected>=0?[NSString stringWithFormat:@"选中 %@ · 未设置",PTName(self.selected)]:@"选择点位开始编辑";
-    [self.jump setTitle:has?[NSString stringWithFormat:@"跳转到 %@ 点",PTName(self.selected)]:@"选中点位后跳转" forState:UIControlStateNormal];
+    [self.jump setTitle:@"跳转选中点" forState:UIControlStateNormal];
     self.jump.enabled=(has||editing)&&!busy;self.jump.alpha=self.jump.enabled?1:0.32;
-    self.removeT.enabled=has&&self.selected>=2&&!busy&&editing;
+    self.removeT.enabled=has&&!self.freeEditing&&!busy;
     NSInteger targetT=[self bookmarkTarget];self.addT.enabled=!busy&&targetT>=2;
     [self.addT setTitle:targetT>=2?[NSString stringWithFormat:@"设置 %@ 点",PTName(targetT)]:@"T 点已满" forState:UIControlStateNormal];
-    if(editing)[self.jump setTitle:self.freeEditing?@"跳转":[NSString stringWithFormat:@"跳转到 %@ 点",PTName(self.selected)] forState:UIControlStateNormal];
     for(UIButton *b in self.captureButtons)b.enabled=!busy;
     self.loop.enabled=!busy;
     NSString *loopTitle=pcp_ab_loop_get()?@"A-B 循环 开":@"A-B 循环 关";

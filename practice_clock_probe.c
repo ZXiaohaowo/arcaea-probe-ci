@@ -146,7 +146,7 @@
 #ifndef PRACTICE_BUILD_ID
 #define PRACTICE_BUILD_ID "dev"
 #endif
-#define PRACTICE_CLOCK_PROBE_VERSION "v53-" PRACTICE_BUILD_ID
+#define PRACTICE_CLOCK_PROBE_VERSION "v54-" PRACTICE_BUILD_ID
 
 #define SAMPLE_INTERVAL_MS 1000
 #define GAP_FACTOR 3
@@ -1030,7 +1030,13 @@ int pcp_point_capture(unsigned id) {
 }
 int pcp_point_delete(unsigned id) {
     if(!pthread_main_np() || !pcp_rate_ui_state().visible || psk_busy(&g_seek))return 0;
-    return pp_delete_t(&g_points,id);
+    if(id>=PP_COUNT || !(g_points.mask&(1u<<id)))return 0;
+    if(id>=2)return pp_delete_t(&g_points,id);
+    /* Removing an A/B endpoint invalidates the loop, never the other points. */
+    pcp_ab_loop_set(0);g_ab_have[id]=0;g_ab_pos[id]=0;
+    g_points.mask&=~(1u<<id);g_points.ms[id]=0;g_points.revision++;
+    if(g_points.selected==(int)id)g_points.selected=-1;
+    return 1;
 }
 int pcp_jump_time(unsigned ms) {
     uint64_t now=0;

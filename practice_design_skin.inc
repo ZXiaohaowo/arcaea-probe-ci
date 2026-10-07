@@ -8,9 +8,18 @@ static CGRect PTSliderFrame(NSString *key) {
     CGRect r=PTRect(PTElement(key));return CGRectMake(r.origin.x-12,CGRectGetMidY(r)-24,r.size.width+24,48);
 }
 static UIFont *PTDesignFont(NSDictionary *e) {
-    NSString *name=[[e[@"font"] lastPathComponent] stringByDeletingPathExtension];
+    NSString *path=[NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:e[@"font"]?:@""];
+    static NSMutableDictionary *fontNames;static dispatch_once_t once;
+    dispatch_once(&once, ^{fontNames=[NSMutableDictionary dictionary];});
+    NSString *name=fontNames[path];
+    if(!name) {
+        NSArray *descriptors=CFBridgingRelease(CTFontManagerCreateFontDescriptorsFromURL((__bridge CFURLRef)[NSURL fileURLWithPath:path]));
+        if(descriptors.count)name=CFBridgingRelease(CTFontDescriptorCopyAttribute((__bridge CTFontDescriptorRef)descriptors[0],kCTFontNameAttribute));
+        if(!name)name=[[e[@"font"] lastPathComponent] stringByDeletingPathExtension];
+        if(name)fontNames[path]=name;
+    }
     CGFloat size=[e[@"fontSize"] doubleValue];
-    CGFloat weight=[name containsString:@"SemiBold"]?UIFontWeightSemibold:[name containsString:@"Bold"]?UIFontWeightBold:[name containsString:@"Medium"]?UIFontWeightMedium:[name containsString:@"Light"]?UIFontWeightLight:UIFontWeightRegular;
+    CGFloat weight=([name containsString:@"SemiBold"] || [name containsString:@"DemiBold"])?UIFontWeightSemibold:[name containsString:@"Bold"]?UIFontWeightBold:[name containsString:@"Medium"]?UIFontWeightMedium:[name containsString:@"Light"]?UIFontWeightLight:UIFontWeightRegular;
     UIFont *font=[UIFont fontWithName:name size:size]?:[UIFont systemFontOfSize:size weight:weight];
     UIFontDescriptor *fallback=[UIFont systemFontOfSize:size weight:weight].fontDescriptor;
     return [UIFont fontWithDescriptor:[font.fontDescriptor fontDescriptorByAddingAttributes:@{UIFontDescriptorCascadeListAttribute:@[fallback]}] size:size];
