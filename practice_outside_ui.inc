@@ -15,10 +15,11 @@
     self.outsideViews=[NSMutableDictionary dictionary];
     NSArray *rateIDs=@[@"el_2f79b0c4",@"el_3311a015",@"el_0453e383",@"el_9dc1d38c"];
     NSArray *noteIDs=@[@"el_129caae6",@"el_400594d7",@"el_e42e438b",@"el_3d713da5"];
-    NSArray *unavailable=@[@"el_8670e9d4",@"el_d2a36ce7",@"el_13dad963",@"el_66bf3b78",@"el_dfd77ec5",@"el_085dcf7a",@"el_a43a4aff"];
+    NSArray *unavailable=@[@"el_8670e9d4",@"el_d2a36ce7",@"el_13dad963",@"el_66bf3b78",@"el_dfd77ec5",@"el_085dcf7a",@"el_a43a4aff",@"el_ddfed51f"];
     NSArray *judgeValues=@[@"el_f50a0d7f",@"el_4aecaa0a",@"el_7e571e02",@"el_e1e84d07"];
     for(NSString *key in PTDesign()[@"_outsideOrder"]) {
         NSDictionary *element=PTElement(key);
+        if([key isEqual:@"runtime_outside_dimmer"] || [key isEqual:@"runtime_outside_status"])continue;
         if([element[@"hidden"] boolValue] || [element[@"visibleWhen"] isEqual:@"editing"])continue;
         SEL action=NULL;NSInteger tag=0;
         NSUInteger i=[rateIDs indexOfObject:key];
@@ -28,26 +29,26 @@
         if([key isEqual:@"el_ccb9ac7b"])action=@selector(outsideMode);
         if([key isEqual:@"el_17314d40"])action=@selector(outsidePitch);
         if([key isEqual:@"el_865d06f7"])action=@selector(outsideLog);
+        if([key isEqual:@"el_09e71c48"])action=@selector(hudTap);
         UIView *view=[self designed:key action:action parent:self.outsidePanel];
         if(view)self.outsideViews[key]=view;
         if([view isKindOfClass:UIButton.class])((UIButton *)view).tag=tag;
         if([unavailable containsObject:key]) {
             UIButton *button=(UIButton *)view;button.enabled=NO;
-            [button setTitle:[element[@"text"] stringByAppendingString:@" · 未接入"] forState:UIControlStateNormal];
+            NSString *title=element[@"text"]?:@"";
+            if([title rangeOfString:@"未接入"].location==NSNotFound && [title rangeOfString:@"待验证"].location==NSNotFound)
+                title=[title stringByAppendingString:@" · 未接入"];
+            [button setTitle:title forState:UIControlStateNormal];
         }
         if([judgeValues containsObject:key])((UILabel *)view).text=@"--";
         if([key isEqual:@"el_9a84c332"])((UILabel *)view).text=@"服务器地址 · 未接入";
     }
-    self.outsideStatus=[[UILabel alloc] initWithFrame:CGRectMake(96,920,1184,56)];
-    self.outsideStatus.font=PTFont(19,NO);self.outsideStatus.textColor=UIColor.whiteColor;
-    self.outsideStatus.numberOfLines=2;self.outsideStatus.textAlignment=NSTextAlignmentCenter;
-    [self.outsidePanel addSubview:self.outsideStatus];
-    UILabel *judgeInfo=[[UILabel alloc] initWithFrame:CGRectMake(48,672,240,40)];
-    judgeInfo.font=PTFont(17,NO);judgeInfo.textColor=UIColor.whiteColor;judgeInfo.text=@"判定调整 · 未接入";
-    judgeInfo.textAlignment=NSTextAlignmentCenter;[self.outsidePanel addSubview:judgeInfo];
-    UILabel *hint=[[UILabel alloc] initWithFrame:CGRectMake(840,336,400,32)];
-    hint.font=PTFont(16,NO);hint.textColor=UIColor.whiteColor;hint.textAlignment=NSTextAlignmentCenter;
-    hint.text=@"CNS ±0.50 / 0.10 · 长按数值恢复";[self.outsidePanel addSubview:hint];
+    self.outsideStatus=(UILabel *)[self designed:@"runtime_outside_status" action:NULL parent:self.outsidePanel];
+    if(!self.outsideStatus) {
+        self.outsideStatus=[[UILabel alloc] initWithFrame:CGRectMake(96,880,1184,32)];
+        self.outsideStatus.font=PTFont(19,NO);self.outsideStatus.textColor=UIColor.whiteColor;
+        self.outsideStatus.textAlignment=NSTextAlignmentCenter;[self.outsidePanel addSubview:self.outsideStatus];
+    }
     UILabel *number=(UILabel *)self.outsideViews[@"el_745197c4"];number.userInteractionEnabled=YES;
     [number addGestureRecognizer:[[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(outsideNative:)]];
 }
@@ -104,6 +105,7 @@
     ((UILabel *)self.outsideViews[@"el_fc9dce22"]).text=reference>0?[NSString stringWithFormat:@"预设 NoteSpeed %.3f",current*rate/100.0]:@"NoteSpeed --";
     [(UIButton *)self.outsideViews[@"el_ccb9ac7b"] setTitle:mode?@"流速不变":@"同步变速" forState:UIControlStateNormal];
     [(UIButton *)self.outsideViews[@"el_17314d40"] setTitle:pcp_pitch_mode_get()?@"音高保持":@"音高随速" forState:UIControlStateNormal];
+    ((UIButton *)self.outsideViews[@"el_09e71c48"]).selected=[self hudEnabled];
     for(NSString *key in @[@"el_129caae6",@"el_400594d7",@"el_e42e438b",@"el_3d713da5"])
         ((UIButton *)self.outsideViews[key]).enabled=!mode&&reference>0;
     if(CFAbsoluteTimeGetCurrent()>self.outsideMessageUntil)

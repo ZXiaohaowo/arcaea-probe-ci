@@ -15,16 +15,19 @@
         button.selectedTexture=PTDesignImage(e,selectionAsset);
         button.caption=[[UILabel alloc] initWithFrame:button.bounds];PTLabelStyle(button.caption,e);
         button.caption.text=e[@"text"];button.caption.userInteractionEnabled=NO;[button addSubview:button.caption];
+        button.alpha=e[@"opacity"]?[e[@"opacity"] doubleValue]:1;
         if(action)[button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
         [parent addSubview:button];return button;
     }
     UIImage *image=PTDesignImage(e,e[@"asset"]);
-    if(image) {UIImageView *background=[[UIImageView alloc] initWithImage:image];background.frame=frame;background.alpha=e[@"opacity"]?[e[@"opacity"] doubleValue]:1;[parent addSubview:background];}
+    UIImageView *background=nil;
+    if(image) {background=[[UIImageView alloc] initWithImage:image];background.frame=frame;background.alpha=e[@"opacity"]?[e[@"opacity"] doubleValue]:1;[parent addSubview:background];}
     if([e[@"type"] isEqual:@"text"]) {
         UILabel *label=[[UILabel alloc] initWithFrame:frame];PTLabelStyle(label,e);label.text=e[@"text"];
+        label.alpha=e[@"opacity"]?[e[@"opacity"] doubleValue]:1;
         [parent addSubview:label];return label;
     }
-    return nil;
+    return background;
 }
 - (void)caption:(UIButton *)button design:(NSString *)key {
     PTTextureButton *b=(PTTextureButton *)button;NSDictionary *e=PTElement(key);
@@ -42,6 +45,8 @@
 
     self.noteMode=(UIButton *)[self designed:@"el11" action:@selector(noteTap)];
 
+    UIButton *animation=(UIButton *)[self designed:@"el_ef4c027c" action:NULL];animation.enabled=NO;animation.accessibilityLabel=@"动画同步变速，待验证";
+    self.hudMode=(UIButton *)[self designed:@"el_700100de" action:@selector(hudTap)];
     UIButton *autoplay=(UIButton *)[self designed:@"el_56cb338e" action:NULL];autoplay.enabled=NO;autoplay.accessibilityLabel=@"自动播放，尚未接入";
     self.noteSpeeds=(UILabel *)[self designed:@"el13" action:NULL];
     self.noteSpeedValue=(UILabel *)[self designed:@"el_c14bfa62" action:NULL];
@@ -64,7 +69,6 @@
     [self.noteSlider setMinimumTrackImage:track forState:UIControlStateNormal];[self.noteSlider setMaximumTrackImage:track forState:UIControlStateNormal];
     [self.noteSlider setThumbImage:PTDesignImage(PTElement(@"el_cfd16d98"),PTElement(@"el_cfd16d98")[@"asset"]) forState:UIControlStateNormal];
     [self.noteSlider addTarget:self action:@selector(noteSlide:) forControlEvents:UIControlEventValueChanged];[self.panel addSubview:self.noteSlider];
-    self.notePending=[self label:16 frame:CGRectMake(784,340,528,44) text:@"CNS · 大步 0.50 / 小步 0.10 · 重试生效"];self.notePending.numberOfLines=2;
     self.axis=[[PTTimeline alloc] initWithFrame:PTRect(PTElement(@"el14"))];self.axis.backgroundColor=UIColor.clearColor;
     __weak PCPRatePanel *weakSelf=self;self.axis.choose=^(NSUInteger i){[weakSelf choose:i];};[self.panel addSubview:self.axis];
     self.axis.drag=^(unsigned ms){[weakSelf dragTime:ms];};
@@ -78,37 +82,31 @@
     self.addT=(UIButton *)[self designed:@"el23" action:@selector(addBookmark)];[self caption:self.addT design:@"el_52b9865f"];
     self.jump=(UIButton *)[self designed:@"el26" action:@selector(jumpTap)];[self caption:self.jump design:@"el_03762b62"];
     self.loop=(UIButton *)[self designed:@"el24" action:@selector(loopTap)];self.loop.accessibilityLabel=@"A/B 循环";
-    self.loopState=[self label:16 frame:CGRectMake(552,808,136,44) text:@"A/B 循环-关"];
-    self.selection=[self label:20 frame:CGRectMake(400,600,280,32) text:@"选择点位开始编辑"];
-    self.status=[self label:17 frame:CGRectMake(400,984,280,40) text:@""];
-    self.cancelJump=[self button:@"取消待执行跳转" frame:CGRectMake(400,880,272,44) action:@selector(cancelWaiting)];
-    self.continueButton=[self button:@"继续准备" frame:CGRectMake(400,936,272,44) action:@selector(continuePlaying)];
-    self.editBox=[[UIView alloc] initWithFrame:CGRectMake(696,616,440,216)];self.editBox.hidden=YES;[self.panel addSubview:self.editBox];
-    UIImageView *inputBackground=[[UIImageView alloc] initWithImage:PTDesignImage(PTElement(@"el_bcefc7e0"),PTElement(@"el_bcefc7e0")[@"asset"])];inputBackground.frame=CGRectMake(8,0,432,56);[self.editBox addSubview:inputBackground];
+    self.selection=(UILabel *)[self designed:@"runtime_selection" action:NULL];
+    self.status=(UILabel *)[self designed:@"runtime_status" action:NULL];self.status.text=@"";
+    self.cancelJump=[self button:@"取消待执行跳转" frame:PTRect(PTElement(@"runtime_cancel_jump")) action:@selector(cancelWaiting)];
+    self.continueButton=[self button:@"继续准备" frame:PTRect(PTElement(@"runtime_continue_prep")) action:@selector(continuePlaying)];
+    self.editBox=[[UIView alloc] initWithFrame:CGRectMake(696,714,440,215)];self.editBox.hidden=YES;[self.panel addSubview:self.editBox];
+    NSDictionary *inputDesign=PTElement(@"el_bcefc7e0");CGRect inputFrame=PTRect(inputDesign);inputFrame.origin.x-=696;inputFrame.origin.y-=714;
+    UIImageView *inputBackground=[[UIImageView alloc] initWithImage:PTDesignImage(inputDesign,inputDesign[@"asset"])];inputBackground.frame=inputFrame;[self.editBox addSubview:inputBackground];
     NSDictionary *numberDesign=PTElement(@"el_5b41cc14");CGRect numberFrame=PTRect(numberDesign);
-    numberFrame.origin.x-=self.editBox.frame.origin.x;numberFrame.origin.y-=self.editBox.frame.origin.y;
-    self.milliseconds=[[UILabel alloc] initWithFrame:numberFrame];PTLabelStyle(self.milliseconds,numberDesign);self.milliseconds.userInteractionEnabled=YES;
-    [self.milliseconds addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(openDigits)]];[self.editBox addSubview:self.milliseconds];
+    numberFrame.origin.x-=696;numberFrame.origin.y-=714;
+    self.milliseconds=[[UILabel alloc] initWithFrame:numberFrame];PTLabelStyle(self.milliseconds,numberDesign);self.milliseconds.userInteractionEnabled=NO;
+    [self.editBox addSubview:self.milliseconds];
     NSDictionary *unitDesign=PTElement(@"el_b2f73a7f");CGRect unitFrame=PTRect(unitDesign);
-    unitFrame.origin.x-=self.editBox.frame.origin.x;unitFrame.origin.y-=self.editBox.frame.origin.y;
+    unitFrame.origin.x-=696;unitFrame.origin.y-=714;
     UILabel *unit=[[UILabel alloc] initWithFrame:unitFrame];PTLabelStyle(unit,unitDesign);unit.text=@"ms";[self.editBox addSubview:unit];
-    /* Keep the full input background tappable despite the narrower authored number label. */
-    inputBackground.userInteractionEnabled=YES;
-    [inputBackground addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(openDigits)]];
     int steps[]={-1000,-100,100,1000};NSArray *stepIDs=@[@"el_fcb25955",@"el_4fe2b11d",@"el_24d119d5",@"el_fdf35a18"];
     self.editButtons=[NSMutableArray array];
-    for(int i=0;i<4;i++){UIButton *v=(UIButton *)[self designed:stepIDs[i] action:@selector(timeStep:)];v.tag=steps[i];CGRect r=v.frame;r.origin.x-=696;r.origin.y-=616;v.frame=r;v.accessibilityLabel=[NSString stringWithFormat:@"%+d 毫秒",steps[i]];[self.editBox addSubview:v];[self.editButtons addObject:v];[v addGestureRecognizer:[[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(holdTime:)]];}
-    for(NSString *key in @[@"el_2ebea99a",@"el_c746bf87"]){UIButton *v=(UIButton *)[self designed:key action:[key isEqual:@"el_2ebea99a"]?@selector(confirmEdit):@selector(cancelEdit)];CGRect r=v.frame;r.origin.x-=696;r.origin.y-=616;v.frame=r;[self.editBox addSubview:v];}
-    self.keypad=[[UIView alloc] initWithFrame:CGRectMake(696,840,440,184)];self.keypad.hidden=YES;[self.panel addSubview:self.keypad];
-    NSArray *keys=@[@"1",@"2",@"3",@"4",@"5",@"6",@"7",@"8",@"9",@"清空",@"0",@"退格"];
-    for(int i=0;i<12;i++){
-        UIButton *v=[self button:keys[i] frame:CGRectMake((i%3)*148,(i/3)*46,144,44) action:@selector(digit:)];v.tag=i;[self.keypad addSubview:v];
-    }
+    for(int i=0;i<4;i++){UIButton *v=(UIButton *)[self designed:stepIDs[i] action:@selector(timeStep:)];v.tag=steps[i];CGRect r=v.frame;r.origin.x-=696;r.origin.y-=714;v.frame=r;v.accessibilityLabel=[NSString stringWithFormat:@"%+d 毫秒",steps[i]];[self.editBox addSubview:v];[self.editButtons addObject:v];[v addGestureRecognizer:[[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(holdTime:)]];}
+    for(NSString *key in @[@"el_2ebea99a",@"el_c746bf87"]){UIButton *v=(UIButton *)[self designed:key action:[key isEqual:@"el_2ebea99a"]?@selector(confirmEdit):@selector(cancelEdit)];[self caption:v design:[key isEqual:@"el_2ebea99a"]?@"el_52a664bd":@"el_9bbbe20d"];CGRect r=v.frame;r.origin.x-=696;r.origin.y-=714;v.frame=r;[self.editBox addSubview:v];}
     self.entry=[self button:@"练习" frame:CGRectZero action:@selector(toggle)];[self.overlay addSubview:self.entry];
     self.speedHUD=(UILabel *)[self designed:@"el33" action:NULL];self.accHUD=(UILabel *)[self designed:@"el34" action:NULL];
     self.currentHUD=(UILabel *)[self designed:@"el_024b6d15" action:NULL];self.durationHUD=(UILabel *)[self designed:@"el_fd5065da" action:NULL];
     self.countdown=(UILabel *)[self designed:@"el35" action:NULL];
     for(UILabel *l in @[self.speedHUD,self.accHUD,self.currentHUD,self.durationHUD,self.countdown]){[self.overlay addSubview:l];l.hidden=YES;l.layer.shadowColor=UIColor.blackColor.CGColor;l.layer.shadowOpacity=0.5;l.layer.shadowRadius=2;l.layer.shadowOffset=CGSizeMake(0,1);}
+    self.hudProgressViews=[NSMutableArray array];
+    for(NSString *key in @[@"el_e6b8d233",@"el_2ce63cf8",@"el_d0b61598",@"el_d7b9d62f",@"el_2729917a"]){UIView *view=[self designed:key action:NULL parent:self.overlay];if(view){view.hidden=YES;[self.hudProgressViews addObject:view];if([key isEqual:@"el_2729917a"])self.hudProgressThumb=view;}}
     self.draft=pcp_rate_ui_stored_percent();[self updateDraft];
     [self buildOutside];
 }
@@ -118,4 +116,14 @@
     NSArray *labels=@[self.speedHUD,self.accHUD,self.currentHUD,self.durationHUD,self.countdown];
     NSArray *keys=@[@"el33",@"el34",@"el_024b6d15",@"el_fd5065da",@"el35"];
     for(unsigned i=0;i<labels.count;i++){UILabel *l=labels[i];NSDictionary *e=PTElement(keys[i]);CGRect r=PTRect(e);l.frame=CGRectMake(dx+r.origin.x*scale,dy+r.origin.y*scale,r.size.width*scale,r.size.height*scale);l.font=[PTDesignFont(e) fontWithSize:[e[@"fontSize"] doubleValue]*scale];}
+    NSArray *progressKeys=@[@"el_e6b8d233",@"el_2ce63cf8",@"el_d0b61598",@"el_d7b9d62f",@"el_2729917a"];
+    for(NSUInteger i=0;i<self.hudProgressViews.count && i<progressKeys.count;i++) {
+        UIView *view=self.hudProgressViews[i];NSDictionary *e=PTElement(progressKeys[i]);CGRect r=PTRect(e);
+        if(view==self.hudProgressThumb) {
+            CGRect track=PTRect(PTElement(@"el_2ce63cf8"));
+            CGFloat ratio=self.hudDurationMs?MIN(1,MAX(0,self.hudCurrentMs/(double)self.hudDurationMs)):0;
+            r.origin.x=track.origin.x+track.size.width*ratio-r.size.width/2;
+        }
+        view.frame=CGRectMake(dx+r.origin.x*scale,dy+r.origin.y*scale,r.size.width*scale,r.size.height*scale);
+    }
 }
